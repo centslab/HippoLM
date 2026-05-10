@@ -55,11 +55,6 @@ checkpoints/
 .DS_Store
 Thumbs.db
 
-# CUDA
-*.cu
-*.cuh
-*.jit
-
 # Test
 .pytest_cache/
 .coverage
