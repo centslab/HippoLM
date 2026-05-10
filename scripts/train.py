@@ -8,7 +8,7 @@ Features:
 - max_step training limit
 - Checkpoint saving to timestamped output directory
 - Qwen3.5 tokenizer
-- SlimPajama dataset support
+- SlimPajama dataset support (streaming, zstd-compressed)
 
 CPU offload (DeepSpeed-style) will be added in v0.0.1.
 """
@@ -16,7 +16,13 @@ import os
 import sys
 import argparse
 import logging
+import io
+import json
+import math
+import random
+import zstandard as zstd
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -132,26 +138,193 @@ def create_output_dir(output_dir: str) -> Path:
     return run_dir
 
 
+import io
+import json
+import math
+import os
+import random
+import zstandard as zstd
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+from torch.utils.data import IterableDataset
+
+
+def _resolve_split_path(data_path: str, split: str) -> str:
+    """Resolve path for a dataset split."""
+    split_path = os.path.join(data_path, split)
+    if os.path.exists(split_path):
+        return split_path
+    if os.path.exists(data_path) and os.path.basename(os.path.normpath(data_path)) == split:
+        return data_path
+    raise ValueError(f"Path does not exist: {split_path}")
+
+
+def _find_files(root_path: str, primary_pattern: str, fallback_pattern: str) -> list[str]:
+    """Find files matching pattern, with fallback."""
+    import glob
+    files = sorted(glob.glob(os.path.join(root_path, primary_pattern)))
+    if not files:
+        files = sorted(glob.glob(os.path.join(root_path, fallback_pattern), recursive=True))
+    if not files:
+        raise ValueError(f"No files found under {root_path} matching {primary_pattern!r} or {fallback_pattern!r}")
+    return files
+
+
+def _shard_range(total_items: int, shard_id: int, num_shards: int) -> tuple[int, int]:
+    """Calculate range for a specific shard."""
+    total_items = max(int(total_items), 0)
+    num_shards = max(int(num_shards), 1)
+    shard_id = min(max(int(shard_id), 0), num_shards - 1)
+
+    base = total_items // num_shards
+    remainder = total_items % num_shards
+    start = shard_id * base + min(shard_id, remainder)
+    end = start + base + (1 if shard_id < remainder else 0)
+    return start, end
+
+
+class ZstdFileReader:
+    """Helper class to stream zstd-compressed jsonl files."""
+
+    @staticmethod
+    def iter_zst_lines(file_path: str):
+        with open(file_path, 'rb') as f:
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(f) as reader:
+                with io.TextIOWrapper(reader, encoding='utf-8') as text_reader:
+                    for line in text_reader:
+                        yield line.rstrip('\r\n')
+
+    @staticmethod
+    def read_zst_file(file_path: str) -> list[str]:
+        return list(ZstdFileReader.iter_zst_lines(file_path))
+
+
 class SlimPajamaDataset(IterableDataset):
-    """Iterable dataset for SlimPajama JSONL files."""
+    """Stream text samples from SlimPajama-style jsonl.zst shards."""
 
-    def __init__(self, data_dir: str, tokenizer, max_seq_len: int = 512):
-        self.data_dir = Path(data_dir)
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer,
+        split: str = "train",
+        max_seq_len: int = 2048,
+        num_samples: Optional[int] = None,
+        chunk_pattern: str = "chunk1/*.jsonl.zst",
+        seed: int = 42,
+        shuffle: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        super().__init__()
+        self.data_path = data_path
         self.tokenizer = tokenizer
+        self.split = split
         self.max_seq_len = max_seq_len
-        self.files = sorted(self.data_dir.glob("**/*.jsonl"))
+        self.num_samples = num_samples
+        self.chunk_pattern = chunk_pattern
+        self.seed = seed
+        self.shuffle = shuffle
+        self.rank = rank
+        self.world_size = max(int(world_size), 1)
 
-    def __iter__(self):
-        import json
+        split_path = _resolve_split_path(data_path, split)
+        self.files = _find_files(split_path, chunk_pattern, "**/*.jsonl.zst")
 
-        for file_path in self.files:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        data = json.loads(line.strip())
-                        text = data.get("text", "")
-                        if not text:
+        if self.shuffle:
+            shuffled = list(self.files)
+            random.Random(seed).shuffle(shuffled)
+            self.files = shuffled
+
+        # Try to load metadata first to avoid counting all files
+        self.file_sample_counts: Optional[list[int]] = None
+        metadata_path = Path(self.data_path) / 'metadata.json'
+        if metadata_path.exists():
+            try:
+                meta = json.loads(metadata_path.read_text(encoding='utf-8'))
+                split_meta = next((s for s in meta.get('splits', []) if s['split'] == self.split), None)
+                if split_meta and 'shard_rows' in split_meta:
+                    self.file_sample_counts = [int(x) for x in split_meta['shard_rows']]
+                    print(f"[SlimPajamaDataset] Loaded {len(self.file_sample_counts)} sample counts from metadata.json")
+            except Exception:
+                pass
+
+        # Use round-robin sharding for training - fast startup, no counting needed
+        self._needs_sample_count = False
+
+    def _iter_file_texts(self, file_path: str):
+        for line in ZstdFileReader.iter_zst_lines(file_path):
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = data.get('text')
+            if text is not None:
+                yield text
+
+    def _count_file_samples(self) -> list[int]:
+        """Count samples in each file. Stop early once we have enough samples."""
+        total_files = len(self.files)
+        # For training, we only need enough samples for num_samples * 1.5 (with margin)
+        target_samples = self.num_samples * 3 // 2 if self.num_samples else None
+
+        counts = []
+
+        for i, file_path in enumerate(self.files):
+            count = 0
+            try:
+                for _ in self._iter_file_texts(file_path):
+                    count += 1
+            except Exception:
+                pass
+
+            counts.append(count)
+
+            # After counting at least 1 file, we can estimate
+            if len(counts) >= 1 and target_samples:
+                total_counted = sum(counts)
+                avg = total_counted / len(counts)
+                estimated_total = int(avg * total_files)
+
+                # If our estimate exceeds target by a lot, we can stop
+                # But only if we've counted enough to have confidence (at least 5 files or 50% of target)
+                if estimated_total >= target_samples * 10 and total_counted >= target_samples:
+                    counts.extend([int(avg)] * (total_files - len(counts)))
+                    print(f"[SlimPajamaDataset] Counted {len(counts)}/{total_files} files, estimated total: {estimated_total:,}")
+                    return counts
+
+        # If we didn't stop early, return all counts
+        print(f"[SlimPajamaDataset] Counted all {len(counts)} files, total samples: {sum(counts):,}")
+        return counts
+
+    def _iter_streaming_partition(self, global_shard_id: int, global_num_shards: int):
+        total_samples = sum(self.file_sample_counts or [])
+        if self.num_samples is not None:
+            total_samples = min(total_samples, int(self.num_samples))
+
+        sample_start, sample_end = _shard_range(total_samples, global_shard_id, global_num_shards)
+        if sample_start >= sample_end:
+            return
+
+        file_global_start = 0
+        for file_path, file_sample_count in zip(self.files, self.file_sample_counts or []):
+            file_global_end = file_global_start + int(file_sample_count)
+            local_start = max(sample_start, file_global_start) - file_global_start
+            local_end = min(sample_end, file_global_end) - file_global_start
+            if local_start < local_end:
+                local_idx = 0
+                try:
+                    for text in self._iter_file_texts(file_path):
+                        if local_idx < local_start:
+                            local_idx += 1
                             continue
+                        if local_idx >= local_end:
+                            break
 
                         tokens = self.tokenizer(
                             text,
@@ -161,15 +334,212 @@ class SlimPajamaDataset(IterableDataset):
                         )
                         input_ids = tokens["input_ids"].squeeze(0)
 
-                        if len(input_ids) < 2:
-                            continue
+                        if len(input_ids) >= 2:
+                            yield {"input_ids": input_ids, "labels": input_ids.clone()}
 
-                        yield {"input_ids": input_ids, "labels": input_ids.clone()}
-                    except (json.JSONDecodeError, KeyError):
-                        continue
+                        local_idx += 1
+                except Exception:
+                    pass
+
+            file_global_start = file_global_end
+            if file_global_start >= sample_end:
+                break
+
+    def _iter_streaming_roundrobin(self, global_shard_id: int, global_num_shards: int):
+        """Fallback streaming using simple round-robin sharding."""
+        sample_idx = 0
+        for file_path in self.files:
+            try:
+                for text in self._iter_file_texts(file_path):
+                    if sample_idx % global_num_shards == global_shard_id:
+                        tokens = self.tokenizer(
+                            text,
+                            max_length=self.max_seq_len,
+                            truncation=True,
+                            return_tensors="pt",
+                        )
+                        input_ids = tokens["input_ids"].squeeze(0)
+                        if len(input_ids) >= 2:
+                            yield {"input_ids": input_ids, "labels": input_ids.clone()}
+                    sample_idx += 1
+                    if self.num_samples is not None and sample_idx >= self.num_samples:
+                        return
+            except Exception:
+                pass
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            local_worker_id = 0
+            local_num_workers = 1
+        else:
+            local_worker_id = worker_info.id
+            local_num_workers = worker_info.num_workers
+
+        global_num_shards = self.world_size * local_num_workers
+        global_shard_id = self.rank * local_num_workers + local_worker_id
+
+        # Count samples on first iteration for range-based sharding
+        if self._needs_sample_count:
+            self.file_sample_counts = self._count_file_samples()
+            self._needs_sample_count = False
+
+        if self.file_sample_counts is not None:
+            yield from self._iter_streaming_partition(global_shard_id, global_num_shards)
+        else:
+            yield from self._iter_streaming_roundrobin(global_shard_id, global_num_shards)
 
     def __len__(self):
-        return 1000000
+        if self.num_samples is not None:
+            total_samples = int(self.num_samples)
+        elif self.file_sample_counts is not None:
+            total_samples = sum(self.file_sample_counts)
+        else:
+            total_samples = len(self.files) * 9980  # SlimPajama average
+        return max(math.ceil(total_samples / self.world_size), 1)
+
+
+class PretokenizedDataset(IterableDataset):
+    """Read pretokenized fixed-length `.npy` shards with mmap for memory efficiency."""
+
+    def __init__(
+        self,
+        data_path: str,
+        split: str = "train",
+        max_seq_len: int = 2048,
+        num_samples: Optional[int] = None,
+        shard_pattern: str = "*.npy",
+        seed: int = 42,
+        shuffle: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        super().__init__()
+        self.data_path = data_path
+        self.split = split
+        self.max_seq_len = int(max_seq_len)
+        self.num_samples = num_samples
+        self.shard_pattern = shard_pattern
+        self.seed = seed
+        self.shuffle = shuffle
+        self.rank = rank
+        self.world_size = max(int(world_size), 1)
+
+        split_path = _resolve_split_path(data_path, split)
+        self.files = _find_files(split_path, shard_pattern, f"**/{shard_pattern}")
+        if self.shuffle:
+            shuffled = list(self.files)
+            random.Random(seed).shuffle(shuffled)
+            self.files = shuffled
+
+        # Load shard sizes from metadata.json if available
+        metadata_path = Path(data_path) / 'metadata.json'
+        self.shard_sizes = []
+        self.total_samples = 0
+
+        if metadata_path.exists():
+            try:
+                meta = json.loads(metadata_path.read_text(encoding='utf-8'))
+                split_meta = next((s for s in meta.get('splits', []) if s['split'] == split), None)
+                if split_meta and int(meta.get('max_seq_len', 0)) == self.max_seq_len:
+                    shard_rows = split_meta.get('shard_rows')
+                    if isinstance(shard_rows, list) and len(shard_rows) == len(self.files):
+                        self.shard_sizes = [int(x) for x in shard_rows]
+                        self.total_samples = sum(self.shard_sizes)
+                    elif 'num_samples' in split_meta:
+                        self.total_samples = int(split_meta['num_samples'])
+            except (json.JSONDecodeError, KeyError, StopIteration):
+                pass
+
+        if not self.shard_sizes:
+            for file_path in self.files:
+                shard = np.load(file_path, mmap_mode='r')
+                if shard.ndim != 2:
+                    raise ValueError(f"Pretokenized shard must be 2D: {file_path}")
+                if shard.shape[1] != self.max_seq_len:
+                    raise ValueError(f"Pretokenized shard shape mismatch for {file_path}")
+                self.shard_sizes.append(int(shard.shape[0]))
+            self.total_samples = sum(self.shard_sizes)
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            local_worker_id = 0
+            local_num_workers = 1
+        else:
+            local_worker_id = worker_info.id
+            local_num_workers = worker_info.num_workers
+
+        global_num_shards = self.world_size * local_num_workers
+        global_shard_id = self.rank * local_num_workers + local_worker_id
+        total_samples = self.total_samples
+        if self.num_samples is not None:
+            total_samples = min(total_samples, int(self.num_samples))
+
+        sample_start, sample_end = _shard_range(total_samples, global_shard_id, global_num_shards)
+        if sample_start >= sample_end:
+            return
+
+        _CHUNK = 256
+        file_global_start = 0
+        for file_idx, file_path in enumerate(self.files):
+            n_rows = int(self.shard_sizes[file_idx])
+            file_global_end = file_global_start + n_rows
+
+            row_start = max(sample_start, file_global_start) - file_global_start
+            row_end = min(sample_end, file_global_end) - file_global_start
+            if row_start < row_end:
+                shard = np.load(file_path, mmap_mode='r')
+                for chunk_start in range(row_start, row_end, _CHUNK):
+                    chunk_end = min(chunk_start + _CHUNK, row_end)
+                    chunk = np.array(shard[chunk_start:chunk_end])
+                    base_idx = file_global_start + chunk_start
+                    for local_idx in range(chunk.shape[0]):
+                        yield {
+                            'input_ids': chunk[local_idx],
+                            'labels': chunk[local_idx].copy(),
+                            'idx': base_idx + local_idx
+                        }
+
+            file_global_start = file_global_end
+            if file_global_start >= sample_end:
+                break
+
+    def __len__(self):
+        total_samples = self.total_samples
+        if self.num_samples is not None:
+            total_samples = min(total_samples, int(self.num_samples))
+        return max(math.ceil(total_samples / self.world_size), 1)
+
+
+def build_dataset(data_path: str, tokenizer, split: str = "train", max_seq_len: int = 512,
+                  num_samples: Optional[int] = None, use_pretokenized: bool = False,
+                  rank: int = 0, world_size: int = 1):
+    """Build appropriate dataset based on data format."""
+    pretokenized_path = Path(data_path).parent / f"{Path(data_path).name}_pretokenized"
+
+    if use_pretokenized and pretokenized_path.exists():
+        return PretokenizedDataset(
+            data_path=str(pretokenized_path),
+            split=split,
+            max_seq_len=max_seq_len,
+            num_samples=num_samples,
+            rank=rank,
+            world_size=world_size,
+        )
+
+    return SlimPajamaDataset(
+        data_path=data_path,
+        tokenizer=tokenizer,
+        split=split,
+        max_seq_len=max_seq_len,
+        num_samples=num_samples,
+        chunk_pattern="chunk1/*.jsonl.zst",
+        seed=42,
+        shuffle=(split == "train"),
+        rank=rank,
+        world_size=world_size,
+    )
 
 
 def create_dummy_dataloader(batch_size: int, seq_len: int, vocab_size: int):
@@ -261,8 +631,21 @@ def train(args):
     else:
         tokenizer = load_tokenizer(args.tokenizer_path)
         if Path(args.data_dir).exists():
-            dataset = SlimPajamaDataset(args.data_dir, tokenizer, args.seq_len)
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+            dataset = SlimPajamaDataset(
+                data_path=args.data_dir,
+                tokenizer=tokenizer,
+                split="train",
+                max_seq_len=args.seq_len,
+                num_samples=args.max_steps * args.batch_size * args.gradient_accumulation_steps,
+                rank=0,
+                world_size=1,
+            )
+            dataloader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
         else:
             logger.warning(f"Dataset not found at {args.data_dir}, using dummy data")
             dataloader = create_dummy_dataloader(args.batch_size, args.seq_len, config.vocab_size)
