@@ -1,0 +1,50 @@
+# HippoLM Training Configuration
+
+# Model Architecture
+vocab_size: 248320
+hidden_size: 1024
+num_heads: 16
+head_dim: 64
+num_kv: 64
+num_layers: 32
+num_blocks: 8
+intermediate_size: 2736
+tie_word_embeddings: true
+use_bias: false
+
+# Normalization
+rms_norm_eps: 1e-6
+
+# Position Encoding
+max_seq_len: -1  # -1 means unlimited context in code
+
+# kvDLA Initialization
+kv_init_std: 0.01
+alpha_init: 0.1
+beta_init: 0.1
+gamma_init: 0.0
+eta_init: 0.01
+
+# Training
+epochs: 1
+max_steps: 1000
+batch_size: 2
+seq_len: 512
+learning_rate: 1.0e-4
+weight_decay: 0.01
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+fp16: true
+
+# Data
+data_dir: /mnt/6138/datasets/xpengx/SlimPajama-627B
+tokenizer_path: /home/wlx/Qwen3.5-9B
+
+# Output
+output_dir: output
+log_interval: 10
+checkpoint_interval: 100
+
+# GPU
+min_gpu_memory_mb: 10240
+num_workers: 2
