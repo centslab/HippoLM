@@ -2,9 +2,13 @@
 
 ## Overview
 
-HippoLM is a production-grade LLM training and inference project based on a novel architecture combining **Gated DeltaNet-inspired key-value linear attention (kvDLA)** with **Block Attention Residuals (Block AttnRes)** from [arXiv:2603.15031](https://arxiv.org/abs/2603.15031).
+HippoLM is a production-grade LLM training and inference project based on a novel architecture combining **Kimi Delta Attention (KDA)** with **Block Attention Residuals (Block AttnRes)** from [arXiv:2603.15031](https://arxiv.org/abs/2603.15031).
 
-The architecture replaces the state matrix in Gated DeltaNet with explicit key-value pairs and replaces standard residual connections with learned, input-dependent depth-wise attention over block-level representations.
+KDA is a fast delta-rule linear attention from [flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention) that supports chunked parallel prefill and fused recurrent decoding. Block AttnRes replaces standard residual connections with learned, input-dependent softmax attention over block-level representations.
+
+### Why KDA
+
+The previous attempt used a custom Key-Value Delta Linear Attention (kvDLA) with explicit per-slot K/V state maintained per head. **kvDLA failed** because the gated delta rule with per-slot state cannot be decomposed into a WY-product form. Without that factorization, the activation memory cannot be reduced via chunked prefill, and parallel prefill across the sequence length is not possible. KDA from flash-linear-attention provides exactly the missing capability: a WY-style chunked computation that supports both training (chunk mode) and inference (fused recurrent mode), with reduced activation memory.
 
 ## Architecture
 
@@ -16,7 +20,7 @@ The architecture replaces the state matrix in Gated DeltaNet with explicit key-v
 | `hidden_size` | 1024 | Model dimension |
 | `num_heads` | 16 | Number of attention heads |
 | `head_dim` | 64 | Per-head dimension |
-| `num_kv` | 64 | Number of KV pairs (training). Equal to `head_dim`. Inference can vary. |
+| `num_kv` | 64 | Number of value heads for grouped value attention |
 | `num_layers` | 32 | Total transformer layers |
 | `num_blocks` | 8 | Block AttnRes blocks |
 | `intermediate_size` | 2736 | SwiGLU intermediate dim = `hidden_size * 8 / 3`, rounded to multiple of 8 |
@@ -25,31 +29,15 @@ The architecture replaces the state matrix in Gated DeltaNet with explicit key-v
 | `tie_word_embeddings` | True | Share token embedding and lm_head weights |
 | `use_bias` | False | No bias in any linear layer |
 
-### Key-Value Delta Linear Attention (kvDLA)
+### Kimi Delta Attention (KDA)
 
-Replaces traditional self-attention. Maintains `num_kv` explicit key-value pairs per head instead of a state matrix.
+Wrapper around `fla.layers.kda.KimiDeltaAttention` (see [Kimi Linear paper](https://arxiv.org/abs/2510.26692)).
 
-**Per token computation:**
-
-```
-k_t = x_t * W_K                          # [B, num_heads, head_dim]
-v_t = x_t * W_V                          # [B, num_heads, head_dim]
-
-v_hat_t = sum_i softmax( K_i^T k_t / sqrt(H) )_i * V_i
-
-e_t = v_t - v_hat_t
-
-g_i = sigmoid( alpha * (K_i^T k_t) + beta * (V_i^T e_t) + gamma )
-
-V_i <- V_i + eta_v * g_i * e_t
-K_i <- K_i + eta_k * g_i * (k_t - K_i)
-```
-
-**Parameters:**
-- `alpha`, `beta`, `gamma`: trainable scalars. Initialized: `alpha=0.1`, `beta=0.1`, `gamma=0`
-- `eta_v`, `eta_k`: trainable vectors, shape `[num_heads, head_dim]`. Initialized to `0.01`
-- `K`, `V`: state variables (not model parameters). Initialized `N(0, 0.01^2)`
-- `H` = `head_dim` = 64
+- Per-key-dim gating: forget gate has shape `[B, T, H, K]` (vector per head), compared to GDN's scalar per-head gate.
+- Supports `chunk` mode for training (parallel prefill) and `fused_recurrent` mode for inference.
+- Each layer has approximately `hidden_size * key_dim * 2 + hidden_size * value_dim * 3` parameters, plus a low-rank `f_proj` bottleneck.
+- No short convolution by default in this project (global attention, no local inductive bias).
+- Wrapper at `src/models/kda.py` provides a simple `[B, T, D] -> [B, T, D]` interface.
 
 ### Block Attention Residuals (Block AttnRes)
 
@@ -58,13 +46,13 @@ From Kimi Team's [Attention Residuals](https://arxiv.org/abs/2603.15031) paper.
 - 32 layers partitioned into 8 blocks of 4 layers each
 - Within each block: standard residual accumulation (`partial_block`)
 - Across blocks: softmax attention over block-level representations
-- Each sub-layer (kvDLA and FFN) has its own pseudo-query `w_l` for AttnRes computation
+- Each sub-layer (KDA and FFN) has its own pseudo-query `w_l` for AttnRes computation
 - `w_l` initialized to 0 (ensures uniform attention weights at start, matching paper)
 - RMSNorm applied to keys in attention computation
 
 **Block representation:**
 ```
-b_n = sum_{j in Block_n} (kvDLA_out_j + FFN_out_j)
+b_n = sum_{j in Block_n} (KDA_out_j + FFN_out_j)
 ```
 
 **Layer input via AttnRes:**
@@ -105,11 +93,26 @@ No positional encoding. Architecture is NoPE (No Positional Encoding), following
 - Gradient accumulation
 - Auto GPU selection: only GPUs with >= 10GB free VRAM
 
+### Datasets (streaming from hf-mirror.com)
+
+Set `HF_ENDPOINT=https://hf-mirror.com` to stream from the Chinese HF mirror.
+
+- **Pretraining:** `openbmb/Ultra-FineWeb-L3` (text field)
+- **SFT:** `openbmb/UltraData-SFT-2605` (messages field, applied via chat template)
+
+Both are streamed via `datasets.load_dataset(..., streaming=True)`. The local SFT dataset is not available — must be streamed.
+
+### Tokenizer
+
+Local copy of Qwen3.5 tokenizer at `src/tokenizer/`. Files copied from `/home/wlx/Qwen3.5-9B`:
+- `tokenizer.json`, `tokenizer_config.json`
+- `vocab.json`, `merges.txt`
+- `preprocessor_config.json`, `chat_template.jinja`
+- `config.json`, `configuration.json`
+
 ### Hyperparameters
 - Epochs: 1
 - Max steps: 1000 (for v0.0.0 validation)
-- Dataset: `/mnt/6138/datasets/xpengx/SlimPajama-627B`
-- Tokenizer: Qwen3.5 from `/home/wlx/Qwen3.5-9B` (to be copied into project)
 
 ## Evaluation
 
@@ -125,7 +128,7 @@ No positional encoding. Architecture is NoPE (No Positional Encoding), following
 ## Development Roadmap
 
 ### v0.0.0: Foundation
-- Basic LLM architecture
+- Basic LLM architecture (KDA + Block AttnRes)
 - Code correctness verified
 - Gradients flow correctly
 - Training runs end-to-end
@@ -169,10 +172,13 @@ HippoLM/
 │   │   │   └── cuda/          # CUDA kernels
 │   │   ├── config.py          # HippoConfig
 │   │   ├── norms.py           # RMSNorm
-│   │   ├── kv_dla.py          # Key-Value Delta Linear Attention
+│   │   ├── kda.py             # Kimi Delta Attention wrapper
 │   │   ├── block_attn_res.py  # Block Attention Residuals
-│   │   ├── layers.py          # HippoLayer
-│   │   └── model.py           # HippoModel
+│   │   ├── model.py           # HippoModel
+│   │   └── activation.py      # SwiGLU FFN
+│   ├── training/
+│   │   └── cpu_adamw.py       # CPU offloaded AdamW
+│   ├── tokenizer/             # Qwen3.5 tokenizer files
 │   └── inference/
 ├── test/                      # All tests
 ├── scripts/
@@ -187,3 +193,5 @@ HippoLM/
 - This is a research project; expect frequent pivots
 - No position encoding by design
 - Block AttnRes pseudo-queries MUST be initialized to zero (paper requirement)
+- KDA requires CUDA tensors (uses Triton kernels) — tests and training must run on GPU
+- KDA chunk mode is the only mode supported for training (fused_recurrent is inference-only)

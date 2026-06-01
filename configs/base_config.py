@@ -11,10 +11,10 @@ class HippoConfig:
     hidden_size: int = 1024
     tie_word_embeddings: bool = True
 
-    # Attention
+    # Attention (KDA)
     num_heads: int = 16
     head_dim: int = 64
-    num_kv: int = 64  # Training: equal to head_dim. Inference: can vary.
+    num_kv: int = 64  # Number of value heads for grouped value attention
 
     # Architecture depth
     num_layers: int = 32
@@ -31,18 +31,14 @@ class HippoConfig:
     max_seq_len: int = -1  # -1 means unlimited context in code
     use_rope: bool = False  # NoPE by design
 
-    # kvDLA initialization
-    kv_init_std: float = 0.01
-    alpha_init: float = 0.1
-    beta_init: float = 0.1
-    gamma_init: float = 0.0
-    eta_init: float = 0.01
-
     # Linear layer bias
     use_bias: bool = False
 
     # Block AttnRes
     block_size: int = 4  # layers per block = num_layers / num_blocks
+
+    # Memory optimization
+    checkpoint_every_layer: bool = False  # If True, checkpoint every layer (saves more memory)
 
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (

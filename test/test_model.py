@@ -6,21 +6,24 @@ sys.path.insert(0, "/home/wlx/HippoLM")
 
 from configs.base_config import HippoConfig
 from src.models.model import HippoModel, HippoLayer
-from src.models.kv_dla import kvDLA
+from src.models.kda import KDA
 from src.models.block_attn_res import BlockAttnRes
 
 
-def test_kv_dla_shape():
-    """Test kvDLA produces correct output shape."""
+def test_kda_shape():
+    """Test KDA produces correct output shape."""
     config = HippoConfig()
-    module = kvDLA(config)
+    module = KDA(config)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    module = module.to(device)
 
     B, T = 2, 16
-    x = torch.randn(B, T, config.hidden_size)
+    x = torch.randn(B, T, config.hidden_size, device=device)
 
     out = module(x)
     assert out.shape == (B, T, config.hidden_size), f"Expected {(B, T, config.hidden_size)}, got {out.shape}"
-    print("[PASS] test_kv_dla_shape")
+    print("[PASS] test_kda_shape")
 
 
 def test_block_attn_res():
@@ -50,11 +53,15 @@ def test_block_attn_res():
 
 def test_model_forward():
     """Test full model forward pass."""
-    config = HippoConfig()
+    # Use small config for fast testing
+    config = HippoConfig(num_layers=4, num_blocks=2)
     model = HippoModel(config)
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
     B, T = 2, 32
-    input_ids = torch.randint(0, config.vocab_size, (B, T))
+    input_ids = torch.randint(0, config.vocab_size, (B, T), device=device)
 
     outputs = model(input_ids)
     logits = outputs["logits"]
@@ -65,12 +72,15 @@ def test_model_forward():
 
 def test_gradient_flow():
     """Test that gradients flow through all layers."""
-    config = HippoConfig()
+    config = HippoConfig(num_layers=4, num_blocks=2)
     model = HippoModel(config)
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
     B, T = 2, 16
-    input_ids = torch.randint(0, config.vocab_size, (B, T))
-    labels = torch.randint(0, config.vocab_size, (B, T))
+    input_ids = torch.randint(0, config.vocab_size, (B, T), device=device)
+    labels = torch.randint(0, config.vocab_size, (B, T), device=device)
     labels[:, -5:] = -100  # Test ignore_index
 
     outputs = model(input_ids, labels=labels)
@@ -92,28 +102,34 @@ def test_tied_weights():
     config = HippoConfig(tie_word_embeddings=True)
     model = HippoModel(config)
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+
     assert model.lm_head.weight is model.embed_tokens.weight
     print("[PASS] test_tied_weights")
 
 
-def test_kv_dla_state_update():
-    """Test that kvDLA states actually update during forward."""
+def test_kda_different_inputs():
+    """Test that KDA produces different outputs for different inputs."""
     config = HippoConfig()
-    module = kvDLA(config)
+    module = KDA(config)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    module = module.to(device)
 
     B, T = 1, 4
-    x = torch.randn(B, T, config.hidden_size)
+    x = torch.randn(B, T, config.hidden_size, device=device)
 
     # Run forward
     out1 = module(x)
 
     # Run again with different input
-    x2 = torch.randn(B, T, config.hidden_size)
+    x2 = torch.randn(B, T, config.hidden_size, device=device)
     out2 = module(x2)
 
     # Outputs should differ due to different inputs
     assert not torch.allclose(out1, out2)
-    print("[PASS] test_kv_dla_state_update")
+    print("[PASS] test_kda_different_inputs")
 
 
 def test_layer_boundary():
@@ -121,10 +137,13 @@ def test_layer_boundary():
     config = HippoConfig(num_layers=8, num_blocks=2)  # block_size = 4
     layer3 = HippoLayer(3, config)  # 4th layer -> boundary
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    layer3 = layer3.to(device)
+
     D = config.hidden_size
     B, T = 2, 8
-    blocks = [torch.randn(B, T, D)]
-    partial = torch.randn(B, T, D)
+    blocks = [torch.randn(B, T, D, device=device)]
+    partial = torch.randn(B, T, D, device=device)
 
     out_blocks, out_partial = layer3(blocks, partial)
 
@@ -138,12 +157,12 @@ def test_layer_boundary():
 
 def run_all_tests():
     print("Running HippoLM 0.0.0 tests...")
-    test_kv_dla_shape()
+    test_kda_shape()
     test_block_attn_res()
     test_model_forward()
     test_gradient_flow()
     test_tied_weights()
-    test_kv_dla_state_update()
+    test_kda_different_inputs()
     test_layer_boundary()
     print("\nAll tests passed!")
 

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 from .norms import RMSNorm
-from .kv_dla import kvDLA
+from .kda import KDA
 from .block_attn_res import BlockAttnRes
 from .activation import SwiGLU
 
@@ -12,7 +12,7 @@ class HippoLayer(nn.Module):
     """Single transformer layer with Block AttnRes.
 
     Each layer contains:
-    1. Pre-attention Block AttnRes -> kvDLA -> add to partial_block
+    1. Pre-attention Block AttnRes -> kda -> add to partial_block
     2. Pre-FFN Block AttnRes -> SwiGLU -> add to partial_block
 
     Block boundaries are checked before the attention sub-layer.
@@ -23,7 +23,7 @@ class HippoLayer(nn.Module):
         self.layer_idx = layer_idx
         self.block_size = config.block_size
 
-        # Two AttnRes: one before kvDLA, one before FFN
+        # Two AttnRes: one before kda, one before FFN
         self.attn_res = BlockAttnRes(config)
         self.mlp_res = BlockAttnRes(config)
 
@@ -32,7 +32,7 @@ class HippoLayer(nn.Module):
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Core sub-layers
-        self.kv_dla = kvDLA(config)
+        self.kda = KDA(config)
         self.ffn = SwiGLU(config)
 
     def forward(
@@ -59,8 +59,12 @@ class HippoLayer(nn.Module):
             partial_block = None
 
         # ---- Attention sub-layer ----
-        h_attn = self.attn_res(blocks, partial_block)
-        attn_out = self.kv_dla(self.attn_norm(h_attn))
+        # Use checkpoint for attention to save activation memory
+        # save (blocks, partial_block) only - recompute h_attn and attn_out during backward
+        h_attn, attn_out = torch.utils.checkpoint.checkpoint(
+            self._attn_forward, blocks, partial_block,
+            use_reentrant=False, preserve_rng_state=False,
+        )
 
         if partial_block is None:
             partial_block = attn_out
@@ -68,17 +72,33 @@ class HippoLayer(nn.Module):
             partial_block = partial_block + attn_out
 
         # ---- FFN sub-layer ----
-        h_mlp = self.mlp_res(blocks, partial_block)
-        ffn_out = self.ffn(self.mlp_norm(h_mlp))
+        # Use checkpoint for FFN
+        ffn_out = torch.utils.checkpoint.checkpoint(
+            self._ffn_forward, blocks, partial_block,
+            use_reentrant=False, preserve_rng_state=False,
+        )
+
         partial_block = partial_block + ffn_out
 
         return blocks, partial_block
+
+    def _attn_forward(self, blocks, partial_block):
+        """Attention sub-layer forward (used for checkpointing)."""
+        h_attn = self.attn_res(blocks, partial_block)
+        attn_out = self.kda(self.attn_norm(h_attn))
+        return h_attn, attn_out
+
+    def _ffn_forward(self, blocks, partial_block):
+        """FFN sub-layer forward (used for checkpointing)."""
+        h_mlp = self.mlp_res(blocks, partial_block)
+        ffn_out = self.ffn(self.mlp_norm(h_mlp))
+        return ffn_out
 
 
 class HippoModel(nn.Module):
     """HippoLM model.
 
-    Combines token embeddings, Block AttnRes layers with kvDLA attention,
+    Combines token embeddings, Block AttnRes layers with kda attention,
     and a language modeling head.
     """
 
@@ -135,23 +155,10 @@ class HippoModel(nn.Module):
         blocks: list[torch.Tensor] = [embeds]  # b_0 = embedding
         partial_block: torch.Tensor | None = embeds
 
-        # Gradient checkpointing every block_size layers
-        checkpoint_interval = self.config.block_size
-
-        for layer_idx, layer in enumerate(self.layers):
-            use_checkpoint = (
-                self.training
-                and checkpoint_interval > 0
-                and (layer_idx + 1) % checkpoint_interval == 0
-            )
-
-            if use_checkpoint:
-                # Use gradient checkpointing for this layer
-                blocks, partial_block = torch.utils.checkpoint.checkpoint(
-                    layer, blocks, partial_block, use_reentrant=False
-                )
-            else:
-                blocks, partial_block = layer(blocks, partial_block)
+        # Each layer uses checkpointing internally for kda and FFN sub-layers
+        # This saves activation memory while keeping block-level gradient flow
+        for layer in self.layers:
+            blocks, partial_block = layer(blocks, partial_block)
 
         # Final normalization and projection
         hidden_states = self.norm(partial_block)  # [B, T, D]
