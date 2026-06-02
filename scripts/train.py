@@ -402,6 +402,7 @@ def train(args):
             text_field=args.text_field,
             rank=0,
             world_size=1,
+            shuffle=args.shuffle,
         )
         dataloader = DataLoader(
             dataset,
@@ -536,6 +537,12 @@ def main():
                         default="src/tokenizer")
     parser.add_argument("--use_dummy_data", action="store_true", default=False)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--shuffle", type=bool, default=True,
+        help="Shuffle the streaming dataset. Disable (--shuffle false) for "
+             "faster first-batch on slow mirrors — sequential order is fine "
+             "for short validation runs.",
+    )
 
     # GPU
     parser.add_argument("--min_gpu_memory_mb", type=int, default=10240)

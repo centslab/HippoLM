@@ -49,6 +49,11 @@ sft_dataset: openbmb/UltraData-SFT-2605
 sft_config: null
 text_field: content
 tokenizer_path: src/tokenizer
+# Disable shuffle: with the slow hf-mirror.com, the 1000-sample shuffle
+# buffer causes random shard access which multiplies the per-shard latency
+# and makes the first batch take minutes. Sequential streaming is fine for
+# the v0.0.0 validation run (1000 steps).
+shuffle: false
 
 # Output
 output_dir: output
