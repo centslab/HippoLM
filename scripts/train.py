@@ -14,12 +14,30 @@ Features:
 
 CPU offload (DeepSpeed-style) will be added in v0.0.1.
 """
+
+# CRITICAL: HF_ENDPOINT must be set BEFORE huggingface_hub is imported,
+# because HfApi reads the env var at construction time. Set it at the
+# very top, before any other imports, so that any chain import of
+# huggingface_hub (e.g. via `datasets` or `transformers`) picks it up.
+import os as _os
+if "HF_ENDPOINT" not in _os.environ:
+    _os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+# All HF cache locations go to a fresh tempdir so nothing persists locally.
+import tempfile as _tempfile
+if "HF_HOME" not in _os.environ:
+    _hf_home = _tempfile.mkdtemp(prefix="hippolm_hf_")
+    _os.environ["HF_HOME"] = _hf_home
+    _os.environ.setdefault("HF_DATASETS_CACHE", _os.path.join(_hf_home, "datasets"))
+    _os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _os.path.join(_hf_home, "hub"))
+
 import os
 import sys
 import argparse
 import logging
 import time
 import random
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -130,7 +148,7 @@ def create_output_dir(output_dir: str) -> Path:
 class HFStreamingDataset(IterableDataset):
     """Stream text samples from a HuggingFace dataset via hf-mirror.com.
 
-    Supports both pretraining (text field) and SFT (messages field) formats.
+    Supports both pretraining (text/content field) and SFT (messages field) formats.
     """
 
     def __init__(
@@ -140,8 +158,9 @@ class HFStreamingDataset(IterableDataset):
         split: str = "train",
         max_seq_len: int = 2048,
         num_samples: Optional[int] = None,
-        text_field: str = "text",
+        text_field: str = "content",
         is_sft: bool = False,
+        config_name: Optional[str] = None,
         seed: int = 42,
         shuffle: bool = True,
         rank: int = 0,
@@ -155,13 +174,16 @@ class HFStreamingDataset(IterableDataset):
         self.num_samples = num_samples
         self.text_field = text_field
         self.is_sft = is_sft
+        self.config_name = config_name
         self.seed = seed
         self.shuffle = shuffle
         self.rank = rank
         self.world_size = max(int(world_size), 1)
 
-        # Set HF endpoint to mirror for streaming
-        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        # Note: HF_ENDPOINT and HF_HOME are set at module import time
+        # (top of this file) so that huggingface_hub picks them up before
+        # HfApi() caches its default endpoint. Streaming keeps the dataset
+        # off-disk; only small metadata is fetched to the temp HF_HOME.
 
         # Lazy init dataset
         self._ds = None
@@ -170,13 +192,20 @@ class HFStreamingDataset(IterableDataset):
     def _ensure_dataset(self):
         if self._ds is None:
             from datasets import load_dataset
-            logger.info(f"Loading streaming dataset {self.dataset_name} (split={self.split})")
-            self._ds = load_dataset(
-                self.dataset_name,
+            logging.getLogger(__name__).info(
+                f"Streaming (no local parquet cache) dataset {self.dataset_name}"
+                f"{f' ({self.config_name})' if self.config_name else ''}"
+                f" (split={self.split}, endpoint={os.environ.get('HF_ENDPOINT')},"
+                f" HF_HOME={os.environ.get('HF_HOME')})"
+            )
+            load_kwargs = dict(
                 split=self.split,
                 streaming=True,
-                trust_remote_code=True,
+                cache_dir=None,  # Do not persist parquet locally
             )
+            if self.config_name:
+                load_kwargs["name"] = self.config_name
+            self._ds = load_dataset(self.dataset_name, **load_kwargs)
             if self.shuffle:
                 self._ds = self._ds.shuffle(seed=self.seed, buffer_size=1000)
 
@@ -300,14 +329,22 @@ def train(args):
     config = HippoConfig(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
+        tie_word_embeddings=args.tie_word_embeddings,
+        use_bias=args.use_bias,
         num_heads=args.num_heads,
         head_dim=args.head_dim,
-        num_kv=args.num_kv,
+        expand_v=args.expand_v,
+        kda_mode=args.kda_mode,
+        use_short_conv=args.use_short_conv,
+        allow_neg_eigval=args.allow_neg_eigval,
+        safe_gate=args.safe_gate,
+        lower_bound=args.lower_bound,
+        conv_size=args.conv_size,
+        conv_bias=args.conv_bias,
         num_layers=args.num_layers,
         num_blocks=args.num_blocks,
         intermediate_size=args.intermediate_size,
-        max_seq_len=args.max_seq_len,
-        checkpoint_every_layer=args.checkpoint_every_layer,
+        rms_norm_eps=args.rms_norm_eps,
     )
     logger.info(f"Model config: {config}")
 
@@ -345,9 +382,15 @@ def train(args):
         dataloader = create_dummy_dataloader(args.batch_size, args.seq_len, config.vocab_size)
     else:
         tokenizer = load_tokenizer(args.tokenizer_path)
-        dataset_name = args.sft_dataset if args.stage == "sft" else args.pretrain_dataset
-        is_sft = args.stage == "sft"
-        logger.info(f"Loading dataset: {dataset_name} (stage={args.stage})")
+        if args.stage == "sft":
+            dataset_name = args.sft_dataset
+            config_name = args.sft_config
+            is_sft = True
+        else:
+            dataset_name = args.pretrain_dataset
+            config_name = args.pretrain_config
+            is_sft = False
+        logger.info(f"Loading dataset: {dataset_name} (config={config_name}, stage={args.stage})")
         dataset = HFStreamingDataset(
             dataset_name=dataset_name,
             tokenizer=tokenizer,
@@ -355,6 +398,8 @@ def train(args):
             max_seq_len=args.seq_len,
             num_samples=args.max_steps * args.batch_size * args.gradient_accumulation_steps,
             is_sft=is_sft,
+            config_name=config_name,
+            text_field=args.text_field,
             rank=0,
             world_size=1,
         )
@@ -442,13 +487,23 @@ def main():
     # Model args
     parser.add_argument("--vocab_size", type=int, default=248320)
     parser.add_argument("--hidden_size", type=int, default=1024)
+    parser.add_argument("--tie_word_embeddings", type=bool, default=True)
+    parser.add_argument("--use_bias", type=bool, default=False)
     parser.add_argument("--num_heads", type=int, default=16)
     parser.add_argument("--head_dim", type=int, default=64)
-    parser.add_argument("--num_kv", type=int, default=64)
+    parser.add_argument("--expand_v", type=float, default=1.0)
+    parser.add_argument("--kda_mode", type=str, default="chunk",
+                        choices=["chunk", "fused_recurrent"])
+    parser.add_argument("--use_short_conv", type=bool, default=False)
+    parser.add_argument("--allow_neg_eigval", type=bool, default=False)
+    parser.add_argument("--safe_gate", type=bool, default=False)
+    parser.add_argument("--lower_bound", type=float, default=None)
+    parser.add_argument("--conv_size", type=int, default=4)
+    parser.add_argument("--conv_bias", type=bool, default=False)
     parser.add_argument("--num_layers", type=int, default=32)
     parser.add_argument("--num_blocks", type=int, default=8)
     parser.add_argument("--intermediate_size", type=int, default=2736)
-    parser.add_argument("--max_seq_len", type=int, default=-1)
+    parser.add_argument("--rms_norm_eps", type=float, default=1e-6)
 
     # Training args
     parser.add_argument("--batch_size", type=int, default=2)
@@ -471,8 +526,12 @@ def main():
                         help="Training stage: pretrain or sft")
     parser.add_argument("--pretrain_dataset", type=str,
                         default="openbmb/Ultra-FineWeb-L3")
+    parser.add_argument("--pretrain_config", type=str,
+                        default="Ultra-FineWeb-L3-en-QA-Synthetic")
     parser.add_argument("--sft_dataset", type=str,
                         default="openbmb/UltraData-SFT-2605")
+    parser.add_argument("--sft_config", type=str, default=None)
+    parser.add_argument("--text_field", type=str, default="content")
     parser.add_argument("--tokenizer_path", type=str,
                         default="src/tokenizer")
     parser.add_argument("--use_dummy_data", action="store_true", default=False)
@@ -481,7 +540,6 @@ def main():
     # GPU
     parser.add_argument("--min_gpu_memory_mb", type=int, default=10240)
     parser.add_argument("--offload_optimizer", action="store_true", default=False)
-    parser.add_argument("--checkpoint_every_layer", action="store_true", default=False)
 
     args = parser.parse_args()
 

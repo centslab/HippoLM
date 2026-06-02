@@ -32,7 +32,7 @@ class HippoLayer(nn.Module):
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Core sub-layers
-        self.kda = KDA(config)
+        self.kda = KDA(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
     def forward(

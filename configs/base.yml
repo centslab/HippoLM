@@ -3,20 +3,30 @@
 # Model Architecture
 vocab_size: 248320
 hidden_size: 1024
-num_heads: 16
-head_dim: 64
-num_kv: 64
-num_layers: 32
-num_blocks: 8
-intermediate_size: 2736
 tie_word_embeddings: true
 use_bias: false
 
-# Normalization
-rms_norm_eps: 1e-6
+# KDA (Kimi Delta Attention)
+num_heads: 16
+head_dim: 64
+expand_v: 1.0
+kda_mode: chunk            # chunk for training, fused_recurrent for inference
+use_short_conv: false      # global KDA, no local inductive bias
+allow_neg_eigval: false
+safe_gate: false
+lower_bound: null
+conv_size: 4
+conv_bias: false
 
-# Position Encoding
-max_seq_len: -1  # -1 means unlimited context in code
+# Architecture Depth
+num_layers: 32
+num_blocks: 8
+
+# FFN (SwiGLU)
+intermediate_size: 2736
+
+# Normalization
+rms_norm_eps: 0.000001
 
 # Training
 epochs: 1
@@ -26,8 +36,6 @@ seq_len: 512
 learning_rate: 1.0e-4
 weight_decay: 0.01
 gradient_accumulation_steps: 4
-gradient_checkpointing: true
-checkpoint_every_layer: false
 fp16: true
 
 # Stage: pretrain or sft
@@ -36,7 +44,10 @@ stage: pretrain
 # Data (HF datasets streamed from hf-mirror.com)
 # Set HF_ENDPOINT=https://hf-mirror.com before running
 pretrain_dataset: openbmb/Ultra-FineWeb-L3
+pretrain_config: Ultra-FineWeb-L3-en-QA-Synthetic
 sft_dataset: openbmb/UltraData-SFT-2605
+sft_config: null
+text_field: content
 tokenizer_path: src/tokenizer
 
 # Output
