@@ -8,10 +8,11 @@ Features:
 - max_step training limit
 - Checkpoint saving to timestamped output directory
 - Qwen3.5 tokenizer (local)
-- Streaming HF datasets from hf-mirror.com with single-threaded
-  background-thread prefetch and persistent ~/.cache:
-  - Pretraining: openbmb/Ultra-FineWeb-L3
-  - SFT: openbmb/UltraData-SFT-2605
+- Streaming datasets with ModelScope preferred (Aliyun CDN, fast)
+  and HuggingFace (hf-mirror.com) as fallback on network errors only:
+  - Pretraining: OpenBMB/Ultra-FineWeb-L3 (MS) / openbmb/Ultra-FineWeb-L3 (HF)
+  - SFT: OpenBMB/UltraData-SFT-2605 (MS) / openbmb/UltraData-SFT-2605 (HF)
+- Single-threaded background-thread prefetch with persistent ~/.cache
 
 CPU offload (DeepSpeed-style) will be added in v0.0.1.
 """
@@ -135,6 +136,116 @@ def load_tokenizer(tokenizer_path: str):
     return tokenizer
 
 
+# Network/connection-related exception types. If loading from ModelScope
+# fails with one of these, we transparently retry on the HF mirror. Other
+# exception types (HTTPError on 4xx, ValueError on schema mismatch, etc.)
+# are intentionally NOT caught here — they signal a real problem that
+# should not be masked by silently switching data sources.
+def _network_exceptions() -> tuple:
+    """Tuple of exception types considered 'connection error' for fallback."""
+    import socket
+    import requests
+    import urllib3.exceptions
+    return (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        urllib3.exceptions.NewConnectionError,
+        urllib3.exceptions.MaxRetryError,
+        urllib3.exceptions.ConnectTimeoutError,
+        urllib3.exceptions.ReadTimeoutError,
+        socket.gaierror,        # DNS resolution failure
+        socket.timeout,         # raw socket timeout
+        TimeoutError,           # builtin; superset of socket.timeout on py3
+        ConnectionError,        # builtin; OSError subclass incl. refused/reset
+    )
+
+
+def _load_modelscope_streaming(
+    ms_name: str,
+    config_name: Optional[str],
+    split: str,
+):
+    """Load a streaming dataset from ModelScope Hub (Aliyun CDN).
+
+    Returns a NativeIterableDataset that yields dicts in the same shape
+    as ``datasets.load_dataset(..., streaming=True)``, so the rest of
+    the pipeline (tokenize, collate) is source-agnostic.
+    """
+    from modelscope.msdatasets import MsDataset
+
+    kwargs: dict = dict(split=split, use_streaming=True)
+    if config_name:
+        kwargs["subset_name"] = config_name
+    return MsDataset.load(ms_name, **kwargs)
+
+
+def _load_hf_streaming(
+    hf_name: str,
+    config_name: Optional[str],
+    split: str,
+):
+    """Load a streaming dataset from HuggingFace Hub (via HF_ENDPOINT)."""
+    from datasets import load_dataset
+
+    kwargs: dict = dict(split=split, streaming=True)
+    if config_name:
+        kwargs["name"] = config_name
+    return load_dataset(hf_name, **kwargs)
+
+
+def _load_streaming_with_fallback(
+    hf_name: str,
+    ms_name: Optional[str],
+    config_name: Optional[str],
+    split: str,
+    use_ms: bool,
+    log: logging.Logger,
+):
+    """Try ModelScope first, fall back to HF on network/connection errors only.
+
+    Behavior matrix:
+      - ``use_ms=False`` or ``ms_name is None``  -> HF directly
+      - MS load succeeds                          -> return MS iterator
+      - MS raises ``_network_exceptions``         -> warn, fall back to HF
+      - MS raises ``ImportError`` (not installed) -> warn, fall back to HF
+      - MS raises anything else (HTTPError 4xx,
+        ValueError on schema, KeyError on field)  -> re-raise unchanged
+    """
+    if use_ms and ms_name:
+        try:
+            ds = _load_modelscope_streaming(ms_name, config_name, split)
+            log.info(
+                f"Streaming dataset from ModelScope: {ms_name}"
+                f"{f' (subset={config_name})' if config_name else ''}"
+                f" (split={split})"
+            )
+            return ds
+        except _network_exceptions() as e:
+            log.warning(
+                f"ModelScope unreachable for {ms_name} "
+                f"({type(e).__name__}: {e}); "
+                f"falling back to HF endpoint "
+                f"{os.environ.get('HF_ENDPOINT', 'huggingface.co')}: {hf_name}"
+            )
+        except ImportError as e:
+            log.warning(
+                f"modelscope is not installed ({e}); "
+                f"falling back to HF: {hf_name}"
+            )
+        # Other exceptions (HTTPError on 4xx, schema errors, etc.) are
+        # intentionally not caught - they indicate a real problem that
+        # the HF mirror will not solve.
+
+    ds = _load_hf_streaming(hf_name, config_name, split)
+    log.info(
+        f"Streaming dataset from HF: {hf_name}"
+        f"{f' (config={config_name})' if config_name else ''}"
+        f" (split={split}, endpoint={os.environ.get('HF_ENDPOINT')},"
+        f" HF_HOME={os.environ.get('HF_HOME', '~/.cache/huggingface')})"
+    )
+    return ds
+
+
 def load_config(config_path: str) -> dict:
     """Load training config from YAML file."""
     import yaml
@@ -157,7 +268,13 @@ def create_output_dir(output_dir: str) -> Path:
 
 
 class HFStreamingDataset(IterableDataset):
-    """Stream text samples from a HuggingFace dataset via hf-mirror.com.
+    """Stream text samples from a ModelScope or HuggingFace dataset.
+
+    Primary source is ModelScope (Aliyun CDN, faster). On network or
+    connection errors only, falls back to HuggingFace via the configured
+    ``HF_ENDPOINT`` (hf-mirror.com by default). Non-network errors
+    (HTTP 4xx, schema mismatch, missing fields) propagate so the user
+    sees the real failure rather than a silent source switch.
 
     Supports both pretraining (text/content field) and SFT (messages field) formats.
 
@@ -177,9 +294,13 @@ class HFStreamingDataset(IterableDataset):
         config_name: Optional[str] = None,
         seed: int = 42,
         shuffle: bool = False,
+        ms_dataset_name: Optional[str] = None,
+        use_modelscope: bool = True,
     ):
         super().__init__()
         self.dataset_name = dataset_name
+        self.ms_dataset_name = ms_dataset_name
+        self.use_modelscope = use_modelscope
         self.tokenizer = tokenizer
         self.split = split
         self.max_seq_len = max_seq_len
@@ -198,20 +319,14 @@ class HFStreamingDataset(IterableDataset):
 
     def _ensure_dataset(self):
         if self._ds is None:
-            from datasets import load_dataset
-            logging.getLogger(__name__).info(
-                f"Streaming dataset {self.dataset_name}"
-                f"{f' ({self.config_name})' if self.config_name else ''}"
-                f" (split={self.split}, endpoint={os.environ.get('HF_ENDPOINT')},"
-                f" HF_HOME={os.environ.get('HF_HOME', '~/.cache/huggingface')})"
-            )
-            load_kwargs = dict(
+            self._ds = _load_streaming_with_fallback(
+                hf_name=self.dataset_name,
+                ms_name=self.ms_dataset_name,
+                config_name=self.config_name,
                 split=self.split,
-                streaming=True,
+                use_ms=self.use_modelscope,
+                log=logging.getLogger(__name__),
             )
-            if self.config_name:
-                load_kwargs["name"] = self.config_name
-            self._ds = load_dataset(self.dataset_name, **load_kwargs)
             if self.shuffle:
                 self._ds = self._ds.shuffle(seed=self.seed, buffer_size=1000)
 
@@ -465,16 +580,23 @@ def train(args):
     else:
         tokenizer = load_tokenizer(args.tokenizer_path)
         if args.stage == "sft":
-            dataset_name = args.sft_dataset
+            hf_name = args.sft_dataset_hf
+            ms_name = args.sft_dataset_ms
             config_name = args.sft_config
             is_sft = True
         else:
-            dataset_name = args.pretrain_dataset
+            hf_name = args.pretrain_dataset_hf
+            ms_name = args.pretrain_dataset_ms
             config_name = args.pretrain_config
             is_sft = False
-        logger.info(f"Loading dataset: {dataset_name} (config={config_name}, stage={args.stage})")
+        logger.info(
+            f"Loading dataset: stage={args.stage}, hf={hf_name}, ms={ms_name},"
+            f" use_modelscope={args.use_modelscope}, config={config_name}"
+        )
         dataset = HFStreamingDataset(
-            dataset_name=dataset_name,
+            dataset_name=hf_name,
+            ms_dataset_name=ms_name,
+            use_modelscope=args.use_modelscope,
             tokenizer=tokenizer,
             split="train",
             max_seq_len=args.seq_len,
@@ -645,12 +767,23 @@ def main():
     parser.add_argument("--stage", type=str, default="pretrain",
                         choices=["pretrain", "sft"],
                         help="Training stage: pretrain or sft")
-    parser.add_argument("--pretrain_dataset", type=str,
-                        default="openbmb/Ultra-FineWeb-L3")
+    parser.add_argument("--use_modelscope", type=bool, default=True,
+                        help="Prefer ModelScope (Aliyun CDN) over HF. Falls "
+                             "back to HF only on network/connection errors.")
+    parser.add_argument("--pretrain_dataset_hf", type=str,
+                        default="openbmb/Ultra-FineWeb-L3",
+                        help="HF dataset id for pretraining (fallback source).")
+    parser.add_argument("--pretrain_dataset_ms", type=str,
+                        default="OpenBMB/Ultra-FineWeb-L3",
+                        help="ModelScope dataset id for pretraining (primary).")
     parser.add_argument("--pretrain_config", type=str,
                         default="Ultra-FineWeb-L3-en-QA-Synthetic")
-    parser.add_argument("--sft_dataset", type=str,
-                        default="openbmb/UltraData-SFT-2605")
+    parser.add_argument("--sft_dataset_hf", type=str,
+                        default="openbmb/UltraData-SFT-2605",
+                        help="HF dataset id for SFT (fallback source).")
+    parser.add_argument("--sft_dataset_ms", type=str,
+                        default="OpenBMB/UltraData-SFT-2605",
+                        help="ModelScope dataset id for SFT (primary).")
     parser.add_argument("--sft_config", type=str, default=None)
     parser.add_argument("--text_field", type=str, default="content")
     parser.add_argument("--tokenizer_path", type=str,
