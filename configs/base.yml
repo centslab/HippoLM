@@ -11,7 +11,7 @@ num_heads: 16
 head_dim: 64
 expand_v: 1.0
 kda_mode: chunk            # chunk for training, fused_recurrent for inference
-use_short_conv: false      # global KDA, no local inductive bias
+use_short_conv: true
 allow_neg_eigval: false
 safe_gate: false
 lower_bound: null
