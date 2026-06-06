@@ -79,6 +79,18 @@ class _ParamState:
     # AdamW-specific (also reused as Muon's momentum buffer; same
     # field is overloaded to keep the dataclass slim).
     exp_avg_sq: torch.Tensor | None = None
+    # AdamW-specific: persistent first-moment buffer (m). Lives in
+    # its own allocation so that ``m = beta1*m + (1-beta1)*g`` is
+    # not aliased with the incoming grad ``g = s.accum``. An
+    # earlier version of this code re-purposed ``s.accum`` as m
+    # (zeroing it after the step) but that meant ``g`` and ``m``
+    # were the same tensor during the in-place update, so the
+    # chained ``m.mul_(beta1).add_(g, alpha=1-beta1)`` mutated
+    # ``g`` mid-chain and produced ``m = 0.99*X`` instead of the
+    # intended ``0.1*X`` (9.9x error on every step). Keeping
+    # ``m`` separate is the standard AdamW layout and makes the
+    # aliasing bug impossible by construction. Set to None for Muon.
+    m: torch.Tensor | None = None
     # Cached for Muon: original param shape for reshape on GPU.
     shape: tuple = field(default_factory=tuple)
     # Step counter (per param; cheap).
@@ -141,7 +153,23 @@ class CPUAdamW:
             self.state[id(p)] = _ParamState(
                 param=p,
                 accum=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
-                exp_avg_sq=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
+                # v MUST be FP32: an FP16 v can underflow to 0 for
+                # entries where the grad magnitude is small
+                # (1e-4 to 1e-3), and that makes the AdamW
+                # denominator fall back to ``eps`` (1e-8),
+                # blowing the per-element factor up to ~1e9 * m
+                # which overflows the FP16 cast and corrupts
+                # the param with inf. FP32 v never underflows
+                # (FP32 has ~28 bits of dynamic range, way more
+                # than the ~12 bits of FP16). m stays FP16
+                # because the m update is bounded in magnitude
+                # by the grad scale and FP16 precision is
+                # sufficient for the per-element update.
+                exp_avg_sq=torch.zeros(n, dtype=torch.float32, device="cpu").pin_memory(),
+                # Persistent first-moment buffer. Allocated
+                # separately from ``accum`` so that the in-place
+                # m update cannot alias the incoming grad.
+                m=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
                 kind="adamw",
                 shape=p.shape,
             )
@@ -170,14 +198,20 @@ class CPUAdamW:
             bc1 = 1.0 - beta1 ** step
             bc2 = 1.0 - beta2 ** step
             g = s.accum
-            # exp_avg (m) and exp_avg_sq (v) are stored inside
-            # accum and exp_avg_sq respectively; we keep them in
-            # place between steps. m_t = beta1 * m_{t-1} + (1-beta1) * g.
-            # We need a separate m tensor. Recycle accum as m, and
-            # use exp_avg_sq as v.
-            m = s.accum                # re-purpose: m lives here
+            # m lives in its own buffer (``s.m``), initialised
+            # to 0 in :meth:`__init__`. We update it in place;
+            # on step 1, m = beta1*0 + (1-beta1)*g = 0.1*g.
+            # The previous v0.0.1 layout over-loaded ``s.accum``
+            # as both the grad accumulator AND m, but that made
+            # ``g`` and ``m`` the same tensor for the in-place
+            # update chain (``m.mul_(beta1).add_(g, 1-beta1)``),
+            # which mutates ``g`` mid-chain to ``0.9*g_orig``
+            # and produces ``m = 0.99*X`` instead of ``0.1*X``
+            # (9.9x error on every step). The dedicated ``s.m``
+            # buffer makes the aliasing bug impossible.
+            m = s.m
             v = s.exp_avg_sq
-            # Update m, v (FP16 in-place ops).
+            # Update m (FP16, in place) and v (FP32, in place).
             m.mul_(beta1).add_(g, alpha=1.0 - beta1)
             v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
             # Compute update: -lr * (m/bc1) / (sqrt(v/bc2) + eps) - lr*wd*p
@@ -200,13 +234,14 @@ class CPUAdamW:
             #
             # We use (b) for memory efficiency.
             #
-            # FP16 SAFETY: do the divisor math in FP32. Pure FP16
-            # ``1/sqrt(v)`` underflows when v ≈ 0 (v_max in FP16
-            # is 65504, but the reciprocal of a small v rounds to
-            # 0). The up-cast is a ``numel`` op — cheap relative to
-            # the GPU transfer and far cheaper than the matmul we'd
-            # otherwise corrupt.
-            denom = (v.float() / bc2).sqrt_().add_(eps)        # FP32, numel
+            # FP16 SAFETY: do the divisor math in FP32. The m
+            # update is in FP16 (in place); the v update is in
+            # FP32 (so v never underflows). Pure FP16
+            # ``1/sqrt(v)`` would underflow when v ≈ 0 (v_min in
+            # FP16 is ~6e-8, but the reciprocal of a small v
+            # rounds to 0). The up-cast is a ``numel`` op — cheap
+            # relative to the GPU transfer.
+            denom = (v / bc2).sqrt_().add_(eps)                # FP32, numel
             factor = (m.float() / bc1) / denom                 # FP32, numel
             # The per-element factor is a 1-D tensor of size
             # ``numel``; ``s.param.data`` may be 1-D (RMSNorm,
@@ -217,10 +252,48 @@ class CPUAdamW:
             if wd != 0.0:
                 # Decoupled weight decay: p = p * (1 - lr * wd).
                 s.param.data.mul_(1.0 - lr * wd)
-            # factor is FP32 (numel); cast to param dtype (FP16 on
-            # the GPU side) before the DMA, then reshape to the
-            # param's view so the add_ broadcasts element-wise.
-            factor_gpu = factor.to(s.param.dtype, non_blocking=True).view_as(s.param.data)
+            # factor is FP32 on CPU (numel). We need it on the same
+            # device and dtype as ``s.param.data`` before the
+            # ``add_`` — otherwise PyTorch raises
+            # "Expected all tensors to be on the same device".
+            # ``.to(dtype, non_blocking=True)`` ONLY changes dtype;
+            # the device stays CPU (and on CPU non_blocking is a
+            # no-op), so we have to pass device= explicitly.
+            factor_gpu = factor.to(
+                device=s.param.device, dtype=s.param.dtype,
+                non_blocking=True,
+            ).view_as(s.param.data)
+            # DIAG: per-stage telemetry for the first few steps
+            # so we can localize where inf/nan is introduced on
+            # the embed (the post-step pmax went to inf on step 0).
+            import os as _os_diag
+            import logging as _logging_diag
+            if _os_diag.environ.get("HIPPOLM_ADAMW_DIAG") == "1" and step <= int(
+                _os_diag.environ.get("HIPPOLM_DIAG_STEPS", "3")
+            ):
+                _log_diag = _logging_diag.getLogger(__name__)
+                _has = lambda t, dt: t.detach().to(dt, copy=True)
+                _factor_fp16 = factor.to(torch.float16).to(torch.float32)
+                _factor_gpu_fp32 = _has(factor_gpu, torch.float32)
+                def _stats(name, t):
+                    f = t.detach().float()
+                    nan_n = torch.isnan(f).sum().item()
+                    inf_n = torch.isinf(f).sum().item()
+                    return (
+                        f"{name}: max_abs={f.abs().max().item():.3e}"
+                        f" min_abs={f.abs().min().item():.3e}"
+                        f" nan={int(nan_n)} inf={int(inf_n)}"
+                        f" numel={f.numel()}"
+                    )
+                _log_diag.info(
+                    f"[adamw-diag step={step} shape={tuple(s.shape)}]"
+                    f" {_stats('m(after update, fp16)', m)}"
+                    f" | {_stats('v(after update, fp16)', v)}"
+                    f" | {_stats('denom(fp32)', denom)}"
+                    f" | {_stats('factor(fp32)', factor)}"
+                    f" | {_stats('factor(fp16->fp32)', _factor_fp16)}"
+                    f" | {_stats('factor_gpu(fp32)', _factor_gpu_fp32)}"
+                )
             s.param.data.add_(factor_gpu, alpha=-lr)
             # Reset accum to zero for the next accumulation cycle.
             s.accum.zero_()
