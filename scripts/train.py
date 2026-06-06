@@ -44,6 +44,24 @@ if "HF_ENDPOINT" not in _os.environ:
 # This way repeated runs reuse downloaded parquet shards instead of
 # paying the 3-hop redirect chain on every startup.
 
+# --- NCCL transport pinning -------------------------------------------
+# On this 8xV100-SXM2 box, GPUs 0-3 belong to a vLLM TP deployment
+# and GPU 4 to ComfyUI; we must not touch them. ``nvidia-smi topo -m``
+# shows the training pair (e.g. 5,6) connected via NVLink (NV1) so
+# inter-GPU traffic should stay on the NVLink fabric, not fall through
+# to PCIe/SYS (which would be ~5x slower and would also let NCCL probe
+# the vLLM GPUs).
+#
+# Set these BEFORE the first import of torch.distributed, so they are
+# in effect when NCCL initializes. ``setdefault`` leaves anything the
+# user pinned in the environment (e.g. for an NCCL_DEBUG run) alone.
+_os.environ.setdefault("NCCL_P2P_LEVEL", "NVL")
+_os.environ.setdefault("NCCL_IB_DISABLE", "1")
+# Force NCCL to use only the loopback / IB-disallowed path; on a
+# single-node job the cross-NIC traffic is never useful and can
+# otherwise steal a few hundred ms at startup.
+_os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker,veth,br-")
+
 import os
 import sys
 import argparse
@@ -564,13 +582,27 @@ def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str
     os.environ["WORLD_SIZE"] = str(len(gpus))
     os.environ["LOCAL_RANK"] = str(rank)
 
+    # Bind this process to its training GPU BEFORE NCCL initializes.
+    # Without this, PyTorch's default CUDA device is cuda:0 (the first
+    # visible device), and NCCL's init_process_group infers the comm
+    # device from current_device() — so it allocates its comm buffers
+    # on cuda:0. On this 8xV100 box cuda:0 is occupied by vLLM (only
+    # ~239 MiB free), and the first barrier() / all-reduce from inside
+    # the model construction blows up with cudaErrorMemoryAllocation
+    # at the next synchronous NCCL call.
+    #
+    # Fix: set the default device first, then pass device_id= to
+    # init_process_group as belt-and-braces. The device_id= argument
+    # is the forward-compatible way to pin the NCCL comm to a specific
+    # GPU; set_device also silences NCCL's "Guessing device ID" warning.
+    torch.cuda.set_device(gpus[rank])
     dist.init_process_group(
         backend="nccl",
         init_method="env://",
         rank=rank,
         world_size=len(gpus),
+        device_id=torch.device(f"cuda:{gpus[rank]}"),
     )
-    torch.cuda.set_device(gpus[rank])
 
     # Per-worker logging.
     run_dir = Path(run_dir_path)
