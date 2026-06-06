@@ -227,7 +227,13 @@ class ParallelCrossEntropy(nn.Module):
         target_logit = tp_all_reduce(local_target_logit)  # [...]
 
         # Global logsumexp.
-        local_lse = local_logsumexp.squeeze(-1)  # [...]
+        # NOTE: ``local_logsumexp`` above is the *sum* of
+        # exp(local_centered) (the ``.log()`` is only applied when
+        # computing local_log_probs on the next line). To get the
+        # log-domain value used in the LSE identity below we must
+        # take its log here. Without this, ``local_lse`` is ~1.5e5
+        # and exp(1.5e5) overflows FP32 → global_lse=inf → nll=inf.
+        local_lse = local_logsumexp.log().squeeze(-1)  # [...]
         local_max_sq = local_max.squeeze(-1)  # [...]
         # global_max = max over ranks of local_max
         global_max = tp_all_reduce_max(local_max_sq)

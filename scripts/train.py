@@ -23,6 +23,7 @@ Replaces v0.0.0's DataParallel-with-GPU-AdamW path.
 # imported, because HfApi reads the env vars at construction time. Set them
 # at the very top, before any other imports, so that any chain import of
 # huggingface_hub (e.g. via `datasets` or `transformers`) picks them up.
+import math
 import os as _os
 from pathlib import Path as _Path
 
@@ -274,6 +275,11 @@ def _network_exceptions() -> tuple:
 
 _HIPPOLM_CACHE_DIR = _Path(_os.environ.get("HIPPOLM_CACHE_DIR") or str(_Path.home() / ".cache" / "hippolm" / "datasets"))
 _HIPPOLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Per-microbatch loss logging threshold: log every step for the
+# first N accumulated steps so we can see when nan/inf first
+# appears. Set via HIPPOLM_DIAG_STEPS env var (default 5).
+_DIAG_STEPS = int(_os.environ.get("HIPPOLM_DIAG_STEPS", "5"))
 
 
 def _ms_first_parquet_url(ms_name: str, config_name: Optional[str]) -> str:
@@ -1112,8 +1118,19 @@ def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str
                     loss = outputs["loss"]
                 # Scaler is disabled (see construction above), so
                 # ``scale`` is a no-op. Direct backward in FP16.
+                mb_loss = loss.detach().float().item()
+                # Per-microbatch loss logging: always log for the
+                # first ``_DIAG_STEPS`` accum cycles, and on any
+                # cycle where the microbatch loss is non-finite.
+                # Helps localize when/where nan/inf first appears.
+                if rank == 0 and (
+                    global_step < _DIAG_STEPS or not math.isfinite(mb_loss)
+                ):
+                    logger.info(
+                        f"  [diag] mb={batch_idx} loss={mb_loss:.6e}"
+                    )
                 (loss / args.gradient_accumulation_steps).backward()
-                accumulated_loss += loss.float().item()
+                accumulated_loss += mb_loss
 
                 # Stream grads to CPU and free GPU copies.
                 accumulate_grads_to_cpu(
