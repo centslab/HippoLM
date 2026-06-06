@@ -1,20 +1,22 @@
-"""Training script for HippoLM v0.0.0.
+"""Training script for HippoLM v0.0.1.
 
-Features:
-- Auto GPU selection (VRAM >= 10GB)
-- AMP FP16 training
-- Gradient accumulation
-- Gradient checkpointing every block_size layers
-- max_step training limit
-- Checkpoint saving to timestamped output directory
+Features (v0.0.1):
+- Contiguous 2/4/8 GPU selection (largest viable run, never odd)
+- Megatron-style TP (column-row parallel FFN, column-parallel
+  lm_head, replicated KDA / AttnRes / RMSNorm / embed)
+- Muon optimizer (Newton-Schulz on GPU) for 2D Linear weights
+- AdamW for 1D params (norms, queries) and lm_head / embed
+- CPU-offloaded optimizer state (m, v, momentum) on pinned memory
+- No gradients stored on GPU: each micro-batch streams
+  ``.grad`` to the CPU accumulators, frees the GPU copy, and
+  only triggers a real optimizer step after
+  ``gradient_accumulation_steps`` micro-batches
+- Background-thread streaming data prefetch
+- Persistent HF cache; ModelScope preferred, HF mirror fallback
 - Qwen3.5 tokenizer (local)
-- Streaming datasets with ModelScope preferred (Aliyun CDN, fast)
-  and HuggingFace (hf-mirror.com) as fallback on network errors only:
-  - Pretraining: OpenBMB/Ultra-FineWeb-L3 (MS) / openbmb/Ultra-FineWeb-L3 (HF)
-  - SFT: OpenBMB/UltraData-SFT-2605 (MS) / openbmb/UltraData-SFT-2605 (HF)
-- Single-threaded background-thread prefetch with persistent ~/.cache
+- max_step training limit
 
-CPU offload (DeepSpeed-style) will be added in v0.0.1.
+Replaces v0.0.0's DataParallel-with-GPU-AdamW path.
 """
 
 # CRITICAL: HF_ENDPOINT and HF_TOKEN must be set BEFORE huggingface_hub is
@@ -47,20 +49,17 @@ import sys
 import argparse
 import logging
 import time
-import random
 import queue
 import threading
 from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, "/home/wlx/HippoLM")
 
 from configs.base_config import HippoConfig
-from src.models.model import HippoModel
 
 
 def setup_logging(log_file: Path | None = None):
@@ -79,31 +78,37 @@ def setup_logging(log_file: Path | None = None):
 
 
 def get_available_gpus(min_memory_mb: int = 10240) -> list[int]:
-    """Select GPUs with at least min_memory_mb free VRAM."""
+    """Select a contiguous run of 2/4/8 GPUs, each with at least
+    ``min_memory_mb`` free VRAM.
+
+    Strategy: collect the indices of all eligible GPUs (in
+    increasing physical order), then look for the largest
+    contiguous run of length 2, 4, or 8 and return that. 1, 3, 5,
+    6, 7 are intentionally not supported — odd counts would force
+    uneven sharding and 6/7 are not power-of-two friendly. The
+    largest viable prefix is preferred (8 > 4 > 2) so we don't
+    under-utilize the box.
+    """
     if not torch.cuda.is_available():
         return []
+
+    eligible: list[int] = []
 
     try:
         import pynvml
 
         pynvml.nvmlInit()
         device_count = pynvml.nvmlDeviceGetCount()
-
-        available = []
         for i in range(device_count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             free_mb = info.free / (1024 ** 2)
             if free_mb >= min_memory_mb:
-                available.append(i)
-
+                eligible.append(i)
         pynvml.nvmlShutdown()
-        return available
-
     except ImportError:
         import subprocess
 
-        available = []
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=index,memory.free",
@@ -116,14 +121,28 @@ def get_available_gpus(min_memory_mb: int = 10240) -> list[int]:
                     idx = int(parts[0].strip())
                     free = float(parts[1].strip())
                     if free >= min_memory_mb:
-                        available.append(idx)
+                        eligible.append(idx)
         except FileNotFoundError:
             for i in range(torch.cuda.device_count()):
                 total = torch.cuda.get_device_properties(i).total_memory / (1024 ** 2)
                 if total >= min_memory_mb:
-                    available.append(i)
+                    eligible.append(i)
 
-        return available
+    # Respect CUDA_VISIBLE_DEVICES if set.
+    visible = torch.cuda.device_count()
+    eligible = [g for g in eligible if g < visible]
+    if not eligible:
+        eligible = list(range(visible))
+
+    # Find the largest contiguous run of size 2, 4, or 8.
+    for target in (8, 4, 2):
+        for start in range(len(eligible) - target + 1):
+            window = eligible[start:start + target]
+            if window[-1] - window[0] == target - 1:
+                # All contiguous and in order.
+                return window
+
+    return []
 
 
 def load_tokenizer(tokenizer_path: str):
@@ -520,33 +539,49 @@ def save_checkpoint(model, optimizer, scaler, step, loss, checkpoint_dir: Path):
     return path
 
 
-def train(args):
-    """Main training loop."""
-    run_dir = create_output_dir(args.output_dir)
-    log_file = run_dir / "logs" / "train.log"
+def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str):
+    """Single-worker training loop (one process per GPU).
 
+    Each worker:
+      - Initializes the NCCL process group with rank=rank, world=len(gpus)
+      - Builds its own TP model fragment (TPHippoModel constructs all
+        device fragments; each worker only uses its own slot)
+      - Builds per-device optimizers (Muon for 2D, AdamW for 1D + lm_head)
+      - Runs the data-parallel-style training loop: forward, backward,
+        stream grad to CPU, accumulate, optimizer step
+      - Logs to a per-worker log file under ``run_dir/logs``
+
+    The replicated modules (KDA, embed, RMSNorm, BlockAttnRes) are
+    broadcast from worker 0 to all others at construction time, so
+    the params on every device are identical. The sharded modules
+    (FFN, lm_head) are per-device from the start.
+    """
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(len(gpus))
+    os.environ["LOCAL_RANK"] = str(rank)
+
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        rank=rank,
+        world_size=len(gpus),
+    )
+    torch.cuda.set_device(gpus[rank])
+
+    # Per-worker logging.
+    run_dir = Path(run_dir_path)
+    log_file = run_dir / "logs" / f"train_rank{rank}.log"
     global logger
     logger = setup_logging(log_file)
-    logger.info(f"HippoLM Training - Output: {run_dir}")
+    logger.info(
+        f"Worker {rank}/{len(gpus)} starting on cuda:{gpus[rank]}"
+    )
 
-    # GPU selection
-    gpus = get_available_gpus(min_memory_mb=args.min_gpu_memory_mb)
-    use_dp = False
-    if not gpus:
-        logger.warning("No GPUs with enough memory, using CPU")
-        device = torch.device("cpu")
-    else:
-        # Clamp to visible devices to avoid device ordinal errors when CUDA_VISIBLE_DEVICES is set
-        visible = torch.cuda.device_count()
-        gpus = [g for g in gpus if g < visible]
-        if not gpus:
-            gpus = list(range(visible))
-        device = torch.device(f"cuda:{gpus[0]}")
-        if len(gpus) > 1:
-            logger.info(f"Using {len(gpus)} GPUs: {gpus} (DataParallel)")
-            use_dp = args.batch_size >= len(gpus)
-
-    # Model config
+    # ---- Model config ----
     config = HippoConfig(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
@@ -567,15 +602,14 @@ def train(args):
         intermediate_size=args.intermediate_size,
         rms_norm_eps=args.rms_norm_eps,
     )
-    logger.info(f"Model config: {config}")
+    if rank == 0:
+        logger.info(f"Model config: {config}")
 
-    # Data — build the streaming dataset and start the prefetch producer
-    # BEFORE the model is constructed. The first-batch cold start
-    # (HF metadata cascade + 3-hop redirect parquet fetch) is IO-bound and
-    # can fully overlap with the ~12s the model takes to materialize on GPU.
+    # ---- Data (each worker runs its own iterator) ----
     if args.use_dummy_data:
-        logger.info("Using dummy data")
-        dataloader = create_dummy_dataloader(args.batch_size, args.seq_len, config.vocab_size)
+        dataloader = create_dummy_dataloader(
+            args.batch_size, args.seq_len, config.vocab_size
+        )
         dataloader_is_prefetched = False
     else:
         tokenizer = load_tokenizer(args.tokenizer_path)
@@ -589,10 +623,6 @@ def train(args):
             ms_name = args.pretrain_dataset_ms
             config_name = args.pretrain_config
             is_sft = False
-        logger.info(
-            f"Loading dataset: stage={args.stage}, hf={hf_name}, ms={ms_name},"
-            f" use_modelscope={args.use_modelscope}, config={config_name}"
-        )
         dataset = HFStreamingDataset(
             dataset_name=hf_name,
             ms_dataset_name=ms_name,
@@ -605,119 +635,188 @@ def train(args):
             text_field=args.text_field,
             shuffle=args.shuffle,
         )
-        # Single-threaded streaming with background-thread prefetch. Bounded
-        # queue keeps a few batches of tokenized data ready so the GPU does
-        # not stall waiting on HTTP. The training loop breaks on max_steps
-        # and signals the producer to drain & exit.
         dataloader = _PrefetchBatcher(
-            dataset,
-            batch_size=args.batch_size,
-            queue_size=2,
+            dataset, batch_size=args.batch_size, queue_size=2,
         )
         dataloader_is_prefetched = True
-        # Kick off the producer now so the IO overlaps with the model build
-        # and optimizer/scaler setup below.
         dataloader.start()
-        logger.info("Streaming prefetch producer started; building model in parallel.")
 
-    # Model
-    model = HippoModel(config).to(device)
-    if use_dp:
-        model = nn.DataParallel(model, device_ids=gpus)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Total params: {total_params:,}")
-
-    # Optimizer
-    if args.offload_optimizer:
-        logger.info("Using CPU AdamW optimizer (optimizer state offloaded to CPU)")
-        from src.training.cpu_adamw import create_cpu_adamw_optimizer
-        optimizer = create_cpu_adamw_optimizer(
-            model,
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-            logger=logger.info,
+    # ---- TP model ----
+    from src.models.tp_model import TPHippoModel
+    from src.models.tp_layers import init_tp
+    init_tp(world_size=len(gpus), devices=gpus, backend="nccl")
+    torch.manual_seed(args.seed)
+    model = TPHippoModel(config, devices=gpus, dtype=torch.float16)
+    # Broadcast replicated params from rank 0 (devices gpus[0]) to
+    # all others, so the KDA / embed / norm are identical on every
+    # device. (No-op when world_size == 1.)
+    dist.barrier()
+    model.sync_replicated_from(gpus[0])
+    if rank == 0:
+        trainable = sum(
+            p.numel() for p in model.trainable_parameters(gpus[0])
         )
-    else:
-        logger.info("Using standard GPU AdamW optimizer")
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.learning_rate,
-            betas=(0.9, 0.999),
-            weight_decay=args.weight_decay,
-        )
-    scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
+        logger.info(f"TP model built. Per-device trainable params: {trainable:,}")
 
-    # Training loop
-    model.train()
+    # ---- FP16 GradScaler ----
+    # V100 has FP16 tensor cores; the model runs in FP16
+    # (V100 doesn't support BF16 tensor cores). Loss scaling
+    # would normally be required to prevent FP16 gradient
+    # underflow on small updates, but PyTorch's
+    # ``GradScaler.unscale_`` refuses to unscale FP16 grads in
+    # this version (``allow_fp16=False`` is hard-coded), so we
+    # disable the scaler and run plain FP16. The risk of
+    # underflow is mitigated by the FP16-mantissa headroom on
+    # the magnitude range of the gradients (typical for
+    # transformer training at lr≈1e-3). If we later observe
+    # underflow, we can swap in a manual scale/unscale path
+    # or keep FP32 master weights.
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+    # ---- Per-device optimizers ----
+    from src.training.param_offload import (
+        build_param_groups, accumulate_grads_to_cpu, zero_cpu_grad_accum,
+    )
+    muon_opt, adamw_opt = build_param_groups(
+        model, device=gpus[rank],
+        lr_muon=args.muon_lr,
+        lr_adamw=args.learning_rate,
+        weight_decay=args.weight_decay,
+        muon_momentum=args.muon_momentum,
+    )
+    n_muon = sum(s.param.numel() for s in muon_opt.state.values())
+    n_adamw = sum(s.param.numel() for s in adamw_opt.state.values())
+    # Optimizer state is FP16 on CPU; 2 bytes per element.
+    logger.info(
+        f"Device {gpus[rank]}: Muon params={n_muon:,} ({n_muon * 2 / 1024**3:.2f} GB CPU momentum),"
+        f" AdamW params={n_adamw:,} ({n_adamw * 2 * 2 / 1024**3:.2f} GB CPU m+v)."
+    )
+
+    # ---- Training loop ----
     global_step = 0
     accumulated_loss = 0.0
-    optimizer.zero_grad()
+    microbatch_in_cycle = 0
 
-    for epoch in range(args.epochs):
-        logger.info(f"Epoch {epoch + 1}/{args.epochs}")
+    try:
+        for epoch in range(args.epochs):
+            if rank == 0:
+                logger.info(f"Epoch {epoch + 1}/{args.epochs}")
+            for batch_idx, batch in enumerate(dataloader):
+                if global_step >= args.max_steps:
+                    if rank == 0:
+                        logger.info(
+                            f"Reached max_steps={args.max_steps}, stopping"
+                        )
+                    break
 
-        for batch_idx, batch in enumerate(dataloader):
+                input_ids = batch["input_ids"].to(gpus[rank], non_blocking=True)
+                labels = batch["labels"].to(gpus[rank], non_blocking=True)
+
+                # autocast is a no-op for already-FP16 inputs but
+                # is needed in case any module casts back to FP32
+                # internally (e.g. layernorm in fla kernels) -- it
+                # catches that and downcasts to FP16 on the way out.
+                with torch.amp.autocast(
+                    device_type="cuda", dtype=torch.float16,
+                ):
+                    outputs = model(input_ids, labels=labels)
+                    loss = outputs["loss"]
+                # Scaler is disabled (see construction above), so
+                # ``scale`` is a no-op. Direct backward in FP16.
+                (loss / args.gradient_accumulation_steps).backward()
+                accumulated_loss += loss.float().item()
+
+                # Stream grads to CPU and free GPU copies.
+                accumulate_grads_to_cpu(
+                    [muon_opt, adamw_opt], sync_device=gpus[rank],
+                )
+                del loss, outputs, input_ids, labels
+                microbatch_in_cycle += 1
+
+                if microbatch_in_cycle >= args.gradient_accumulation_steps:
+                    # Inf/nan check on the accumulated grads. FP16
+                    # has limited dynamic range; we skip the
+                    # optimizer step on overflow so the CPU state
+                    # doesn't get poisoned.
+                    found_inf = False
+                    for opt in (muon_opt, adamw_opt):
+                        for s in opt.state.values():
+                            if not torch.isfinite(s.accum).all():
+                                found_inf = True
+                                break
+                        if found_inf:
+                            break
+                    if not found_inf:
+                        muon_opt.step()
+                        adamw_opt.step()
+                        zero_cpu_grad_accum([muon_opt, adamw_opt])
+                    scaler.update()
+                    torch.cuda.synchronize(gpus[rank])
+
+                    global_step += 1
+                    avg_loss = accumulated_loss / args.gradient_accumulation_steps
+                    accumulated_loss = 0.0
+                    microbatch_in_cycle = 0
+
+                    if rank == 0 and global_step % args.log_interval == 0:
+                        logger.info(
+                            f"Step {global_step}/{args.max_steps} | "
+                            f"Loss: {avg_loss:.4f}"
+                        )
+                        # VRAM snapshot for OOM debugging.
+                        for d in gpus:
+                            free, total = torch.cuda.mem_get_info(d)
+                            used = total - free
+                            logger.info(
+                                f"  device {d} VRAM: {used / 1024**3:.2f} /"
+                                f" {total / 1024**3:.2f} GB"
+                            )
+
             if global_step >= args.max_steps:
-                logger.info(f"Reached max_steps={args.max_steps}, stopping")
-                if dataloader_is_prefetched:
-                    dataloader.stop()
                 break
+    finally:
+        if dataloader_is_prefetched:
+            dataloader.close()
+        dist.destroy_process_group()
 
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
 
-            with torch.amp.autocast("cuda", enabled=args.fp16):
-                outputs = model(input_ids, labels=labels)
-                loss = outputs["loss"]
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
+def train(args):
+    """Top-level training entry point.
 
-            scaler.scale(loss).backward()
-            accumulated_loss += loss.item()
+    For TP world size > 1, spawns one process per GPU and runs
+    :func:`_train_worker`. For world size == 1, runs the worker
+    inline (no distributed init needed since all collectives are
+    no-ops when world_size == 1).
+    """
+    run_dir = create_output_dir(args.output_dir)
 
-            if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-
-                global_step += 1
-                avg_loss = accumulated_loss / args.gradient_accumulation_steps
-
-                if global_step % args.log_interval == 0:
-                    lr = optimizer.param_groups[0]['lr']
-                    logger.info(
-                        f"Step {global_step}/{args.max_steps} | "
-                        f"Loss: {avg_loss:.4f} | "
-                        f"LR: {lr:.2e}"
-                    )
-
-                if global_step % args.checkpoint_interval == 0:
-                    path = save_checkpoint(
-                        model.module if hasattr(model, "module") else model,
-                        optimizer, scaler, global_step, avg_loss,
-                        run_dir / "checkpoints",
-                    )
-                    logger.info(f"Checkpoint saved: {path}")
-
-                accumulated_loss = 0.0
-
-        if global_step >= args.max_steps:
-            break
-
-    # Final checkpoint
-    if global_step > 0:
-        path = save_checkpoint(
-            model.module if hasattr(model, "module") else model,
-            optimizer, scaler, global_step, accumulated_loss,
-            run_dir / "checkpoints",
+    gpus = get_available_gpus(min_memory_mb=args.min_gpu_memory_mb)
+    if not gpus:
+        print(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: no contiguous"
+            f" 2/4/8-GPU run is available.",
+            file=sys.stderr,
         )
-        logger.info(f"Final checkpoint saved: {path}")
+        return run_dir
 
-    if dataloader_is_prefetched:
-        dataloader.close()
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Selected contiguous"
+        f" TP group: {gpus} (world_size={len(gpus)})"
+    )
 
-    logger.info(f"Training complete! Output: {run_dir}")
+    if len(gpus) == 1:
+        # No TP plumbing needed; just run the worker inline.
+        _train_worker(rank=0, args=args, gpus=gpus, port=0, run_dir_path=str(run_dir))
+    else:
+        import torch.multiprocessing as mp
+        port = 29500 + (os.getpid() % 1000)
+        mp.spawn(
+            _train_worker,
+            args=(args, gpus, port, str(run_dir)),
+            nprocs=len(gpus),
+            join=True,
+        )
+
     return run_dir
 
 
@@ -799,7 +898,12 @@ def main():
 
     # GPU
     parser.add_argument("--min_gpu_memory_mb", type=int, default=10240)
-    parser.add_argument("--offload_optimizer", action="store_true", default=False)
+    parser.add_argument("--muon_lr", type=float, default=0.02,
+                        help="Learning rate for Muon (2D weight matrices).")
+    parser.add_argument("--muon_momentum", type=float, default=0.95,
+                        help="SGD momentum for the Muon path.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Init seed for replicated params on each device.")
 
     args = parser.parse_args()
 

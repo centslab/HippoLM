@@ -1,0 +1,274 @@
+"""Megatron-style Tensor Parallel layers for HippoLM.
+
+Implements ColumnParallelLinear (split output dim, no comm) and
+RowParallelLinear (split input dim, all-reduce output). These are
+the building blocks of column-row parallel pairs (e.g. SwiGLU FFN
+and KDA Q/K/V/O projections) and of the column-parallel lm_head.
+
+TP is implemented as a single process managing N CUDA devices. The
+NCCL process group is initialized once at startup and reused for
+all communication. World size is fixed at init time; the layers
+read it via ``get_tp_world_size()``.
+"""
+from __future__ import annotations
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# --------------------------------------------------------------------------- #
+# Process-group state. Set once by init_tp(); queried by every TP op.         #
+# --------------------------------------------------------------------------- #
+_TP_GROUP = None
+_TP_WORLD_SIZE = 1
+_TP_RANK = 0
+
+
+def get_tp_world_size() -> int:
+    return _TP_WORLD_SIZE
+
+
+def get_tp_rank() -> int:
+    return _TP_RANK
+
+
+def get_tp_group():
+    return _TP_GROUP
+
+
+def init_tp(world_size: int, devices: list[int], backend: str = "nccl") -> None:
+    """Initialize the single-process TP group spanning ``world_size`` GPUs.
+
+    Uses ``torch.distributed`` with a single rank 0 process owning
+    ``world_size`` devices. NCCL handles the cross-device comms.
+
+    We must call ``torch.cuda.set_device(devices[rank])`` before
+    touching any tensor on that device, so the rank's "default"
+    stream is bound correctly. The TP layers below always use
+    ``param.device`` rather than relying on a default device, so
+    this matters mainly for collective ops.
+    """
+    import torch.distributed as dist
+
+    global _TP_GROUP, _TP_WORLD_SIZE, _TP_RANK
+    assert _TP_GROUP is None, "init_tp called twice"
+
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    # Pick a port that's unlikely to clash. Use the same convention
+    # as torchrun defaults so external launches don't break.
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", str(world_size))
+    os.environ.setdefault("LOCAL_RANK", "0")
+
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            rank=0,
+            world_size=world_size,
+        )
+    _TP_GROUP = dist.group.WORLD
+    _TP_WORLD_SIZE = world_size
+    _TP_RANK = 0  # single-process; rank is the device slot
+    torch.cuda.set_device(devices[0])
+
+
+def shutdown_tp() -> None:
+    import torch.distributed as dist
+    global _TP_GROUP, _TP_WORLD_SIZE, _TP_RANK
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    _TP_GROUP = None
+    _TP_WORLD_SIZE = 1
+    _TP_RANK = 0
+
+
+# --------------------------------------------------------------------------- #
+# TP linear layers                                                            #
+# --------------------------------------------------------------------------- #
+class _AllReduce(torch.autograd.Function):
+    """Forward: all-reduce. Backward: identity (sum's gradient is 1)."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if _TP_WORLD_SIZE == 1:
+            return x
+        import torch.distributed as dist
+        out = x.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=_TP_GROUP)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        # d/dx sum_i x_i = 1 for each x_i, so each rank's grad is
+        # passed through unchanged. (We do NOT all-reduce the grad;
+        # the upstream graph will route it to the right sharded
+        # inputs.)
+        return grad
+
+
+def tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    return _AllReduce.apply(x)
+
+
+def tp_all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
+    if _TP_WORLD_SIZE == 1:
+        return x
+    import torch.distributed as dist
+    out = x.clone()
+    dist.all_reduce(out, op=dist.ReduceOp.SUM, group=_TP_GROUP)
+    return out
+
+
+def tp_all_reduce_max(x: torch.Tensor) -> torch.Tensor:
+    if _TP_WORLD_SIZE == 1:
+        return x
+    import torch.distributed as dist
+    out = x.clone()
+    dist.all_reduce(out, op=dist.ReduceOp.MAX, group=_TP_GROUP)
+    return out
+
+
+def _slice(t: torch.Tensor, dim: int, rank: int, world: int) -> torch.Tensor:
+    """Split ``t`` along ``dim`` into ``world`` equal pieces and return rank's.
+
+    Falls back to identity when world == 1.
+    """
+    if world == 1:
+        return t
+    size = t.size(dim)
+    assert size % world == 0, f"dim={dim} size={size} not divisible by world={world}"
+    chunk = size // world
+    return t.narrow(dim, rank * chunk, chunk).contiguous()
+
+
+class ColumnParallelLinear(nn.Module):
+    """Linear whose output dim is sharded across the TP group.
+
+    Weight shape: ``[in_features, out_features // world]``. No
+    communication on forward (output is sharded); on backward the
+    input gradient is implicitly summed via the autograd graph of
+    the consumer (typically a RowParallelLinear that all-reduces).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world = get_tp_world_size()
+        assert out_features % self.world == 0, (
+            f"out_features={out_features} not divisible by tp_world={self.world}"
+        )
+        self.out_features_per_partition = out_features // self.world
+        # Store the full logical size so checkpoints / state_dicts look
+        # like a normal Linear to a non-TP consumer.
+        self.weight = nn.Parameter(
+            torch.empty(self.out_features_per_partition, in_features, device=device, dtype=dtype)
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(self.out_features_per_partition, device=device, dtype=dtype)
+            )
+        else:
+            self.register_parameter("bias", None)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., in_features]; weight: [out/world, in]
+        # F.linear computes x @ weight.T -> [..., out/world]
+        return F.linear(x, self.weight, self.bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"out_features_per_partition={self.out_features_per_partition}, "
+            f"tp_world={self.world}, bias={self.bias is not None}"
+        )
+
+
+class RowParallelLinear(nn.Module):
+    """Linear whose input dim is sharded across the TP group.
+
+    Weight shape: ``[in_features // world, out_features]``. Forward
+    is a local matmul producing a partial output, followed by an
+    all-reduce. The bias is added on each rank but only the rank-0
+    contribution is kept after the all-reduce to avoid double-counting.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world = get_tp_world_size()
+        assert in_features % self.world == 0, (
+            f"in_features={in_features} not divisible by tp_world={self.world}"
+        )
+        self.in_features_per_partition = in_features // self.world
+        self.weight = nn.Parameter(
+            torch.empty(out_features, self.in_features_per_partition, device=device, dtype=dtype)
+        )
+        # Bias lives on every rank; we mask it to zero on non-zero
+        # ranks so the all-reduce sums to a single effective bias.
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., in/world]. Local matmul -> [..., out].
+        out = F.linear(x, self.weight)
+        if self.bias is not None and _TP_RANK == 0:
+            out = out + self.bias
+        elif self.bias is not None:
+            # Add a zero bias on other ranks so the all-reduce
+            # only sees the rank-0 contribution once.
+            out = out + 0.0
+        return tp_all_reduce(out)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, "
+            f"in_features_per_partition={self.in_features_per_partition}, "
+            f"out_features={self.out_features}, "
+            f"tp_world={self.world}, bias={self.bias is not None}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Helpers for inspecting how a tensor would be sharded                        #
+# --------------------------------------------------------------------------- #
+def partition_slice(total: int) -> tuple[int, int]:
+    """Return (start, length) of this rank's shard of a 1D dim of size ``total``."""
+    rank = get_tp_rank()
+    world = get_tp_world_size()
+    chunk = total // world
+    return rank * chunk, chunk
