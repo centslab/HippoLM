@@ -73,7 +73,18 @@ def init_tp(world_size: int, devices: list[int], backend: str = "nccl") -> None:
     _TP_GROUP = dist.group.WORLD
     _TP_WORLD_SIZE = world_size
     _TP_RANK = 0  # single-process; rank is the device slot
-    torch.cuda.set_device(devices[0])
+    # NOTE: do NOT call ``set_device`` here. Each worker in the TP
+    # group has already called ``set_device(gpus[rank])`` before
+    # init_tp, and the NCCL process group was initialised with
+    # ``device_id=cuda:{gpus[rank]}``. Pinning the current device
+    # back to ``devices[0]`` (always cuda:5 in the 8xV100 layout)
+    # silently desyncs every rank's ``current_device()`` from the
+    # NCCL backend's device constraint, and the next all-reduce
+    # on a tensor allocated via ``torch.cuda.current_device()``
+    # blows up with "Tensor found on device cuda:5 but backend
+    # constrained to cuda:6". The TP layers themselves always
+    # reference ``param.device`` rather than the default device,
+    # so we don't need this set_device call at all.
 
 
 def shutdown_tp() -> None:
