@@ -282,13 +282,16 @@ _HIPPOLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _DIAG_STEPS = int(_os.environ.get("HIPPOLM_DIAG_STEPS", "5"))
 
 
-def _ms_first_parquet_url(ms_name: str, config_name: Optional[str]) -> str:
+def _ms_first_parquet_url(ms_name: str, config_name: Optional[str], timeout: float = 15) -> str:
     """Resolve the URL of the first parquet shard for a MS streaming dataset.
 
     The MS dataset is sharded by subset (e.g. ``qa``) and each shard is a
     snappy-compressed parquet file on the Aliyun CDN. We hit the
     canonical ``resolve/master`` URL (which 302-redirects to the CDN
     with a fresh auth_key) and return the resolved URL.
+
+    ``timeout`` defaults to 15s; the caller may pass a longer value when
+    it intends to retry on transient CDN timeouts.
     """
     import requests
     # Hard-coded path is OK here: the dataset is OpenBMB/Ultra-FineWeb-L3
@@ -302,7 +305,7 @@ def _ms_first_parquet_url(ms_name: str, config_name: Optional[str]) -> str:
     for path in guess_paths:
         url = f"{base}/{path}"
         try:
-            r = requests.head(url, allow_redirects=True, timeout=15)
+            r = requests.head(url, allow_redirects=True, timeout=timeout)
             if r.status_code == 200 and "Content-Length" in r.headers:
                 return r.url
         except _network_exceptions() as e:
@@ -329,7 +332,35 @@ def _prefetch_first_parquet(
     cache_path = _HIPPOLM_CACHE_DIR / f"{ms_name.replace('/', '__')}__{config_name or 'default'}__part0.snappy.parquet"
     expected_size: Optional[int] = None
     try:
-        auth_url = _ms_first_parquet_url(ms_name, config_name)
+        # The MS CDN has been observed to spuriously ReadTimeout on
+        # the first HEAD from one of the two worker processes while
+        # the other worker gets through fine. A single 15s timeout
+        # then pushes the unlucky worker into the MS-streaming path,
+        # which can take tens of minutes to warm up; meanwhile the
+        # other worker enters the TP forward loop and the model
+        # all-reduce hangs for the full NCCL timeout (default 30 min)
+        # waiting for the slow rank. Retry a few times with a longer
+        # timeout before giving up so both ranks converge on the
+        # local cache when it's available.
+        auth_url: Optional[str] = None
+        last_err: Optional[BaseException] = None
+        for attempt in range(3):
+            try:
+                auth_url = _ms_first_parquet_url(
+                    ms_name, config_name, timeout=30,
+                )
+                last_err = None
+                break
+            except _network_exceptions() as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+        if auth_url is None:
+            raise RuntimeError(
+                f"MS URL HEAD kept failing after 3 attempts"
+                f" (last error: {last_err})"
+            )
         head = requests.head(auth_url, allow_redirects=True, timeout=15)
         expected_size = int(head.headers.get("Content-Length", 0)) or None
     except Exception as e:
@@ -708,17 +739,56 @@ class _PrefetchBatcher:
     ``batch_size`` samples, collates, and ``put``s the batch. The main thread
     pulls batches via ``__iter__`` and processes them. When the dataset
     iterator is exhausted a ``None`` sentinel ends the stream; any producer
-    exception is re-raised on the main thread.
+    exception is also pushed into the queue and re-raised on the consumer.
+
+    Owner / non-owner split (TP):
+    In a multi-process run (e.g. TP=2) the dataloading is centralised:
+    exactly one process is the *owner* and runs the producer thread;
+    every other process is a *non-owner* that just consumes the same
+    shared queue. This is required by the model contract: TP shards the
+    weights but replicates the input, so every rank must see the exact
+    same batch on every step. Running an independent producer per rank
+    is incorrect (different file iterators, different timing, no
+    cross-rank synchronisation on the input).
+
+    The shared queue can be a ``multiprocessing.Queue`` (cross-process,
+    pickles payloads) or a ``queue.Queue`` (single-process, no
+    pickling). Both support ``put`` / ``get`` / ``put_nowait`` /
+    ``queue.Full``, so the producer and consumer code is identical.
     """
 
+    # End-of-stream marker. ``None`` is a singleton in CPython and is
+    # safe to use as a sentinel across processes: pickle round-trips
+    # preserve the identity, so ``item is None`` still works in the
+    # consumer process.
     _SENTINEL = None
 
-    def __init__(self, dataset, batch_size: int, queue_size: int = 2):
+    def __init__(
+        self,
+        dataset=None,
+        batch_size: int = 1,
+        queue_size: int = 2,
+        shared_queue=None,
+        is_owner: bool = True,
+    ):
+        if is_owner and dataset is None:
+            raise ValueError(
+                "_PrefetchBatcher: dataset is required when is_owner=True"
+            )
         self._dataset = dataset
         self._batch_size = batch_size
-        self._queue: queue.Queue = queue.Queue(maxsize=max(queue_size, 1))
+        if shared_queue is not None:
+            # Cross-process (or externally supplied) queue. The
+            # caller is responsible for sizing it; we trust whatever
+            # maxsize they passed.
+            self._queue = shared_queue
+        else:
+            # Single-process default: in-memory bounded queue.
+            self._queue = queue.Queue(maxsize=max(queue_size, 1))
+        self._is_owner = bool(is_owner) and dataset is not None
         self._error: Optional[BaseException] = None
         self._thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._log = logging.getLogger(__name__)
         self._samples_seen = 0
@@ -753,6 +823,14 @@ class _PrefetchBatcher:
                 self._batches_built += 1
         except BaseException as e:  # noqa: BLE001 - surface to consumer
             self._error = e
+            # Push the exception itself so cross-process consumers
+            # (which don't share ``self._error`` with us) can re-raise
+            # it. ``queue.Full`` is the same class on threading.Queue
+            # and multiprocessing.Queue.
+            try:
+                self._queue.put_nowait(e)
+            except queue.Full:
+                pass
         finally:
             # Put the sentinel in a non-blocking way: if the main thread has
             # already abandoned the iterator the queue may be full of items
@@ -773,7 +851,14 @@ class _PrefetchBatcher:
                 continue
 
     def start(self) -> None:
-        """Start the producer thread. Idempotent; safe to call multiple times."""
+        """Start the producer thread. Idempotent; safe to call multiple times.
+
+        Non-owners (processes that share the queue with the owner) are
+        no-ops here: there is no producer to start, the owner's thread
+        is what feeds the queue.
+        """
+        if not self._is_owner:
+            return
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(
@@ -785,10 +870,10 @@ class _PrefetchBatcher:
         # iter? tokenize? collate? queue.put?). The watchdog only
         # observes; it does not interrupt the producer. Interval is
         # 30s because at 1 sample / 0.5s the per-tick log is just noise.
-        self._watchdog = threading.Thread(
+        self._watchdog_thread = threading.Thread(
             target=self._watchdog, name="hf-prefetch-watchdog", daemon=True
         )
-        self._watchdog.start()
+        self._watchdog_thread.start()
 
     def _watchdog(self) -> None:
         _log = self._log
@@ -807,13 +892,26 @@ class _PrefetchBatcher:
         while True:
             item = self._queue.get()
             if item is self._SENTINEL:
-                if self._error is not None:
+                # End of stream. In the single-process case the
+                # producer's exception is also in self._error; in the
+                # cross-process case the exception was already pushed
+                # into the queue and re-raised via the
+                # ``isinstance(item, BaseException)`` branch below
+                # before we ever see the sentinel.
+                if self._error is not None and not isinstance(
+                    self._error, StopIteration
+                ):
                     raise self._error
                 return
+            if isinstance(item, BaseException):
+                raise item
             yield item
 
     def stop(self) -> None:
-        """Signal the producer to exit at the next sample boundary."""
+        """Signal the producer to exit at the next sample boundary.
+
+        Non-owners have no producer to signal; this is a no-op for them.
+        """
         self._stop.set()
 
     def close(self, timeout: float = 2.0) -> None:
@@ -866,14 +964,26 @@ def _compute_and_clip_grad_norm(
 
     sq_sum = torch.zeros(1, dtype=torch.float32, device="cpu")
     n_tensors = 0
+    # Grab the device from the first param we see. The optimizer
+    # state is keyed on the param itself, and the param was created
+    # on ``gpus[rank]`` during model construction, so its
+    # ``.device`` is guaranteed to be the device the NCCL group is
+    # bound to. We deliberately do NOT use ``torch.cuda.current_device()``
+    # here: it's a per-thread default that can drift away from the
+    # NCCL backend's device constraint if anything else (TP setup,
+    # another module) called ``set_device`` in between. Reading
+    # ``.device`` off a real param is the only source of truth.
+    reduce_device: Optional[torch.device] = None
     for opt in optimizers:
         for s in opt.state.values():
+            if reduce_device is None:
+                reduce_device = s.param.device
             # ``accum`` is a CPU FP16 1-D buffer; promote to FP32
             # before squaring so very large grads don't overflow.
             sq_sum += s.accum.detach().float().pow(2).sum()
             n_tensors += 1
 
-    if n_tensors == 0:
+    if n_tensors == 0 or reduce_device is None:
         return 0.0
 
     # TP-reduce the squared norm. Each rank owns a disjoint shard of
@@ -882,8 +992,17 @@ def _compute_and_clip_grad_norm(
     # the global value. When world_size == 1 the reduction is a no-op
     # and we skip it (and avoid touching the default process group,
     # which may not be initialized).
+    #
+    # The TP group is NCCL-backed, so the all-reduce tensor must live
+    # on a CUDA device. We compute the per-rank sum on CPU (because
+    # the accumulated grads ``s.accum`` are CPU FP16 buffers), then
+    # move a 1-element sum to the worker's NCCL-bound CUDA device
+    # for the collective, and move it back to CPU for the sqrt. The
+    # 1-element H2D/D2H copy is negligible compared to the reduction.
     if get_tp_world_size() > 1:
-        dist.all_reduce(sq_sum, op=dist.ReduceOp.SUM, group=get_tp_group())
+        gpu_sq_sum = sq_sum.to(reduce_device, non_blocking=True)
+        dist.all_reduce(gpu_sq_sum, op=dist.ReduceOp.SUM, group=get_tp_group())
+        sq_sum = gpu_sq_sum.to("cpu", non_blocking=True)
     total_norm = sq_sum.sqrt().item()
 
     if total_norm > max_norm:
@@ -909,7 +1028,14 @@ def save_checkpoint(model, optimizer, scaler, step, loss, checkpoint_dir: Path):
     return path
 
 
-def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str):
+def _train_worker(
+    rank: int,
+    args,
+    gpus: list[int],
+    port: int,
+    run_dir_path: str,
+    shared_batch_queue=None,
+):
     """Single-worker training loop (one process per GPU).
 
     Each worker:
@@ -989,41 +1115,66 @@ def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str
     if rank == 0:
         logger.info(f"Model config: {config}")
 
-    # ---- Data (each worker runs its own iterator) ----
+    # ---- Data (centralised: rank 0 owns the iterator, all ranks consume
+    # the same shared queue). TP is "shard weights, replicate input", so
+    # every rank MUST see the same batch on every step. Building an
+    # independent producer per rank is the bug we're fixing. ----
     if args.use_dummy_data:
+        # Dummy data has no IO; each rank builds its own random
+        # DataLoader. The batches are random per rank, which is fine
+        # for a smoke test of the sharded forward/backward path even
+        # though it doesn't strictly satisfy the TP input-replication
+        # contract. We deliberately don't route this through
+        # _PrefetchBatcher because the DataLoader already yields
+        # collated batches and re-collating would crash.
         dataloader = create_dummy_dataloader(
             args.batch_size, args.seq_len, config.vocab_size
         )
         dataloader_is_prefetched = False
     else:
-        tokenizer = load_tokenizer(args.tokenizer_path)
-        if args.stage == "sft":
-            hf_name = args.sft_dataset_hf
-            ms_name = args.sft_dataset_ms
-            config_name = args.sft_config
-            is_sft = True
+        if rank == 0:
+            # Owner: build the dataset, the tokenizer, and start the
+            # producer thread. All the IO + tokenize cost is paid here.
+            tokenizer = load_tokenizer(args.tokenizer_path)
+            if args.stage == "sft":
+                hf_name = args.sft_dataset_hf
+                ms_name = args.sft_dataset_ms
+                config_name = args.sft_config
+                is_sft = True
+            else:
+                hf_name = args.pretrain_dataset_hf
+                ms_name = args.pretrain_dataset_ms
+                config_name = args.pretrain_config
+                is_sft = False
+            dataset = HFStreamingDataset(
+                dataset_name=hf_name,
+                ms_dataset_name=ms_name,
+                use_modelscope=args.use_modelscope,
+                tokenizer=tokenizer,
+                split="train",
+                max_seq_len=args.seq_len,
+                is_sft=is_sft,
+                config_name=config_name,
+                text_field=args.text_field,
+                shuffle=args.shuffle,
+            )
+            dataloader = _PrefetchBatcher(
+                dataset, batch_size=args.batch_size,
+                shared_queue=shared_batch_queue, is_owner=True,
+            )
+            dataloader_is_prefetched = True
+            dataloader.start()
         else:
-            hf_name = args.pretrain_dataset_hf
-            ms_name = args.pretrain_dataset_ms
-            config_name = args.pretrain_config
-            is_sft = False
-        dataset = HFStreamingDataset(
-            dataset_name=hf_name,
-            ms_dataset_name=ms_name,
-            use_modelscope=args.use_modelscope,
-            tokenizer=tokenizer,
-            split="train",
-            max_seq_len=args.seq_len,
-            is_sft=is_sft,
-            config_name=config_name,
-            text_field=args.text_field,
-            shuffle=args.shuffle,
-        )
-        dataloader = _PrefetchBatcher(
-            dataset, batch_size=args.batch_size, queue_size=2,
-        )
-        dataloader_is_prefetched = True
-        dataloader.start()
+            # Non-owner: don't touch the dataset / tokenizer / parquet
+            # at all. Just attach to the shared queue the owner is
+            # filling. This is the only way all ranks can be sure to
+            # see the same input on every step.
+            dataloader = _PrefetchBatcher(
+                dataset=None, batch_size=args.batch_size,
+                shared_queue=shared_batch_queue, is_owner=False,
+            )
+            dataloader_is_prefetched = True
+            # No start() needed: the owner's thread is doing the work.
 
     # ---- TP model ----
     from src.models.tp_model import TPHippoModel
@@ -1162,8 +1313,112 @@ def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str
                         total_norm = _compute_and_clip_grad_norm(
                             [muon_opt, adamw_opt], args.max_grad_norm,
                         )
+                        # DIAG: detailed per-step telemetry for the
+                        # first few steps, so we can localize which
+                        # optimizer (or which param group) is the
+                        # source of NaN/Inf if it appears. The fields
+                        # we capture are the ones most likely to
+                        # blow up in FP16:
+                        #   - max abs of accum (the clipped grad)
+                        #   - max abs of state (m for AdamW, momentum for Muon)
+                        #   - max abs of param
+                        #   - per-optimizer non-finite counts after step
+                        if global_step < _DIAG_STEPS and rank == 0:
+                            import math as _math
+                            def _amax_cpu(t):
+                                if t is None:
+                                    return 0.0
+                                return t.detach().abs().max().item()
+                            muon_acc = max(
+                                (_amax_cpu(s.accum) for s in muon_opt.state.values()),
+                                default=0.0,
+                            )
+                            muon_mom = max(
+                                (_amax_cpu(s.exp_avg_sq) for s in muon_opt.state.values()),
+                                default=0.0,
+                            )
+                            muon_pmax = max(
+                                (_amax_cpu(s.param.data) for s in muon_opt.state.values()),
+                                default=0.0,
+                            )
+                            adamw_acc = max(
+                                (_amax_cpu(s.accum) for s in adamw_opt.state.values()),
+                                default=0.0,
+                            )
+                            adamw_v = max(
+                                (_amax_cpu(s.exp_avg_sq) for s in adamw_opt.state.values()),
+                                default=0.0,
+                            )
+                            adamw_pmax = max(
+                                (_amax_cpu(s.param.data) for s in adamw_opt.state.values()),
+                                default=0.0,
+                            )
+                            logger.info(
+                                f"  [diag-step {global_step} pre]"
+                                f" total_norm={total_norm:.3e}"
+                                f" muon: acc_max={muon_acc:.3e}"
+                                f" mom_max={muon_mom:.3e}"
+                                f" pmax={muon_pmax:.3e}"
+                                f" | adamw: acc_max={adamw_acc:.3e}"
+                                f" v_max={adamw_v:.3e}"
+                                f" pmax={adamw_pmax:.3e}"
+                            )
                         muon_opt.step()
+                        if global_step < _DIAG_STEPS and rank == 0:
+                            _nan_pmax = 0.0
+                            _nan_first = None
+                            for s in muon_opt.state.values():
+                                v = s.param.data
+                                if not torch.isfinite(v).all():
+                                    am = v.detach().abs().max().item()
+                                    if _math.isnan(am) or am > _nan_pmax:
+                                        _nan_pmax = am
+                                        if _nan_first is None:
+                                            _nan_first = (s.param.shape, am)
+                            if _nan_first is not None:
+                                logger.info(
+                                    f"  [diag-step {global_step} post-muon]"
+                                    f" NON-FINITE in muon params:"
+                                    f" first_shape={_nan_first[0]}"
+                                    f" pmax={_nan_first[1]:.3e}"
+                                )
+                            else:
+                                _pmax = max(
+                                    (_amax_cpu(s.param.data) for s in muon_opt.state.values()),
+                                    default=0.0,
+                                )
+                                logger.info(
+                                    f"  [diag-step {global_step} post-muon]"
+                                    f" all finite, pmax={_pmax:.3e}"
+                                )
                         adamw_opt.step()
+                        if global_step < _DIAG_STEPS and rank == 0:
+                            _nan_pmax = 0.0
+                            _nan_first = None
+                            for s in adamw_opt.state.values():
+                                v = s.param.data
+                                if not torch.isfinite(v).all():
+                                    am = v.detach().abs().max().item()
+                                    if _math.isnan(am) or am > _nan_pmax:
+                                        _nan_pmax = am
+                                        if _nan_first is None:
+                                            _nan_first = (s.param.shape, am)
+                            if _nan_first is not None:
+                                logger.info(
+                                    f"  [diag-step {global_step} post-adamw]"
+                                    f" NON-FINITE in adamw params:"
+                                    f" first_shape={_nan_first[0]}"
+                                    f" pmax={_nan_first[1]:.3e}"
+                                )
+                            else:
+                                _pmax = max(
+                                    (_amax_cpu(s.param.data) for s in adamw_opt.state.values()),
+                                    default=0.0,
+                                )
+                                logger.info(
+                                    f"  [diag-step {global_step} post-adamw]"
+                                    f" all finite, pmax={_pmax:.3e}"
+                                )
                         zero_cpu_grad_accum([muon_opt, adamw_opt])
                     else:
                         total_norm = float("nan")
@@ -1227,14 +1482,29 @@ def train(args):
     )
 
     if len(gpus) == 1:
-        # No TP plumbing needed; just run the worker inline.
-        _train_worker(rank=0, args=args, gpus=gpus, port=0, run_dir_path=str(run_dir))
+        # No TP plumbing needed; just run the worker inline. The
+        # worker will fall back to a local threading.Queue for the
+        # dataloader (no cross-process sharing needed).
+        _train_worker(
+            rank=0, args=args, gpus=gpus, port=0,
+            run_dir_path=str(run_dir), shared_batch_queue=None,
+        )
     else:
         import torch.multiprocessing as mp
         port = 29500 + (os.getpid() % 1000)
+        # TP shards weights but REPLICATES the input. Therefore all
+        # ranks must consume the exact same batches on every step,
+        # which means data loading has to be centralised: one process
+        # owns the dataset iterator and producer, every other process
+        # just consumes the same shared queue. Building an
+        # independent producer per rank is incorrect (different
+        # iterators, different timings, no cross-rank synchronisation
+        # on the input).
+        ctx = mp.get_context("spawn")
+        shared_batch_queue: "mp.Queue" = ctx.Queue(maxsize=2)
         mp.spawn(
             _train_worker,
-            args=(args, gpus, port, str(run_dir)),
+            args=(args, gpus, port, str(run_dir), shared_batch_queue),
             nprocs=len(gpus),
             join=True,
         )
