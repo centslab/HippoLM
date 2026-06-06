@@ -114,22 +114,68 @@ def tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
     return _AllReduce.apply(x)
 
 
+class _AllReduceSum(torch.autograd.Function):
+    """All-reduce SUM. Backward: identity (alias of :class:`_AllReduce`).
+
+    Kept as a separate class so the call site reads
+    ``tp_all_reduce_sum`` (rather than ``tp_all_reduce``) and so the
+    backward contract is documented at the function level.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if _TP_WORLD_SIZE == 1:
+            return x
+        import torch.distributed as dist
+        out = x.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=_TP_GROUP)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        return grad
+
+
 def tp_all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
-    if _TP_WORLD_SIZE == 1:
-        return x
-    import torch.distributed as dist
-    out = x.clone()
-    dist.all_reduce(out, op=dist.ReduceOp.SUM, group=_TP_GROUP)
-    return out
+    return _AllReduceSum.apply(x)
+
+
+class _AllReduceMax(torch.autograd.Function):
+    """All-reduce MAX. Backward: straight-through to the rank that held the max.
+
+    Forward computes ``out = max_r x_r`` across the TP group and saves
+    the *local* input plus the *global* output. Backward is the
+    subgradient of a max reduction: only the rank(s) that contributed
+    the max value receive the upstream gradient; others get zero. Ties
+    (multiple ranks with the same value as the global max) split the
+    gradient among them — this is the standard straight-through
+    estimator for max.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if _TP_WORLD_SIZE == 1:
+            # No comm: the global max equals the local value. Save both
+            # pointers (x and the same x) so backward can unpack a
+            # uniform 2-tuple regardless of world size.
+            ctx.save_for_backward(x, x)
+            return x
+        import torch.distributed as dist
+        out = x.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.MAX, group=_TP_GROUP)
+        ctx.save_for_backward(x, out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        x, out = ctx.saved_tensors
+        # 1 where this rank's value was the global max, 0 elsewhere.
+        mask = (x == out).to(grad.dtype)
+        return grad * mask
 
 
 def tp_all_reduce_max(x: torch.Tensor) -> torch.Tensor:
-    if _TP_WORLD_SIZE == 1:
-        return x
-    import torch.distributed as dist
-    out = x.clone()
-    dist.all_reduce(out, op=dist.ReduceOp.MAX, group=_TP_GROUP)
-    return out
+    return _AllReduceMax.apply(x)
 
 
 def _slice(t: torch.Tensor, dim: int, rank: int, world: int) -> torch.Tensor:
