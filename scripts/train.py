@@ -255,16 +255,24 @@ def _network_exceptions() -> tuple:
 #
 # Workaround: download the first parquet shard (~1 GB) to a stable local
 # cache once, then iterate the on-disk file with pyarrow. pyarrow reads
-# row groups one at a time, so peak RAM stays tiny even though the file
-# is 1 GB. Subsequent runs use the cache and start iterating within
-# ~1 second. We only pre-download the *first* shard because v0.0.0
-# validation (max_steps=1000) does not need more data than that, and the
-# training loop can early-exit on max_steps before exhausting the shard.
+# row groups one at a time (peak RAM ~1 row group, ~250MB compressed),
+# so loading IS streaming — the full file is never in memory. Subsequent
+# runs use the cache and start iterating within ~1 second.
+#
+# Cache policy: at most ONE shard is ever kept (``_HIPPOLM_CACHE_DIR``
+# contains a single file). We don't pre-download more shards because
+# v0.0.0 validation (max_steps=1000) does not need more data than the
+# first shard, and 1000 steps × 4 microbatches × 2 samples = 8K samples
+# fits easily inside the first 64K-row group.
+#
+# Set ``HIPPOLM_NO_PREFETCH=1`` to skip the pre-download and stream
+# from the CDN directly. Set ``HIPPOLM_CACHE_DIR=/path`` to relocate
+# the cache (e.g. to a larger disk if the default is constrained).
 #
 # If the pre-download fails (network down, disk full, MS outage), we
 # fall back to streaming so the user still has a path forward.
 
-_HIPPOLM_CACHE_DIR = _Path.home() / ".cache" / "hippolm" / "datasets"
+_HIPPOLM_CACHE_DIR = _Path(_os.environ.get("HIPPOLM_CACHE_DIR") or str(_Path.home() / ".cache" / "hippolm" / "datasets"))
 _HIPPOLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -488,7 +496,7 @@ def _load_streaming_with_fallback(
     from local NVMe takes ~3-5s end-to-end; reading it row-group by
     row-group from a slow CDN can take >10 min and is non-deterministic.
     """
-    if use_ms and ms_name:
+    if use_ms and ms_name and not _os.environ.get("HIPPOLM_NO_PREFETCH"):
         cached = _prefetch_first_parquet(ms_name, config_name, log)
         if cached is not None:
             log.info(
