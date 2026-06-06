@@ -77,6 +77,40 @@ from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, "/home/wlx/HippoLM")
 
+# ---------------------------------------------------------------------------
+# datasets streaming read retries
+# ---------------------------------------------------------------------------
+# ModelScope streaming for parquet datasets fetches a streaming reader
+# wrapped by ``datasets.utils.file_utils._add_retries_to_file_obj_read_method``,
+# which on a mid-stream disconnect sleeps one of these intervals and
+# retries up to ``*_MAX_RETRIES`` times:
+#
+#   CONNECTION_ERRORS_TO_RETRY     -> STREAMING_READ_RETRY_INTERVAL         (5s)
+#   HTTP 503 SERVER_UNAVAILABLE     -> STREAMING_READ_SERVER_UNAVAILABLE_…  (20s)
+#   HTTP 429 RATE_LIMIT             -> STREAMING_READ_RATE_LIMIT_RETRY_…    (60s)
+#   open(...) failures              -> STREAMING_OPEN_*                    (5s)
+#
+# Combined with the default ``MAX_RETRIES=20`` the worst case is
+# ``20 × 60s = 1200s`` of silent sleeping, which is what the init
+# "hang" actually is.  The log shows cdn-lfs-cn-1.modelscope.cn
+# returning 503 partway through a 1GB parquet read; we observe
+# 100s+ of empty time between log lines, exactly matching
+# ``20 × 5s = 100s`` of unrecoverable ``time.sleep``.
+#
+# Tighten the *retries* budget (50, 5s total) AND the *interval* on the
+# slow paths (503 → 1s, 429 → 2s) so transient CDN disconnects are
+# recovered transparently inside the streaming read rather than
+# surfacing as a 100s+ wall-clock stall.  The HF mirror is also routed
+# through the same wrapper, so this tuning helps its disconnects too.
+import datasets as _datasets_for_cfg
+_datasets_for_cfg.config.STREAMING_READ_MAX_RETRIES = 50
+_datasets_for_cfg.config.STREAMING_READ_RETRY_INTERVAL = 0.1
+_datasets_for_cfg.config.STREAMING_OPEN_MAX_RETRIES = 10
+_datasets_for_cfg.config.STREAMING_OPEN_RETRY_INTERVAL = 0.5
+_datasets_for_cfg.config.STREAMING_READ_SERVER_UNAVAILABLE_RETRY_INTERVAL = 1
+_datasets_for_cfg.config.STREAMING_READ_RATE_LIMIT_RETRY_INTERVAL = 2
+del _datasets_for_cfg
+
 from configs.base_config import HippoConfig
 
 
@@ -247,6 +281,10 @@ def _load_streaming_with_fallback(
       - MS raises ``ImportError`` (not installed) -> warn, fall back to HF
       - MS raises anything else (HTTPError 4xx,
         ValueError on schema, KeyError on field)  -> re-raise unchanged
+
+    The ``datasets`` streaming-read retry budget is tightened at module
+    import (see top of file) so a mid-stream disconnect on the MS path
+    raises within a few seconds rather than sleeping silently for ~100s.
     """
     if use_ms and ms_name:
         try:
@@ -543,6 +581,60 @@ def create_dummy_dataloader(batch_size: int, seq_len: int, vocab_size: int):
     return DataLoader(DummyDataset(), batch_size=batch_size, shuffle=True)
 
 
+def _compute_and_clip_grad_norm(
+    optimizers: list,
+    max_norm: float,
+) -> float:
+    """Compute the TP-reduced L2 norm of the accumulated CPU grads and
+    clip them in place if the norm exceeds ``max_norm``.
+
+    The accumulated grads (``s.accum``) live on CPU in FP16 as 1-D
+    tensors; we promote to FP32 for the norm computation (FP16
+    overflows past ~65k). The squared sum is all-reduced across the
+    TP group, so a parameter that is sharded across N ranks
+    contributes ``1/N`` of its squared L2 to each rank's local sum,
+    and the reduction makes the global norm exact.
+
+    Returns the **pre-clip** total norm. If ``max_norm <= 0`` the
+    function is a no-op and returns 0.0 (caller can use this to
+    detect "clipping disabled" without an extra flag).
+    """
+    if max_norm <= 0:
+        return 0.0
+    import torch.distributed as dist
+    from src.models.tp_layers import get_tp_group, get_tp_world_size
+
+    sq_sum = torch.zeros(1, dtype=torch.float32, device="cpu")
+    n_tensors = 0
+    for opt in optimizers:
+        for s in opt.state.values():
+            # ``accum`` is a CPU FP16 1-D buffer; promote to FP32
+            # before squaring so very large grads don't overflow.
+            sq_sum += s.accum.detach().float().pow(2).sum()
+            n_tensors += 1
+
+    if n_tensors == 0:
+        return 0.0
+
+    # TP-reduce the squared norm. Each rank owns a disjoint shard of
+    # the sharded params, so the per-rank ``sq_sum`` is already
+    # ``(1/world_size)`` of the global squared norm; ``SUM`` recovers
+    # the global value. When world_size == 1 the reduction is a no-op
+    # and we skip it (and avoid touching the default process group,
+    # which may not be initialized).
+    if get_tp_world_size() > 1:
+        dist.all_reduce(sq_sum, op=dist.ReduceOp.SUM, group=get_tp_group())
+    total_norm = sq_sum.sqrt().item()
+
+    if total_norm > max_norm:
+        scale = max_norm / (total_norm + 1e-6)
+        for opt in optimizers:
+            for s in opt.state.values():
+                s.accum.mul_(scale)
+
+    return total_norm
+
+
 def save_checkpoint(model, optimizer, scaler, step, loss, checkpoint_dir: Path):
     """Save training checkpoint."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -741,6 +833,17 @@ def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str
                         )
                     break
 
+                # Heartbeat for the user: first batch handed off
+                # means streaming + tokenize + prefetch are alive
+                # and we are about to start stepping.
+                if batch_idx == 0 and rank == 0:
+                    logger.info(
+                        f"First batch ready: "
+                        f"input_ids={tuple(batch['input_ids'].shape)}, "
+                        f"labels={tuple(batch['labels'].shape)} - "
+                        f"starting training"
+                    )
+
                 input_ids = batch["input_ids"].to(gpus[rank], non_blocking=True)
                 labels = batch["labels"].to(gpus[rank], non_blocking=True)
 
@@ -779,9 +882,20 @@ def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str
                         if found_inf:
                             break
                     if not found_inf:
+                        # Compute the TP-reduced L2 grad norm on the
+                        # accumulated CPU grads and clip in place if
+                        # it exceeds ``args.max_grad_norm``. This
+                        # guards against FP16 overflow (esp. in
+                        # early steps with large lr) and against
+                        # spikey KDA grads at block boundaries.
+                        total_norm = _compute_and_clip_grad_norm(
+                            [muon_opt, adamw_opt], args.max_grad_norm,
+                        )
                         muon_opt.step()
                         adamw_opt.step()
                         zero_cpu_grad_accum([muon_opt, adamw_opt])
+                    else:
+                        total_norm = float("nan")
                     scaler.update()
                     torch.cuda.synchronize(gpus[rank])
 
@@ -791,9 +905,14 @@ def _train_worker(rank: int, args, gpus: list[int], port: int, run_dir_path: str
                     microbatch_in_cycle = 0
 
                     if rank == 0 and global_step % args.log_interval == 0:
+                        grad_norm_str = (
+                            f"{total_norm:.2f}" if total_norm == total_norm
+                            else "nan"
+                        )
                         logger.info(
                             f"Step {global_step}/{args.max_steps} | "
-                            f"Loss: {avg_loss:.4f}"
+                            f"Loss: {avg_loss:.4f} | "
+                            f"grad_norm: {grad_norm_str}"
                         )
                         # VRAM snapshot for OOM debugging.
                         for d in gpus:
@@ -887,6 +1006,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Max global (TP-reduced) L2 grad norm. "
+                             "Set <= 0 to disable clipping. Default 1.0.")
     parser.add_argument("--fp16", action="store_true", default=True)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--checkpoint_interval", type=int, default=100)
