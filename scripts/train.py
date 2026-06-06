@@ -111,6 +111,19 @@ _datasets_for_cfg.config.STREAMING_READ_SERVER_UNAVAILABLE_RETRY_INTERVAL = 1
 _datasets_for_cfg.config.STREAMING_READ_RATE_LIMIT_RETRY_INTERVAL = 2
 del _datasets_for_cfg
 
+# Default socket timeout for streaming HTTP reads. Without this, a
+# CDN that accepts the connection then stops sending bytes (silent
+# stall, no 503, no TCP RST) leaves ``datasets`` / ``modelscope``
+# blocked in a recv() until the OS TCP keepalive fires (default
+# ~7200s on Linux). Setting 60s means a stalled connection raises
+# a timeout exception after 1 minute, which the retry config above
+# then turns into a transparent reconnect rather than a wall-clock
+# hang. Healthy chunks of this dataset arrive in 1-3s, so 60s is
+# generous headroom for slow CDN hops.
+import socket as _socket
+_socket.setdefaulttimeout(60.0)
+del _socket
+
 from configs.base_config import HippoConfig
 
 
@@ -231,6 +244,192 @@ def _network_exceptions() -> tuple:
     )
 
 
+# ---------------------------------------------------------------------------
+# Local parquet cache: pre-download the first shard, iterate from disk.
+# ---------------------------------------------------------------------------
+# Streaming from the ModelScope CDN has been observed to silently stall for
+# 100s+ minutes on a single row-group read when the CDN's mirror is slow
+# but still answering TCP opens. The 60s socket-level timeout converts a
+# stall into an exception that the retry wrapper recovers from, but the
+# effective throughput is then bounded by the CDN's bad day.
+#
+# Workaround: download the first parquet shard (~1 GB) to a stable local
+# cache once, then iterate the on-disk file with pyarrow. pyarrow reads
+# row groups one at a time, so peak RAM stays tiny even though the file
+# is 1 GB. Subsequent runs use the cache and start iterating within
+# ~1 second. We only pre-download the *first* shard because v0.0.0
+# validation (max_steps=1000) does not need more data than that, and the
+# training loop can early-exit on max_steps before exhausting the shard.
+#
+# If the pre-download fails (network down, disk full, MS outage), we
+# fall back to streaming so the user still has a path forward.
+
+_HIPPOLM_CACHE_DIR = _Path.home() / ".cache" / "hippolm" / "datasets"
+_HIPPOLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ms_first_parquet_url(ms_name: str, config_name: Optional[str]) -> str:
+    """Resolve the URL of the first parquet shard for a MS streaming dataset.
+
+    The MS dataset is sharded by subset (e.g. ``qa``) and each shard is a
+    snappy-compressed parquet file on the Aliyun CDN. We hit the
+    canonical ``resolve/master`` URL (which 302-redirects to the CDN
+    with a fresh auth_key) and return the resolved URL.
+    """
+    import requests
+    # Hard-coded path is OK here: the dataset is OpenBMB/Ultra-FineWeb-L3
+    # and the qa subset is the one we train on. If the path ever changes
+    # the fallback to streaming still works.
+    guess_paths = [
+        f"data/ultrafineweb_en_l3/qa/part-00000-37dc9f21-f87f-4f43-8dd2-134424f1537a-c000.snappy.parquet",
+    ]
+    base = f"https://www.modelscope.cn/datasets/{ms_name}/resolve/master"
+    last_err: Optional[BaseException] = None
+    for path in guess_paths:
+        url = f"{base}/{path}"
+        try:
+            r = requests.head(url, allow_redirects=True, timeout=15)
+            if r.status_code == 200 and "Content-Length" in r.headers:
+                return r.url
+        except _network_exceptions() as e:
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"Could not resolve first parquet URL for {ms_name}"
+        f" (last error: {last_err})"
+    )
+
+
+def _prefetch_first_parquet(
+    ms_name: str,
+    config_name: Optional[str],
+    log: logging.Logger,
+) -> Optional[Path]:
+    """Download the first parquet shard to ``~/.cache/hippolm/datasets``.
+
+    Returns the local path on success, or ``None`` on any failure (the
+    caller should then fall back to streaming). Logs progress every
+    ~5 seconds so a slow download is observable, not mysterious.
+    """
+    import requests
+    cache_path = _HIPPOLM_CACHE_DIR / f"{ms_name.replace('/', '__')}__{config_name or 'default'}__part0.snappy.parquet"
+    expected_size: Optional[int] = None
+    try:
+        auth_url = _ms_first_parquet_url(ms_name, config_name)
+        head = requests.head(auth_url, allow_redirects=True, timeout=15)
+        expected_size = int(head.headers.get("Content-Length", 0)) or None
+    except Exception as e:
+        log.warning(
+            f"Could not resolve MS first-shard URL ({type(e).__name__}: {e});"
+            f" skipping pre-download and falling back to streaming."
+        )
+        return None
+
+    if cache_path.exists() and expected_size and cache_path.stat().st_size == expected_size:
+        log.info(
+            f"Reusing cached parquet: {cache_path}"
+            f" ({cache_path.stat().st_size / 1024**2:.1f} MB)"
+        )
+        return cache_path
+
+    if cache_path.exists():
+        # Partial or stale; redownload. Resumable download would be nicer
+        # but the CDN does not always honor Range reliably, and a fresh
+        # start is simpler and fast enough at ~1-2 MB/s.
+        cache_path.unlink()
+
+    log.info(
+        f"Pre-downloading first parquet shard to {cache_path}"
+        f" ({expected_size / 1024**2:.1f} MB) ..."
+    )
+    t0 = time.monotonic()
+    got = 0
+    last_log = t0
+    rate = 0.0
+    try:
+        with requests.get(auth_url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            tmp = cache_path.with_suffix(cache_path.suffix + ".part")
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    got += len(chunk)
+                    now = time.monotonic()
+                    if now - last_log > 5:
+                        rate = got / (now - t0) / 1024
+                        pct = (
+                            f" ({got / expected_size * 100:.1f}%)"
+                            if expected_size else ""
+                        )
+                        log.info(
+                            f"  pre-download: {got / 1024**2:.1f} MB"
+                            f" in {now - t0:.1f}s, {rate:.0f} KB/s{pct}"
+                        )
+                        last_log = now
+            tmp.rename(cache_path)
+        now = time.monotonic()
+        rate = got / (now - t0) / 1024
+        pct = (
+            f" ({got / expected_size * 100:.1f}%)" if expected_size else ""
+        )
+        log.info(
+            f"  pre-download: {got / 1024**2:.1f} MB in {now - t0:.1f}s,"
+            f" {rate:.0f} KB/s{pct}"
+        )
+    except _network_exceptions() as e:
+        log.warning(
+            f"Pre-download failed ({type(e).__name__}: {e});"
+            f" falling back to streaming."
+        )
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+    except Exception as e:
+        log.warning(
+            f"Pre-download error ({type(e).__name__}: {e});"
+            f" falling back to streaming."
+        )
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+
+    return cache_path
+
+
+class _LocalParquetIterable:
+    """Yield examples from a local parquet shard via pyarrow row groups.
+
+    The MS streaming reader returns dicts with the same keys as the
+    parquet schema (``content`` for text, ``messages`` for SFT). This
+    wrapper does the same, so the existing ``HFStreamingDataset`` text
+    / SFT path works unchanged.
+
+    Iteration is row-group-by-row-group, not row-by-row, so the
+    inner loop is fast even on multi-GB files.
+    """
+
+    def __init__(self, path: Path):
+        self._path = Path(path)
+
+    def __iter__(self):
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(str(self._path))
+        # ``iter_batches`` reads one row group at a time and yields an
+        # Arrow RecordBatch. Converting to pandas then to dicts is
+        # cheap for our schema (1-2 text columns) and avoids the
+        # per-row Python overhead of ``to_pylist``.
+        for batch in pf.iter_batches(batch_size=1024):
+            df = batch.to_pandas()
+            for _, row in df.iterrows():
+                yield row.to_dict()
+
+
 def _load_modelscope_streaming(
     ms_name: str,
     config_name: Optional[str],
@@ -272,21 +471,31 @@ def _load_streaming_with_fallback(
     use_ms: bool,
     log: logging.Logger,
 ):
-    """Try ModelScope first, fall back to HF on network/connection errors only.
+    """Try local cached parquet first, then MS streaming, then HF streaming.
 
     Behavior matrix:
-      - ``use_ms=False`` or ``ms_name is None``  -> HF directly
-      - MS load succeeds                          -> return MS iterator
-      - MS raises ``_network_exceptions``         -> warn, fall back to HF
-      - MS raises ``ImportError`` (not installed) -> warn, fall back to HF
+      - ``use_ms=False`` or ``ms_name is None``  -> HF streaming directly
+      - Local cached parquet available              -> use ``_LocalParquetIterable``
+      - MS streaming succeeds                       -> return MS iterator
+      - MS raises ``_network_exceptions``           -> warn, fall back to HF
+      - MS raises ``ImportError`` (not installed)   -> warn, fall back to HF
       - MS raises anything else (HTTPError 4xx,
-        ValueError on schema, KeyError on field)  -> re-raise unchanged
+        ValueError on schema, KeyError on field)    -> re-raise unchanged
 
-    The ``datasets`` streaming-read retry budget is tightened at module
-    import (see top of file) so a mid-stream disconnect on the MS path
-    raises within a few seconds rather than sleeping silently for ~100s.
+    The local cache is preferred over streaming because the MS CDN has
+    been observed to silently stall 100s+ minutes on a single row-group
+    read when its mirror is having a bad day. Reading a 1GB parquet
+    from local NVMe takes ~3-5s end-to-end; reading it row-group by
+    row-group from a slow CDN can take >10 min and is non-deterministic.
     """
     if use_ms and ms_name:
+        cached = _prefetch_first_parquet(ms_name, config_name, log)
+        if cached is not None:
+            log.info(
+                f"Using local cached parquet for {ms_name}"
+                f" (subset={config_name}): {cached}"
+            )
+            return _LocalParquetIterable(cached)
         try:
             ds = _load_modelscope_streaming(ms_name, config_name, split)
             log.info(
@@ -497,21 +706,37 @@ class _PrefetchBatcher:
         self._error: Optional[BaseException] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._log = logging.getLogger(__name__)
+        self._samples_seen = 0
+        self._batches_built = 0
+        self._last_progress = time.monotonic()
 
     def _producer(self) -> None:
+        _log = self._log
+        _t0 = time.monotonic()
         try:
             batch: list = []
             for sample in self._dataset:
                 if self._stop.is_set():
                     return
+                self._samples_seen += 1
+                self._last_progress = time.monotonic()
+                _n = self._samples_seen
+                if _n == 1:
+                    _log.info(
+                        f"producer: first sample received"
+                        f" after {time.monotonic() - _t0:.2f}s"
+                    )
                 batch.append(sample)
                 if len(batch) >= self._batch_size:
                     self._put_with_stop(_collate_batch(batch))
+                    self._batches_built += 1
                     if self._stop.is_set():
                         return
                     batch = []
             if batch and not self._stop.is_set():
                 self._put_with_stop(_collate_batch(batch))
+                self._batches_built += 1
         except BaseException as e:  # noqa: BLE001 - surface to consumer
             self._error = e
         finally:
@@ -541,6 +766,27 @@ class _PrefetchBatcher:
             target=self._producer, name="hf-prefetch", daemon=True
         )
         self._thread.start()
+        # Watchdog: if the producer makes no progress for an extended
+        # time, log it so the user can see what stage is stuck (dataset
+        # iter? tokenize? collate? queue.put?). The watchdog only
+        # observes; it does not interrupt the producer. Interval is
+        # 30s because at 1 sample / 0.5s the per-tick log is just noise.
+        self._watchdog = threading.Thread(
+            target=self._watchdog, name="hf-prefetch-watchdog", daemon=True
+        )
+        self._watchdog.start()
+
+    def _watchdog(self) -> None:
+        _log = self._log
+        while not self._stop.is_set():
+            time.sleep(30.0)
+            idle = time.monotonic() - self._last_progress
+            if idle > 30.0:
+                _log.warning(
+                    f"prefetch watchdog: samples={self._samples_seen},"
+                    f" batches={self._batches_built}, idle={idle:.1f}s,"
+                    f" error={type(self._error).__name__ if self._error else 'None'}"
+                )
 
     def __iter__(self):
         self.start()
