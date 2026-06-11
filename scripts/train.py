@@ -17,6 +17,32 @@ Features (v0.0.1):
 - max_step training limit
 
 Replaces v0.0.0's DataParallel-with-GPU-AdamW path.
+
+TP simulation (development on a single-GPU box, e.g. one 5060 Ti 16G)
+-----------------------------------------------------------------------
+Pass ``--tp_sim`` to exercise the TP code paths without owning N
+physical GPUs. Internally we:
+  1. Keep ``get_available_gpus`` exactly as-is (still scans for
+     contiguous 2/4/8 runs of GPUs with >= 10 GB free).
+  2. If the scan returns [] (the single-GPU case), fall back to
+     ``cuda:0``.
+  3. Expand the GPU list to ``[gpus[0]] * tp_size`` so the
+     downstream mp.spawn launches N child processes all bound to
+     the same physical device.
+  4. Swap NCCL for the gloo backend. gloo can transport CUDA
+     tensors (it D2H-stages each collective, so it's much slower
+     than NVLink NCCL — we are testing correctness, not speed).
+  5. Sharding math (out_features // world, Column/RowParallelLinear,
+     replicated-broadcast, lm_head narrow view, fused-CE TP-aware
+     all-reduce) is byte-for-byte the same code as the real path;
+     only the transport differs.
+
+Memory note: replicated modules (KDA / AttnRes / embed / RMSNorm)
+are constructed independently in every process, so N processes
+each carry a full copy. On a 16 GB GPU the practical ceiling is
+``--tp_size=2`` (use with caution) or ``--tp_size=4`` if you shrink
+the config; ``--tp_size=8`` will OOM. Use ``--use_dummy_data`` for
+the cheapest smoke run.
 """
 
 # CRITICAL: HF_ENDPOINT and HF_TOKEN must be set BEFORE huggingface_hub is
@@ -84,7 +110,7 @@ from typing import Optional
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-sys.path.insert(0, "/home/wlx/HippoLM")
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 # ---------------------------------------------------------------------------
 # datasets streaming read retries
@@ -1014,14 +1040,23 @@ def _train_worker(
     # init_process_group as belt-and-braces. The device_id= argument
     # is the forward-compatible way to pin the NCCL comm to a specific
     # GPU; set_device also silences NCCL's "Guessing device ID" warning.
+    #
+    # TP simulation (``--tp_sim``) uses the gloo backend instead of
+    # NCCL: gloo transports CUDA tensors via host staging, so it has
+    # no device_id concept and the "pin comm to a specific GPU" trick
+    # doesn't apply. The sharding math is identical; only the comm
+    # transport changes.
     torch.cuda.set_device(gpus[rank])
-    dist.init_process_group(
-        backend="nccl",
+    backend = "gloo" if args.tp_sim else "nccl"
+    pg_kwargs: dict = dict(
+        backend=backend,
         init_method="env://",
         rank=rank,
         world_size=len(gpus),
-        device_id=torch.device(f"cuda:{gpus[rank]}"),
     )
+    if backend == "nccl":
+        pg_kwargs["device_id"] = torch.device(f"cuda:{gpus[rank]}")
+    dist.init_process_group(**pg_kwargs)
 
     # Per-worker logging.
     run_dir = Path(run_dir_path)
@@ -1126,7 +1161,12 @@ def _train_worker(
     # ---- TP model ----
     from src.models.tp_model import TPHippoModel
     from src.models.tp_layers import init_tp
-    init_tp(world_size=len(gpus), devices=gpus, backend="nccl")
+    # Reuse the backend chosen at init_process_group time so
+    # :func:`init_tp` records the right transport in the global TP
+    # state. The init_process_group call itself is a no-op inside
+    # init_tp (we already initialized above), so this only seeds the
+    # world-size / group globals.
+    init_tp(world_size=len(gpus), devices=gpus, backend=backend)
     torch.manual_seed(args.seed)
     model = TPHippoModel(config, devices=gpus, dtype=torch.float16)
     # Broadcast replicated params from rank 0 (devices gpus[0]) to
@@ -1411,10 +1451,40 @@ def train(args):
     :func:`_train_worker`. For world size == 1, runs the worker
     inline (no distributed init needed since all collectives are
     no-ops when world_size == 1).
+
+    TP simulation (``--tp_sim``) short-circuits the auto-detect
+    step: the original ``get_available_gpus`` scan is kept
+    verbatim (it still returns the largest viable contiguous run
+    on multi-GPU boxes) but on a single-GPU dev box it returns
+    ``[]``, in which case we fall back to ``cuda:0`` and then
+    expand the list to ``tp_size`` copies so mp.spawn launches
+    N children all bound to the same physical device.
     """
     run_dir = create_output_dir(args.output_dir)
 
     gpus = get_available_gpus(min_memory_mb=args.min_gpu_memory_mb)
+    if not gpus and args.tp_sim:
+        # ``get_available_gpus`` looks for a contiguous run of
+        # 2/4/8 GPUs with >= 10 GB free. On a single-GPU dev box
+        # (one 5060 Ti 16G) that scan returns []; sim mode
+        # explicitly opts into "I'll fake it with one card", so
+        # fall back to cuda:0 here. Keeps the auto-detect
+        # algorithm intact while still making the script usable
+        # in the new dev environment.
+        if torch.cuda.is_available():
+            gpus = [0]
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [TP-SIM] "
+                f"auto-detect found no 2/4/8-GPU run;"
+                f" falling back to cuda:0 for sim"
+            )
+        else:
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: "
+                f"--tp_sim requires CUDA",
+                file=sys.stderr,
+            )
+            return run_dir
     if not gpus:
         print(
             f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: no contiguous"
@@ -1423,15 +1493,57 @@ def train(args):
         )
         return run_dir
 
+    # TP-simulation override: collapse the detected GPU list to a
+    # single physical device replicated ``tp_size`` times. The TP
+    # sharding code paths then see world_size == tp_size; gloo
+    # handles the cross-process collectives via host staging.
+    # This is the "simple splitting" path: no synthetic
+    # framework, just N copies of the same rank.
+    if args.tp_sim:
+        if args.tp_size is None or args.tp_size < 2:
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WARNING: "
+                f"--tp_size={args.tp_size}; --tp_sim requires >= 2,"
+                f" disabling sim",
+                file=sys.stderr,
+            )
+            args.tp_sim = False
+        else:
+            if args.tp_size > 4:
+                # Replicated params (KDA, embed, RMSNorm, AttnRes)
+                # are duplicated in every child process. For the
+                # default HippoConfig the per-process replicated
+                # weight is ~900 MB in FP16; with optimizer state
+                # and activations a 4-way sim is already tight on
+                # 16 GB, and 8-way will OOM. Warn but don't block
+                # so the user can still try with a shrunk config.
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WARNING: "
+                    f"--tp_size={args.tp_size} > 4 may OOM on 16 GB"
+                    f" (replicated weights duplicated per process)."
+                    f" Try --use_dummy_data first.",
+                    file=sys.stderr,
+                )
+            first_gpu = gpus[0]
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [TP-SIM] "
+                f"simulating TP={args.tp_size} ranks on cuda:{first_gpu}"
+                f" (gloo backend)"
+            )
+            gpus = [first_gpu] * args.tp_size
+
     print(
         f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Selected contiguous"
-        f" TP group: {gpus} (world_size={len(gpus)})"
+        f" TP group: {gpus} (world_size={len(gpus)}, sim={args.tp_sim})"
     )
 
-    if len(gpus) == 1:
+    if len(gpus) == 1 and not args.tp_sim:
         # No TP plumbing needed; just run the worker inline. The
         # worker will allocate its own in-process ``queue.Queue``
         # for the dataloader (no cross-process sharing needed).
+        # Skip this fast path in sim mode: even with one physical
+        # GPU we still need N child processes to exercise the
+        # sharded forward / all-reduce paths.
         _train_worker(
             rank=0, args=args, gpus=gpus, port=0,
             run_dir_path=str(run_dir), shared_batch_queues=None,
@@ -1552,6 +1664,22 @@ def main():
                         help="SGD momentum for the Muon path.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Init seed for replicated params on each device.")
+
+    # TP simulation (development on a single-GPU box, e.g. one
+    # 5060 Ti 16G). When --tp_sim is set we run N child processes
+    # all bound to the same physical GPU and use the gloo backend
+    # to transport CUDA tensors (host-staged; much slower than
+    # NVLink NCCL but the sharding math is byte-for-byte the
+    # same). Use this to verify the TP code paths without owning
+    # N physical GPUs. --tp_size is only consulted when --tp_sim
+    # is set.
+    parser.add_argument("--tp_sim", action="store_true", default=False,
+                        help="Simulate TP on a single GPU with gloo.")
+    parser.add_argument("--tp_size", type=int, default=2,
+                        help="Simulated TP world size when --tp_sim is set."
+                             " Ignored otherwise. Default 2. Practical max"
+                             " is ~2-4 on a 16 GB GPU because replicated"
+                             " weights are duplicated per process.")
 
     args = parser.parse_args()
 

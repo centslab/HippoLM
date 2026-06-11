@@ -42,13 +42,22 @@ def init_tp(world_size: int, devices: list[int], backend: str = "nccl") -> None:
     """Initialize the single-process TP group spanning ``world_size`` GPUs.
 
     Uses ``torch.distributed`` with a single rank 0 process owning
-    ``world_size`` devices. NCCL handles the cross-device comms.
+    ``world_size`` devices. NCCL handles the cross-device comms
+    on the production 8xV100 box; the ``gloo`` backend is used
+    during development on a single-GPU box (``--tp_sim``) to
+    exercise the same sharding code paths without NVLink.
 
     We must call ``torch.cuda.set_device(devices[rank])`` before
     touching any tensor on that device, so the rank's "default"
     stream is bound correctly. The TP layers below always use
     ``param.device`` rather than relying on a default device, so
     this matters mainly for collective ops.
+
+    ``device_id`` is intentionally NOT passed to
+    ``init_process_group`` here: only NCCL needs it, and the actual
+    ``dist.init_process_group`` call lives in :func:`_train_worker`
+    (which DOES pin the NCCL comm to ``gpus[rank]``). For gloo
+    the call is the same minus ``device_id``.
     """
     import torch.distributed as dist
 
@@ -64,12 +73,28 @@ def init_tp(world_size: int, devices: list[int], backend: str = "nccl") -> None:
     os.environ.setdefault("LOCAL_RANK", "0")
 
     if not dist.is_initialized():
-        dist.init_process_group(
-            backend=backend,
-            init_method="env://",
-            rank=0,
-            world_size=world_size,
-        )
+        # ``backend`` may be "nccl" (production) or "gloo" (TP
+        # simulation on a single-GPU dev box). gloo does its comm
+        # on host memory and stages CUDA tensors through it, so it
+        # has no concept of ``device_id``; NCCL would require it,
+        # but that path is handled in :func:`_train_worker` before
+        # we get here, so this branch is a fallback for callers
+        # that init from scratch.
+        if backend == "nccl":
+            dist.init_process_group(
+                backend=backend,
+                init_method="env://",
+                rank=0,
+                world_size=world_size,
+                device_id=torch.device(f"cuda:{devices[0]}"),
+            )
+        else:
+            dist.init_process_group(
+                backend=backend,
+                init_method="env://",
+                rank=0,
+                world_size=world_size,
+            )
     _TP_GROUP = dist.group.WORLD
     _TP_WORLD_SIZE = world_size
     _TP_RANK = 0  # single-process; rank is the device slot

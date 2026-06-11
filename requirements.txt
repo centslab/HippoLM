@@ -1,8 +1,8 @@
 # Core ML
-torch==2.9.1+cu128
-transformers==5.5.4
+torch==2.9.1
+transformers>=5.5.4
 numpy>=1.24.0
-einops==0.8.2
+einops>=0.8.2
 flash-linear-attention
 
 # Data
@@ -14,7 +14,7 @@ accelerate>=0.20.0
 tqdm>=4.65.0
 
 # Evaluation
-evalscope==1.6.0
+evalscope>=1.6.0
 
 # Utilities
 pyyaml>=6.0
