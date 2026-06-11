@@ -62,6 +62,14 @@ _os.environ.setdefault("NCCL_IB_DISABLE", "1")
 # single-node job the cross-NIC traffic is never useful and can
 # otherwise steal a few hundred ms at startup.
 _os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker,veth,br-")
+# Disable the NCCL heartbeat watchdog. The first step compiles
+# many Triton kernels (chunk_kda fwd/bwd × 32 layers, fused CE,
+# fused RMSNormGated) which can hold the GIL for >480s, making
+# the watchdog falsely report a hang and abort the job.
+_os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
+# Belt and braces: also widen the heartbeat timeout in case the
+# monitoring flag is interpreted differently in this PyTorch build.
+_os.environ.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "7200")
 
 import os
 import sys
@@ -1602,7 +1610,7 @@ def main():
 
     args = parser.parse_args()
 
-    if Path(args.config).exists() and not args.use_dummy_data:
+    if Path(args.config).exists():
         config_dict = load_config(args.config)
         for key, value in config_dict.items():
             if hasattr(args, key):

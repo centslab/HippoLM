@@ -7,8 +7,8 @@ tie_word_embeddings: true
 use_bias: false
 
 # KDA (Kimi Delta Attention)
-num_heads: 16
-head_dim: 64
+num_heads: 8
+head_dim: 128
 expand_v: 1.0
 kda_mode: chunk            # chunk for training, fused_recurrent for inference
 use_short_conv: true
@@ -23,7 +23,7 @@ num_layers: 32
 num_blocks: 8
 
 # FFN (SwiGLU)
-intermediate_size: 2736
+intermediate_size: 3072
 
 # Normalization
 rms_norm_eps: 0.000001
@@ -31,11 +31,11 @@ rms_norm_eps: 0.000001
 # Training
 epochs: 1
 max_steps: 1000
-batch_size: 2
-seq_len: 512
+batch_size: 1
+seq_len: 4096
 learning_rate: 1.0e-4
 weight_decay: 0.01
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 256
 fp16: true
 
 # Stage: pretrain or sft

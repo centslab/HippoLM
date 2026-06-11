@@ -182,11 +182,18 @@ class CPUAdamW:
             # The training loop is responsible for resetting accum
             # at the start of each accumulation cycle.
 
+    # Per-chunk size for the streaming factor / update path.
+    # 4 M elements is the sweet spot on V100 PCIe: 8 MB FP16 per
+    # chunk keeps the GPU transient well under the 16 GB ceiling
+    # and overlaps the H2D copy with the next chunk's compute.
+    _STREAM_CHUNK_NUMEL = 4 * 1024 * 1024
+
     def step(self) -> None:
         beta1, beta2 = self.beta1, self.beta2
         lr = self.lr
         eps = self.eps
         wd = self.weight_decay
+        CHUNK = self._STREAM_CHUNK_NUMEL
         for s in self.state.values():
             if s.accum.abs().sum().item() == 0:
                 # No accumulated grad (shouldn't happen if the
@@ -199,7 +206,7 @@ class CPUAdamW:
             bc2 = 1.0 - beta2 ** step
             g = s.accum
             # m lives in its own buffer (``s.m``), initialised
-            # to 0 in :meth:`__init__`. We update it in place;
+            # to 0 in :meth:`__init__``. We update it in place;
             # on step 1, m = beta1*0 + (1-beta1)*g = 0.1*g.
             # The previous v0.0.1 layout over-loaded ``s.accum``
             # as both the grad accumulator AND m, but that made
@@ -241,60 +248,76 @@ class CPUAdamW:
             # FP16 is ~6e-8, but the reciprocal of a small v
             # rounds to 0). The up-cast is a ``numel`` op — cheap
             # relative to the GPU transfer.
-            denom = (v / bc2).sqrt_().add_(eps)                # FP32, numel
-            factor = (m.float() / bc1) / denom                 # FP32, numel
-            # The per-element factor is a 1-D tensor of size
-            # ``numel``; ``s.param.data`` may be 1-D (RMSNorm,
-            # BlockAttnRes.query) or 2-D (lm_head, embed). Reshape
-            # the factor to match the param's view so ``add_``
-            # broadcasts element-wise. We then subtract from the
-            # param on GPU.
-            if wd != 0.0:
-                # Decoupled weight decay: p = p * (1 - lr * wd).
-                s.param.data.mul_(1.0 - lr * wd)
-            # factor is FP32 on CPU (numel). We need it on the same
-            # device and dtype as ``s.param.data`` before the
-            # ``add_`` — otherwise PyTorch raises
-            # "Expected all tensors to be on the same device".
-            # ``.to(dtype, non_blocking=True)`` ONLY changes dtype;
-            # the device stays CPU (and on CPU non_blocking is a
-            # no-op), so we have to pass device= explicitly.
-            factor_gpu = factor.to(
-                device=s.param.device, dtype=s.param.dtype,
-                non_blocking=True,
-            ).view_as(s.param.data)
-            # DIAG: per-stage telemetry for the first few steps
-            # so we can localize where inf/nan is introduced on
-            # the embed (the post-step pmax went to inf on step 0).
-            import os as _os_diag
-            import logging as _logging_diag
-            if _os_diag.environ.get("HIPPOLM_ADAMW_DIAG") == "1" and step <= int(
-                _os_diag.environ.get("HIPPOLM_DIAG_STEPS", "3")
-            ):
-                _log_diag = _logging_diag.getLogger(__name__)
-                _has = lambda t, dt: t.detach().to(dt, copy=True)
-                _factor_fp16 = factor.to(torch.float16).to(torch.float32)
-                _factor_gpu_fp32 = _has(factor_gpu, torch.float32)
-                def _stats(name, t):
-                    f = t.detach().float()
-                    nan_n = torch.isnan(f).sum().item()
-                    inf_n = torch.isinf(f).sum().item()
-                    return (
-                        f"{name}: max_abs={f.abs().max().item():.3e}"
-                        f" min_abs={f.abs().min().item():.3e}"
-                        f" nan={int(nan_n)} inf={int(inf_n)}"
-                        f" numel={f.numel()}"
+            #
+            # STREAMING: for large params (e.g. embed_tokens at
+            # ``[vocab, hidden] = [248320, 1024]`` = 254 M elts,
+            # 508 MB FP16 for the factor) we chunk the
+            # factor-compute / apply loop so the peak GPU memory
+            # for ``factor`` is bounded to ``CHUNK`` elements.
+            # The chunks are independent (each is a slice along
+            # the flat param view), so the result is bit-identical
+            # to the non-streaming path.
+            p_flat = s.param.data.view(-1)
+            n = p_flat.numel()
+            if n <= CHUNK:
+                denom = (v / bc2).sqrt_().add_(eps)            # FP32, numel
+                factor = (m.float() / bc1) / denom             # FP32, numel
+                if wd != 0.0:
+                    s.param.data.mul_(1.0 - lr * wd)
+                factor_gpu = factor.to(
+                    device=s.param.device, dtype=s.param.dtype,
+                    non_blocking=True,
+                ).view_as(s.param.data)
+                # DIAG: per-stage telemetry for the first few steps
+                # so we can localize where inf/nan is introduced on
+                # the embed (the post-step pmax went to inf on step 0).
+                import os as _os_diag
+                import logging as _logging_diag
+                if _os_diag.environ.get("HIPPOLM_ADAMW_DIAG") == "1" and step <= int(
+                    _os_diag.environ.get("HIPPOLM_DIAG_STEPS", "3")
+                ):
+                    _log_diag = _logging_diag.getLogger(__name__)
+                    _has = lambda t, dt: t.detach().to(dt, copy=True)
+                    _factor_fp16 = factor.to(torch.float16).to(torch.float32)
+                    _factor_gpu_fp32 = _has(factor_gpu, torch.float32)
+                    def _stats(name, t):
+                        f = t.detach().float()
+                        nan_n = torch.isnan(f).sum().item()
+                        inf_n = torch.isinf(f).sum().item()
+                        return (
+                            f"{name}: max_abs={f.abs().max().item():.3e}"
+                            f" min_abs={f.abs().min().item():.3e}"
+                            f" nan={int(nan_n)} inf={int(inf_n)}"
+                            f" numel={f.numel()}"
+                        )
+                    _log_diag.info(
+                        f"[adamw-diag step={step} shape={tuple(s.shape)}]"
+                        f" {_stats('m(after update, fp16)', m)}"
+                        f" | {_stats('v(after update, fp16)', v)}"
+                        f" | {_stats('denom(fp32)', denom)}"
+                        f" | {_stats('factor(fp32)', factor)}"
+                        f" | {_stats('factor(fp16->fp32)', _factor_fp16)}"
+                        f" | {_stats('factor_gpu(fp32)', _factor_gpu_fp32)}"
                     )
-                _log_diag.info(
-                    f"[adamw-diag step={step} shape={tuple(s.shape)}]"
-                    f" {_stats('m(after update, fp16)', m)}"
-                    f" | {_stats('v(after update, fp16)', v)}"
-                    f" | {_stats('denom(fp32)', denom)}"
-                    f" | {_stats('factor(fp32)', factor)}"
-                    f" | {_stats('factor(fp16->fp32)', _factor_fp16)}"
-                    f" | {_stats('factor_gpu(fp32)', _factor_gpu_fp32)}"
-                )
-            s.param.data.add_(factor_gpu, alpha=-lr)
+                s.param.data.add_(factor_gpu, alpha=-lr)
+            else:
+                # Streaming path: chunk-process the param.
+                if wd != 0.0:
+                    s.param.data.mul_(1.0 - lr * wd)
+                for start in range(0, n, CHUNK):
+                    end = min(start + CHUNK, n)
+                    v_chunk = v[start:end]
+                    denom = (v_chunk / bc2).sqrt_().add_(eps)   # FP32, chunk
+                    factor = (m[start:end].float() / bc1) / denom
+                    # Stream the FP32 factor to the GPU as the
+                    # param dtype (FP16) and apply in place.
+                    p_flat[start:end].add_(
+                        factor.to(
+                            device=s.param.device, dtype=s.param.dtype,
+                            non_blocking=True,
+                        ),
+                        alpha=-lr,
+                    )
             # Reset accum to zero for the next accumulation cycle.
             s.accum.zero_()
 
@@ -396,27 +419,53 @@ class CPUMuon:
                 g = inner @ g
             return g
 
+    # Per-chunk row count for the streaming NS path. Each chunk
+    # is a 2-D ``[CHUNK, cols]`` matrix; for embed (cols=1024)
+    # the chunk is ``[CHUNK, 1024]`` = 8 MB FP16 at CHUNK=4096.
+    _STREAM_CHUNK_ROWS = 4096
+
     def step(self) -> None:
         mom = self.momentum
         lr = self.lr
         wd = self.weight_decay
         nesterov = self.nesterov
+        CHUNK_ROWS = self._STREAM_CHUNK_ROWS
         for s in self.state.values():
             if s.accum.abs().sum().item() == 0:
                 continue
             # Update momentum: m = beta*m + grad
             m = s.exp_avg_sq
             m.mul_(mom).add_(s.accum, alpha=1.0 - mom)
-            # Stream momentum to GPU, reshape, NS, apply.
-            g = m.view(s.shape).to(s.param.device, non_blocking=True)
-            update = self._newton_schulz(g)
-            # update has same shape as param. Cast back to param dtype.
-            update = update.to(s.param.dtype)
-            # Decoupled weight decay.
+            shape = s.shape
+            rows, cols = shape[0], shape[1]
+            # Decoupled weight decay (applied once to the full param
+            # rather than per-chunk to keep semantics identical to
+            # the non-streaming path).
             if wd != 0.0:
                 s.param.data.mul_(1.0 - lr * wd)
-            # Apply update.
-            s.param.data.add_(update, alpha=-lr)
+            if rows * cols <= CHUNK_ROWS * cols:
+                # Small param: single chunk.
+                g = m.view(shape).to(s.param.device, non_blocking=True)
+                update = self._newton_schulz(g)
+                update = update.to(s.param.dtype)
+                s.param.data.add_(update, alpha=-lr)
+            else:
+                # Streaming path: chunk along the row dim so each
+                # NS iteration is on a 2-D slice well under the
+                # V100's 16 GB ceiling. The flat momentum
+                # ``m`` (1-D, ``numel``) is sliced in strides of
+                # ``CHUNK_ROWS * cols`` and reshaped per chunk.
+                for r_start in range(0, rows, CHUNK_ROWS):
+                    r_end = min(r_start + CHUNK_ROWS, rows)
+                    flat_start = r_start * cols
+                    flat_end = r_end * cols
+                    m_chunk_flat = m[flat_start:flat_end]
+                    g = m_chunk_flat.view(r_end - r_start, cols).to(
+                        s.param.device, non_blocking=True,
+                    )
+                    update = self._newton_schulz(g)
+                    update = update.to(s.param.dtype)
+                    s.param.data[r_start:r_end].add_(update, alpha=-lr)
             # Reset grad accumulator for next accumulation cycle.
             s.accum.zero_()
 
@@ -507,6 +556,13 @@ def build_param_groups(
         # Per user spec: lm_head and embed_tokens -> AdamW.
         if name.startswith("lm_head.") or name.startswith("replicated."):
             adamw_params.append(p)
+        # BlockAttnRes pseudo-query is now 2-D
+        # ``[num_heads // world, head_dim]`` rather than a 1-D
+        # vector. It's a learned attention parameter, not a
+        # Linear weight, so it should go to AdamW regardless
+        # of its ndim. Match by exact suffix.
+        elif name.endswith(".attn_res.query") or name.endswith(".mlp_res.query"):
+            adamw_params.append(p)
         # KDA short-conv weights are 3D (nn.Conv1d: [D, 1, W]).
         # CPUMuon._newton_schulz does ``g.t()`` which only works on
         # 2-D matrices, so we must route them to AdamW. These params
@@ -519,7 +575,7 @@ def build_param_groups(
                 (".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight"))):
             adamw_params.append(p)
         elif p.ndim < 2:
-            # 1D: norms, pseudo-queries, no-decay scalars.
+            # 1D: norms, A_log, dt_bias, o_norm.weight, lm_head.bias.
             adamw_params.append(p)
         else:
             muon_params.append(p)
