@@ -42,7 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .norms import RMSNorm
-from .block_attn_res import BlockAttnRes
+from .ops.attn_res import BlockAttnRes
 from .tp_layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -391,14 +391,19 @@ class TPKDA(nn.Module):
 # --------------------------------------------------------------------------- #
 class TPHippoLayer(nn.Module):
     """TP version of HippoLayer. KDA is sharded along the head dim
-    via :class:`TPKDA`; AttnRes is multi-head and TP-sharded by
-    head via :class:`BlockAttnRes`; FFN is sharded via
-    :class:`TPSwiGLU`."""
+    via :class:`TPKDA`; FFN is sharded via :class:`TPSwiGLU`.
+
+    AttnRes no longer lives inside each layer. The block-boundary
+    AttnRes is a single per-device replicated module
+    (``TPHippoModel.replicated_per_device[d]["attn_res"]``);
+    it is invoked once per non-first block to compute the next
+    block's input. Inside a block the residual is standard
+    ``x = x + SubLayer(x)``.
+    """
 
     def __init__(self, layer_idx: int, config, device=None, dtype=None) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.block_size = config.block_size
 
         # NB: ``device`` may be 0 (an int) which is falsy in Python
         # — guard with ``is not None`` to avoid the conditional
@@ -410,54 +415,24 @@ class TPHippoLayer(nn.Module):
                 return m.to(device=device, dtype=dtype)
             return m.to(device=device)
 
-        self.attn_res = _to(BlockAttnRes(config))
-        self.mlp_res = _to(BlockAttnRes(config))
         self.attn_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
         self.mlp_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
         self.kda = _to(TPKDA(config, layer_idx=layer_idx))
         self.ffn = TPSwiGLU(config, device=device, dtype=dtype)
 
-    def forward(
-        self,
-        blocks: list[torch.Tensor],
-        partial_block: torch.Tensor | None,
-    ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
-        """Run a single layer. *No* gradient checkpointing here —
-        the outer loop in :meth:`TPHippoModel.forward` decides
-        whether to wrap this layer (or a block of layers) in
-        ``torch.utils.checkpoint.checkpoint``. Putting the
-        checkpoint decision at the block level lets us share one
-        checkpoint across ``block_size`` layers (a 4× activation
-        memory saving on the completed blocks) without redundant
-        inner checkpoints.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Standard residual transformer layer on the local device.
+
+        Args:
+            x: ``[B, T, hidden_size]`` replicated hidden state.
+
+        Returns:
+            ``[B, T, hidden_size]`` after KDA and FFN with
+            standard residual connections.
         """
-        layer_number = self.layer_idx + 1
-
-        if layer_number % self.block_size == 0:
-            if partial_block is not None:
-                blocks = blocks + [partial_block]
-            partial_block = None
-
-        # KDA path: sharded along the head dim inside ``self.kda``.
-        h_attn, attn_out = self._attn_forward(blocks, partial_block)
-        if partial_block is None:
-            partial_block = attn_out
-        else:
-            partial_block = partial_block + attn_out
-
-        # FFN path: sharded; all-reduce inside down_proj.
-        ffn_out = self._ffn_forward(blocks, partial_block)
-        partial_block = partial_block + ffn_out
-        return blocks, partial_block
-
-    def _attn_forward(self, blocks, partial_block):
-        h_attn = self.attn_res(blocks, partial_block)
-        attn_out = self.kda(self.attn_norm(h_attn))
-        return h_attn, attn_out
-
-    def _ffn_forward(self, blocks, partial_block):
-        h_mlp = self.mlp_res(blocks, partial_block)
-        return self.ffn(self.mlp_norm(h_mlp))
+        x = x + self.kda(self.attn_norm(x))
+        x = x + self.ffn(self.mlp_norm(x))
+        return x
 
 
 class TPHippoModel(nn.Module):
@@ -520,6 +495,12 @@ class TPHippoModel(nn.Module):
                 ).to(device=d, dtype=dtype),
                 "norm": RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                 .to(device=d, dtype=dtype),
+                # Block-boundary AttnRes: per-device, replicated.
+                # All-gathers the head dim across the TP group on
+                # every forward. Pseudo-query is sharded along
+                # ``num_heads`` (each rank holds ``num_heads //
+                # world`` heads).
+                "attn_res": BlockAttnRes(config).to(device=d, dtype=dtype),
             }
             device_mods["embed_tokens"] = self._init_embed(device_mods["embed_tokens"])
             self.replicated_per_device[d] = device_mods
@@ -634,7 +615,9 @@ class TPHippoModel(nn.Module):
         ``xavier_uniform_`` would diverge, which doesn't matter
         for OOM testing but does matter for correctness).
         """
-        # 1) Top-level replicated modules (embed_tokens, norm).
+        # 1) Top-level replicated modules (embed_tokens, norm,
+        # attn_res). AttnRes is shared across all boundaries so
+        # the single module is replicated exactly once per device.
         for mname, src_mod in self.replicated_per_device[src_device].items():
             src_params = dict(src_mod.named_parameters(recurse=True))
             for dst_device, dst_mods in self.replicated_per_device.items():
@@ -644,11 +627,12 @@ class TPHippoModel(nn.Module):
                 for pname, p in src_params.items():
                     dst_params[pname].data.copy_(p.data)
 
-        # 2) Per-layer replicated sub-modules (KDA, attn_res, mlp_res,
-        # attn_norm, mlp_norm). Each layer has exactly one of each
-        # so we can copy by explicit attribute name.
+        # 2) Per-layer replicated sub-modules (KDA, attn_norm,
+        # mlp_norm). AttnRes is no longer per-layer; the block
+        # boundary version lives at the model level and is
+        # already synced above.
         for li, src_layer in enumerate(self.layers_per_device[src_device]):
-            for sub_name in ("kda", "attn_res", "mlp_res", "attn_norm", "mlp_norm"):
+            for sub_name in ("kda", "attn_norm", "mlp_norm"):
                 src_sub = getattr(src_layer, sub_name)
                 src_params = dict(src_sub.named_parameters(recurse=True))
                 for dst_device, dst_layers in self.layers_per_device.items():
@@ -662,19 +646,23 @@ class TPHippoModel(nn.Module):
     def _block_forward(
         self,
         block_layers,
-        blocks: list[torch.Tensor],
-        partial_block: torch.Tensor | None,
-    ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+        x: torch.Tensor,
+    ) -> torch.Tensor:
         """Run a contiguous group of ``len(block_layers)`` layers
-        (one block) and return the resulting ``(blocks,
-        partial_block)``. Used as the body of
+        (one block) on the local device and return the block's
+        output. Used as the body of
         :func:`torch.utils.checkpoint.checkpoint` for completed
         blocks so we only keep the per-block output b_n for
         backward, not the per-layer activations.
+
+        The residual inside the block is the standard
+        ``x = x + SubLayer(x)``; there is no per-layer AttnRes
+        call. AttnRes is invoked at the block boundary by the
+        outer :meth:`forward` loop, not inside this body.
         """
         for layer in block_layers:
-            blocks, partial_block = layer(blocks, partial_block)
-        return blocks, partial_block
+            x = layer(x)
+        return x
 
     def forward(
         self,
@@ -683,8 +671,9 @@ class TPHippoModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         device = input_ids.device.index if input_ids.device.type == "cuda" else input_ids.device
         embeds = self.replicated_per_device[device]["embed_tokens"](input_ids)
-        blocks: list[torch.Tensor] = [embeds]
-        partial_block: torch.Tensor | None = embeds
+        attn_res = self.replicated_per_device[device]["attn_res"]
+        blocks: list[torch.Tensor] = [embeds]  # b_0 = embedding
+        x = embeds  # Block 0's input is the embedding.
 
         # Block-level checkpointing
         # ------------------------
@@ -698,34 +687,47 @@ class TPHippoModel(nn.Module):
         # the per-layer checkpointing we used to do.
         #
         # The *last* block is kept on the per-layer checkpoint
-        # path because its ``partial_block`` is the residual that
-        # feeds the final norm + lm_head — we want the per-layer
-        # activations to be replayable for backward without
-        # redoing the entire block. (We could equivalently
-        # checkpoint the last block too, but the per-layer path
-        # is empirically a good balance of memory vs. recompute.)
+        # path because its residual is what feeds the final norm
+        # + lm_head — we want the per-layer activations to be
+        # replayable for backward without redoing the entire
+        # block. (We could equivalently checkpoint the last block
+        # too, but the per-layer path is empirically a good
+        # balance of memory vs. recompute.)
+        #
+        # AttnRes is invoked at every non-first block boundary,
+        # *outside* the checkpoint wrapper, so the per-block
+        # output ``b_n`` captures the boundary-attention input
+        # ``x``. ``blocks`` (the list of completed block reps) is
+        # held live across blocks but is small (one ``[B,T,D]``
+        # per block — same order as before).
         layers = self.layers_per_device[device]
         block_size = self.config.block_size
         num_blocks = self.config.num_blocks
         for block_idx in range(num_blocks - 1):
+            if block_idx > 0:
+                x = attn_res(blocks)
             start = block_idx * block_size
             end = start + block_size
             block_layers = layers[start:end]
-            blocks, partial_block = torch.utils.checkpoint.checkpoint(
-                self._block_forward, block_layers, blocks, partial_block,
+            x = torch.utils.checkpoint.checkpoint(
+                self._block_forward, block_layers, x,
                 use_reentrant=False, preserve_rng_state=False,
             )
+            blocks.append(x)
         # Last block: per-layer checkpointing (preserves the
         # per-layer activations for the residual that feeds the
         # final norm).
-        last_start = (num_blocks - 1) * block_size
+        last_block = num_blocks - 1
+        if last_block > 0:
+            x = attn_res(blocks)
+        last_start = last_block * block_size
         for layer in layers[last_start:]:
-            blocks, partial_block = torch.utils.checkpoint.checkpoint(
-                layer, blocks, partial_block,
+            x = torch.utils.checkpoint.checkpoint(
+                layer, x,
                 use_reentrant=False, preserve_rng_state=False,
             )
 
-        hidden_states = self.replicated_per_device[device]["norm"](partial_block)
+        hidden_states = self.replicated_per_device[device]["norm"](x)
         sharded_logits = self.lm_head_per_device[device](hidden_states)
         out: dict[str, torch.Tensor] = {"logits": sharded_logits}
         if labels is not None:

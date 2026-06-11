@@ -1,106 +1,66 @@
-"""HippoLM transformer layer and full model."""
+"""HippoLM transformer layer and full model.
+
+Block-boundary Block AttnRes (official Kimi design):
+  - 32 layers are partitioned into 8 blocks of 4 layers each.
+  - Within a block, every layer is a standard residual transformer
+    ``x = x + KDA(RMSNorm(x)); x = x + FFN(RMSNorm(x))``. There
+    is no per-layer AttnRes; the only AttnRes invocation is at
+    the block boundary, where the next block's input is computed
+    by softmax-attending over the completed block representations
+    ``[b_0, b_1, ..., b_{n-1}]`` (Kimi Team, arXiv:2603.15031).
+  - The pseudo-query is shared across all boundaries (one module
+    per model, not per sub-layer). Initialised to 0 so the
+    start-of-training attention is uniform.
+  - Block 0's input is the embedding ``b_0``; subsequent blocks
+    use ``attn_res([b_0, ..., b_{n-1}])`` as the input.
+"""
 import torch
 import torch.nn as nn
 
 from .norms import RMSNorm
 from .kda import KDA
-from .block_attn_res import BlockAttnRes
+from .ops.attn_res import BlockAttnRes
 from .activation import SwiGLU
 
 
 class HippoLayer(nn.Module):
-    """Single transformer layer with Block AttnRes.
+    """Single transformer layer with standard residual.
 
-    Each layer contains:
-    1. Pre-attention Block AttnRes -> kda -> add to partial_block
-    2. Pre-FFN Block AttnRes -> SwiGLU -> add to partial_block
-
-    Block boundaries are checked before the attention sub-layer.
+    Within a block, the residual connection is the standard
+    ``x = x + SubLayer(x)`` form. AttnRes lives at the model
+    level and is invoked only at block boundaries (see
+    :class:`HippoModel`).
     """
 
     def __init__(self, layer_idx: int, config):
         super().__init__()
         self.layer_idx = layer_idx
-        self.block_size = config.block_size
 
-        # Two AttnRes: one before kda, one before FFN
-        self.attn_res = BlockAttnRes(config)
-        self.mlp_res = BlockAttnRes(config)
-
-        # Normalization
+        # Pre-attention and pre-FFN RMSNorms.
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Core sub-layers
+        # Core sub-layers.
         self.kda = KDA(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
-    def forward(
-        self,
-        blocks: list[torch.Tensor],
-        partial_block: torch.Tensor | None,
-    ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
-        """Forward pass for one layer.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Standard residual transformer layer.
 
         Args:
-            blocks: Completed block representations [b_0, b_1, ..., b_{n-1}]
-            partial_block: Current block partial sum or None
+            x: ``[B, T, hidden_size]`` input.
 
         Returns:
-            (updated_blocks, updated_partial_block)
+            ``[B, T, hidden_size]`` output after KDA and FFN with
+            standard residual connections.
         """
-        # 1-indexed layer number for block boundary check
-        layer_number = self.layer_idx + 1
-
-        # Check block boundary BEFORE attention (per paper pseudocode)
-        if layer_number % self.block_size == 0:
-            if partial_block is not None:
-                blocks = blocks + [partial_block]
-            partial_block = None
-
-        # ---- Attention sub-layer ----
-        # Use checkpoint for attention to save activation memory
-        # save (blocks, partial_block) only - recompute h_attn and attn_out during backward
-        h_attn, attn_out = torch.utils.checkpoint.checkpoint(
-            self._attn_forward, blocks, partial_block,
-            use_reentrant=False, preserve_rng_state=False,
-        )
-
-        if partial_block is None:
-            partial_block = attn_out
-        else:
-            partial_block = partial_block + attn_out
-
-        # ---- FFN sub-layer ----
-        # Use checkpoint for FFN
-        ffn_out = torch.utils.checkpoint.checkpoint(
-            self._ffn_forward, blocks, partial_block,
-            use_reentrant=False, preserve_rng_state=False,
-        )
-
-        partial_block = partial_block + ffn_out
-
-        return blocks, partial_block
-
-    def _attn_forward(self, blocks, partial_block):
-        """Attention sub-layer forward (used for checkpointing)."""
-        h_attn = self.attn_res(blocks, partial_block)
-        attn_out = self.kda(self.attn_norm(h_attn))
-        return h_attn, attn_out
-
-    def _ffn_forward(self, blocks, partial_block):
-        """FFN sub-layer forward (used for checkpointing)."""
-        h_mlp = self.mlp_res(blocks, partial_block)
-        ffn_out = self.ffn(self.mlp_norm(h_mlp))
-        return ffn_out
+        x = x + self.kda(self.attn_norm(x))
+        x = x + self.ffn(self.mlp_norm(x))
+        return x
 
 
 class HippoModel(nn.Module):
-    """HippoLM model.
-
-    Combines token embeddings, Block AttnRes layers with kda attention,
-    and a language modeling head.
-    """
+    """HippoLM model with block-boundary Block AttnRes."""
 
     def __init__(self, config):
         super().__init__()
@@ -111,6 +71,11 @@ class HippoModel(nn.Module):
             HippoLayer(i, config) for i in range(config.num_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Block-boundary attention residual. One module shared
+        # across all ``num_blocks - 1`` boundaries. Initialised
+        # to 0 (uniform attention) per the paper.
+        self.attn_res = BlockAttnRes(config)
 
         # Language modeling head
         self.lm_head = nn.Linear(
@@ -143,25 +108,34 @@ class HippoModel(nn.Module):
         """Forward pass.
 
         Args:
-            input_ids: [batch_size, seq_len]
-            labels: Optional [batch_size, seq_len] for loss computation
+            input_ids: ``[batch_size, seq_len]``
+            labels: Optional ``[batch_size, seq_len]`` for loss
 
         Returns:
-            Dict with 'logits' and optionally 'loss'
+            Dict with ``logits`` and optionally ``loss``.
         """
         embeds = self.embed_tokens(input_ids)  # [B, T, D]
 
-        # Block AttnRes state
-        blocks: list[torch.Tensor] = [embeds]  # b_0 = embedding
-        partial_block: torch.Tensor | None = embeds
+        # Block representation list. ``b_0`` is always the
+        # embedding; ``b_n`` for ``n >= 1`` is the output of
+        # the n-th completed block.
+        blocks: list[torch.Tensor] = [embeds]
+        x = embeds  # Block 0's input is the embedding.
 
-        # Each layer uses checkpointing internally for kda and FFN sub-layers
-        # This saves activation memory while keeping block-level gradient flow
-        for layer in self.layers:
-            blocks, partial_block = layer(blocks, partial_block)
+        for block_idx in range(self.config.num_blocks):
+            # At every non-first block boundary, AttnRes computes
+            # the next block's input by softmax-attending over the
+            # completed block representations.
+            if block_idx > 0:
+                x = self.attn_res(blocks)
 
-        # Final normalization and projection
-        hidden_states = self.norm(partial_block)  # [B, T, D]
+            start = block_idx * self.config.block_size
+            end = start + self.config.block_size
+            for layer in self.layers[start:end]:
+                x = layer(x)  # Standard residual inside the block.
+            blocks.append(x)
+
+        hidden_states = self.norm(blocks[-1])  # [B, T, D]
         logits = self.lm_head(hidden_states)  # [B, T, vocab_size]
 
         output = {"logits": logits}
@@ -190,13 +164,13 @@ class HippoModel(nn.Module):
         """Greedy / sampling generation.
 
         Args:
-            input_ids: [batch_size, seq_len]
+            input_ids: ``[batch_size, seq_len]``
             max_new_tokens: Number of tokens to generate
             temperature: Sampling temperature
             top_k: Top-k sampling (0 = disabled)
 
         Returns:
-            Generated token IDs [batch_size, seq_len + max_new_tokens]
+            Generated token IDs ``[batch_size, seq_len + max_new_tokens]``.
         """
         self.eval()
         with torch.no_grad():
@@ -210,7 +184,6 @@ class HippoModel(nn.Module):
 
                 probs = nn.functional.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
-
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
         return input_ids

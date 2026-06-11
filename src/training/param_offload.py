@@ -554,14 +554,13 @@ def build_param_groups(
             continue
         seen.add(id(p))
         # Per user spec: lm_head and embed_tokens -> AdamW.
+        # The AttnRes pseudo-query lives under
+        # ``replicated.{device}.attn_res.query`` so it is also
+        # caught by the ``replicated.`` prefix here; the
+        # suffix-only matcher that existed in the
+        # per-layer-AttnRes days has been folded into this
+        # branch.
         if name.startswith("lm_head.") or name.startswith("replicated."):
-            adamw_params.append(p)
-        # BlockAttnRes pseudo-query is now 2-D
-        # ``[num_heads // world, head_dim]`` rather than a 1-D
-        # vector. It's a learned attention parameter, not a
-        # Linear weight, so it should go to AdamW regardless
-        # of its ndim. Match by exact suffix.
-        elif name.endswith(".attn_res.query") or name.endswith(".mlp_res.query"):
             adamw_params.append(p)
         # KDA short-conv weights are 3D (nn.Conv1d: [D, 1, W]).
         # CPUMuon._newton_schulz does ``g.t()`` which only works on

@@ -38,48 +38,162 @@ from src.models.norms import RMSNorm
 from src.models.tp_layers import _TP_GROUP, get_tp_rank, get_tp_world_size
 
 
-def _all_gather_along_head_dim(x: torch.Tensor) -> torch.Tensor:
+class _AllGatherAlongHeadDim(torch.autograd.Function):
+    """Autograd-aware all-gather along the head dim for BlockAttnRes.
+
+    Forward: gather each rank's ``[B, T, hpp * D_h]`` slice along
+    the last dim and concatenate to ``[B, T, H * D_h]`` (full
+    hidden).
+
+    Backward: take the upstream ``[B, T, H * D_h]`` gradient and
+    return this rank's head slice ``[B, T, hpp * D_h]`` — the
+    standard "all-gather of an output" backward.
+
+    Why a custom Function? In PyTorch 2.4+ the autograd
+    registration for ``_allgather_base_`` (the underlying NCCL
+    op behind ``torch.distributed.all_gather_into_tensor``)
+    was removed. Calling the bare NCCL allgather on a tensor
+    that flows into ``loss.backward()`` triggers the
+    ``c10d::_allgather_base_: an autograd kernel was not
+    registered`` warning and silently corrupts the gradient:
+    the per-rank head slice receives no usable gradient, so
+    ``BlockAttnRes.query`` (the pseudo-query) cannot learn.
+    The wrapper makes the gradient path explicit.
+
+    Falls back to identity when ``world == 1`` (no comm, no
+    autograd concern). For ``world > 1`` the forward issues
+    the allgather inside this Function's ``forward`` so the
+    autograd graph sees a single node with a registered
+    backward, and the gradient flowing back to ``query`` is
+    exactly the local head slice of the upstream gradient.
+
+    Implementation note: PyTorch's autograd context
+    (``ctx``) in modern versions does not preserve arbitrary
+    Python attributes set in ``forward`` to ``backward``
+    (the ``backward`` ctx is a different object: an
+    ``_AllGatherAlongHeadDimBackward`` whose ``__getattr__``
+    only delegates to ``saved_tensors``). We therefore route
+    the per-call metadata (``world``, ``rank``, ``hpp``,
+    ``head_dim``) through ``ctx.save_for_backward`` as a
+    small int32 tensor, and unpack it in ``backward``. This
+    is the same pattern used elsewhere in this codebase
+    (see ``_AllReduceMax`` in ``src.models.tp_layers``).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,  # [B, T, hpp * D_h] on this rank's device
+        world: int,
+        rank: int,
+        hpp: int,
+        head_dim: int,
+    ) -> torch.Tensor:  # [B, T, H * D_h]
+        if world == 1:
+            # No-op: local slice is already the full hidden.
+            # Save the metadata so backward is well-defined and
+            # matches the wrapper's contract (returns grad_out).
+            ctx.save_for_backward(torch.tensor(
+                [world, rank, hpp, head_dim], dtype=torch.int32,
+                device=x.device,
+            ))
+            return x
+        # Each rank's slice is contiguous. All-gather a flat
+        # ``[world, B*T*hpp*D_h]`` buffer and reshape+permute to
+        # ``[B, T, H*D_h]``.
+        bt = x.shape[:-1]
+        flat = x.reshape(-1)  # [B*T*hpp*D_h]
+        buf = torch.empty(
+            world * flat.numel(), dtype=x.dtype, device=x.device,
+        )
+        handle = torch.distributed.all_gather_into_tensor(
+            buf, flat, group=_TP_GROUP, async_op=True,
+        )
+        handle.wait()
+        # buf is [world, B*T*hpp*D_h]; reshape each row to
+        # [B, T, hpp*D_h] and concat along the last dim to get
+        # [B, T, H*D_h].
+        per_rank = buf.view(world, *bt, x.shape[-1])
+        out = per_rank.movedim(0, -2).reshape(*bt, world * x.shape[-1])
+        ctx.save_for_backward(torch.tensor(
+            [world, rank, hpp, head_dim], dtype=torch.int32,
+            device=x.device,
+        ))
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # [B, T, H * D_h]
+        (meta,) = ctx.saved_tensors
+        world, rank, hpp, head_dim = (int(v) for v in meta.tolist())
+        if world == 1:
+            # Identity: the gradient is the local slice, which
+            # is the full hidden when world=1.
+            return grad_out, None, None, None, None
+        # The backward of an all-gather of an output is a slice:
+        # rank r's contribution to the forward was the slice
+        # ``grad_out[..., r*hpp*D_h : (r+1)*hpp*D_h]`` along
+        # the last dim. Return only that slice as the gradient
+        # w.r.t. the local input.
+        start = rank * hpp * head_dim
+        end = start + hpp * head_dim
+        return grad_out[..., start:end], None, None, None, None
+
+
+def _all_gather_along_head_dim(
+    x: torch.Tensor,
+    world: int,
+    rank: int,
+    hpp: int,
+    head_dim: int,
+) -> torch.Tensor:
     """All-gather a ``[B, T, hpp * D_h]`` tensor along the last
     dim and concatenate to ``[B, T, H * D_h]`` (= full hidden).
 
-    Falls back to identity when world==1.
+    The all-gather is wrapped in a custom
+    :class:`torch.autograd.Function` (see
+    :class:`_AllGatherAlongHeadDim`) so the backward of the
+    boundary is well-defined: the gradient flowing back to
+    ``BlockAttnRes.query`` is exactly the local head slice of
+    the upstream gradient.
+
+    Falls back to identity when ``world == 1`` (no comm, no
+    autograd concern). For ``world > 1`` the wrapper is
+    essential — the bare NCCL allgather has no autograd kernel
+    in PyTorch 2.4+, which would silently corrupt the gradient
+    for the pseudo-query.
     """
-    world = get_tp_world_size()
-    if world == 1:
-        return x
-    # Each rank's slice is contiguous. We all-gather a flat
-    # ``[world, B*T*hpp*D_h]`` buffer and reshape+permute to
-    # ``[B, T, H*D_h]``.
-    bt = x.shape[:-1]
-    flat = x.reshape(-1)  # [B*T*hpp*D_h]
-    buf = torch.empty(
-        world * flat.numel(), dtype=x.dtype, device=x.device,
-    )
-    handle = torch.distributed.all_gather_into_tensor(
-        buf, flat, group=_TP_GROUP, async_op=True,
-    )
-    handle.wait()
-    # buf is [world, B*T*hpp*D_h]; reshape each row to
-    # [B, T, hpp*D_h] and concat along the last dim to get
-    # [B, T, H*D_h].
-    per_rank = buf.view(world, *bt, x.shape[-1])
-    out = per_rank.movedim(0, -2).reshape(*bt, world * x.shape[-1])
-    return out
+    return _AllGatherAlongHeadDim.apply(x, world, rank, hpp, head_dim)
 
 
 class BlockAttnRes(nn.Module):
-    """Block-level attention residual computation, multi-head and
-    TP-shardable.
+    """Block-boundary attention residual, multi-head and TP-shardable.
 
-    For each sub-layer, computes input as softmax attention over:
-    - b_0: token embedding (always included)
-    - b_1, ..., b_{n-1}: completed block representations
-    - partial_block: intra-block partial sum (if provided)
+    In the official Kimi design, AttnRes is invoked only at block
+    boundaries (every ``block_size`` layers) to compute the input
+    to the next block. Within a block the connection is the
+    standard residual ``x = x + Sublayer(x)``.
 
-    Attention weights are computed from a learned per-head
-    pseudo-query ``w_l`` of shape ``[num_heads, head_dim]`` and
-    RMSNorm-normalized keys. The output is ``[B, T, hidden_size]``
-    (after an all-gather of the head dim across the TP group).
+    For the boundary between block ``n-1`` and block ``n``, the
+    input to the first sub-layer of block ``n`` is::
+
+        h = sum_i softmax( w^T * RMSNorm(b_i) ) * b_i
+        where b_i in {b_0, b_1, ..., b_{n-1}}
+
+    The pseudo-query ``w`` is per-head (``[num_heads, head_dim]``)
+    and shared across all boundaries; initialised to 0 so the
+    start-of-training attention is uniform (paper requirement).
+
+    Under TP, the query is sharded along ``num_heads`` and each
+    rank holds ``num_heads // world`` heads. The output is
+    ``[B, T, hidden_size]`` after an all-gather of the head dim
+    across the TP group.
+
+    Note: the all-gather path needs an autograd-aware wrapper
+    (see ``_AllGatherAlongHeadDim``); the bare NCCL allgather
+    loses gradient through the boundary, which would silently
+    break the pseudo-query's learning. The bug is fixed by
+    :class:`_AllGatherAlongHeadDim` in :mod:`src.models.tp_layers`
+    — this module calls that wrapper, not NCCL directly.
     """
 
     def __init__(self, config):
@@ -115,28 +229,20 @@ class BlockAttnRes(nn.Module):
         # cheap (one row-wise normalisation over a few MB).
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        blocks: list[torch.Tensor],
-        partial_block: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Compute attention residual.
+    def forward(self, blocks: list[torch.Tensor]) -> torch.Tensor:
+        """Compute the input to the next block via AttnRes.
 
         Args:
-            blocks: List of [batch_size, seq_len, hidden_size] tensors.
-                Contains b_0 (embedding) and completed block representations.
-            partial_block: [batch_size, seq_len, hidden_size] or None.
-                Intra-block partial sum for the current block.
+            blocks: list of completed block representations,
+                each ``[B, T, hidden_size]``. Contains ``b_0``
+                (the embedding) and ``b_1, ..., b_{n-1}``.
 
         Returns:
-            Aggregated hidden state [batch_size, seq_len, hidden_size]
-            on this rank's device. When world>1, this is the
-            all-gathered result across the head dim.
+            Aggregated hidden state ``[B, T, hidden_size]``. When
+            ``world > 1`` the head dim is all-gathered across the
+            TP group.
         """
-        if partial_block is None:
-            V = torch.stack(blocks, dim=0)  # [N, B, T, D]
-        else:
-            V = torch.stack(blocks + [partial_block], dim=0)  # [N+1, B, T, D]
+        V = torch.stack(blocks, dim=0)  # [N, B, T, D]
         N, B, T, D = V.shape
 
         # Normalise keys (full hidden, then slice).
@@ -164,6 +270,10 @@ class BlockAttnRes(nn.Module):
         out = out.reshape(B, T, self.hpp * self.head_dim)
 
         # All-gather across the head dim to restore the full
-        # residual. When world==1 this is a no-op.
-        out = _all_gather_along_head_dim(out)
+        # residual. The wrapper is autograd-aware: backward
+        # slices the upstream gradient to the local head slice,
+        # which is what the pseudo-query's gradient needs.
+        out = _all_gather_along_head_dim(
+            out, self.world, self.rank, self.hpp, self.head_dim,
+        )
         return out

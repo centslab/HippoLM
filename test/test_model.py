@@ -7,7 +7,7 @@ sys.path.insert(0, "/home/wlx/HippoLM")
 from configs.base_config import HippoConfig
 from src.models.model import HippoModel, HippoLayer
 from src.models.kda import KDA
-from src.models.block_attn_res import BlockAttnRes
+from src.models.ops.attn_res import BlockAttnRes
 
 
 def test_kda_shape():
@@ -27,7 +27,7 @@ def test_kda_shape():
 
 
 def test_block_attn_res():
-    """Test BlockAttnRes produces correct output shape and weights."""
+    """BlockAttnRes takes only ``blocks`` (no partial_block)."""
     config = HippoConfig()
     module = BlockAttnRes(config)
 
@@ -36,16 +36,14 @@ def test_block_attn_res():
         torch.randn(B, T, D),
         torch.randn(B, T, D),
     ]
-    partial = torch.randn(B, T, D)
 
-    out = module(blocks, partial)
+    out = module(blocks)
     assert out.shape == (B, T, D)
 
-    # With zero query, weights should be uniform
+    # With zero query, weights should be uniform -> mean of blocks.
     module.query.data.zero_()
-    out_zero = module(blocks, partial)
-    # Should be close to average of inputs
-    expected = (blocks[0] + blocks[1] + partial) / 3.0
+    out_zero = module(blocks)
+    expected = sum(blocks) / len(blocks)
     assert torch.allclose(out_zero, expected, atol=1e-5)
 
     print("[PASS] test_block_attn_res")
@@ -125,6 +123,7 @@ def test_kda_different_inputs():
 
     # Run again with different input
     x2 = torch.randn(B, T, config.hidden_size, device=device)
+
     out2 = module(x2)
 
     # Outputs should differ due to different inputs
@@ -132,27 +131,38 @@ def test_kda_different_inputs():
     print("[PASS] test_kda_different_inputs")
 
 
-def test_layer_boundary():
-    """Test that block boundaries are handled correctly."""
-    config = HippoConfig(num_layers=8, num_blocks=2)  # block_size = 4
-    layer3 = HippoLayer(3, config)  # 4th layer -> boundary
+def test_block_boundary_attn_res_invoked():
+    """AttnRes is invoked at every non-first block boundary in HippoModel.forward.
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    layer3 = layer3.to(device)
+    With ``num_blocks=2`` there is one boundary (between block 0 and
+    block 1). Block 0 starts from the embedding (no AttnRes); block 1
+    starts from ``attn_res([b_0])`` — exactly one call.
+    """
+    if not torch.cuda.is_available():
+        print("[SKIP] test_block_boundary_attn_res_invoked (CUDA required)")
+        return
+    config = HippoConfig(num_layers=4, num_blocks=2)  # block_size = 2
+    model = HippoModel(config).cuda()
+    model.eval()
 
-    D = config.hidden_size
-    B, T = 2, 8
-    blocks = [torch.randn(B, T, D, device=device)]
-    partial = torch.randn(B, T, D, device=device)
+    call_count = [0]
+    original_forward = model.attn_res.forward
 
-    out_blocks, out_partial = layer3(blocks, partial)
+    def counting_forward(blocks):
+        call_count[0] += 1
+        return original_forward(blocks)
 
-    # Layer 3 is a boundary (layer_number=4, block_size=4)
-    # Before attention, partial should be appended to blocks
-    assert len(out_blocks) == 2, f"Expected 2 blocks after boundary, got {len(out_blocks)}"
-    # partial_block should be reset to None, then become attn+ffn output
-    assert out_partial is not None
-    print("[PASS] test_layer_boundary")
+    model.attn_res.forward = counting_forward
+
+    B, T = 1, 8
+    input_ids = torch.randint(0, config.vocab_size, (B, T), device="cuda")
+    model(input_ids)
+
+    assert call_count[0] == 1, (
+        f"Expected exactly 1 attn_res call (one boundary, two blocks), "
+        f"got {call_count[0]}"
+    )
+    print("[PASS] test_block_boundary_attn_res_invoked")
 
 
 def run_all_tests():
@@ -163,7 +173,7 @@ def run_all_tests():
     test_gradient_flow()
     test_tied_weights()
     test_kda_different_inputs()
-    test_layer_boundary()
+    test_block_boundary_attn_res_invoked()
     print("\nAll tests passed!")
 
 
