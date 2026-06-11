@@ -735,200 +735,133 @@ def _collate_batch(samples):
     }
 
 
-class _PrefetchBatcher:
-    """Run a streaming dataset in a background thread and emit collated batches.
+class _QueueIterator:
+    """Iterate a queue (``multiprocessing.Queue`` or ``queue.Queue``)
+    until a ``None`` sentinel, re-raising any exception object the
+    producer put in our place.
 
-    Why: with ``num_workers=0`` PyTorch DataLoader does no prefetching, so the
-    GPU stalls waiting on the next HTTP fetch + tokenize. Pushing the
-    iteration / tokenize / collate into a daemon thread and pulling finished
-    batches from a bounded queue overlaps IO with compute.
-
-    The producer thread iterates the dataset, tokenizes, accumulates
-    ``batch_size`` samples, collates, and ``put``s the batch. The main thread
-    pulls batches via ``__iter__`` and processes them. When the dataset
-    iterator is exhausted a ``None`` sentinel ends the stream; any producer
-    exception is also pushed into the queue and re-raised on the consumer.
-
-    Owner / non-owner split (TP):
-    In a multi-process run (e.g. TP=2) the dataloading is centralised:
-    exactly one process is the *owner* and runs the producer thread;
-    every other process is a *non-owner* that just consumes the same
-    shared queue. This is required by the model contract: TP shards the
-    weights but replicates the input, so every rank must see the exact
-    same batch on every step. Running an independent producer per rank
-    is incorrect (different file iterators, different timing, no
-    cross-rank synchronisation on the input).
-
-    The shared queue can be a ``multiprocessing.Queue`` (cross-process,
-    pickles payloads) or a ``queue.Queue`` (single-process, no
-    pickling). Both support ``put`` / ``get`` / ``put_nowait`` /
-    ``queue.Full``, so the producer and consumer code is identical.
+    This is the **single read path** for every TP rank — the owner's
+    prefetch worker pushes each batch into every rank's queue, and
+    every rank (including the owner) pulls from its own queue with
+    one of these iterators. No more owner / non-owner branching at
+    the consumer side.
     """
 
-    # End-of-stream marker. ``None`` is a singleton in CPython and is
-    # safe to use as a sentinel across processes: pickle round-trips
-    # preserve the identity, so ``item is None`` still works in the
-    # consumer process.
+    # ``None`` is a singleton in CPython and survives pickle round-
+    # trips, so it works as the end-of-stream marker for both
+    # in-process ``queue.Queue`` and cross-process ``mp.Queue``.
     _SENTINEL = None
 
-    def __init__(
-        self,
-        dataset=None,
-        batch_size: int = 1,
-        queue_size: int = 2,
-        shared_queue=None,
-        is_owner: bool = True,
-    ):
-        if is_owner and dataset is None:
-            raise ValueError(
-                "_PrefetchBatcher: dataset is required when is_owner=True"
-            )
-        self._dataset = dataset
-        self._batch_size = batch_size
-        if shared_queue is not None:
-            # Cross-process (or externally supplied) queue. The
-            # caller is responsible for sizing it; we trust whatever
-            # maxsize they passed.
-            self._queue = shared_queue
-        else:
-            # Single-process default: in-memory bounded queue.
-            self._queue = queue.Queue(maxsize=max(queue_size, 1))
-        self._is_owner = bool(is_owner) and dataset is not None
-        self._error: Optional[BaseException] = None
-        self._thread: Optional[threading.Thread] = None
-        self._watchdog_thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
-        self._log = logging.getLogger(__name__)
-        self._samples_seen = 0
-        self._batches_built = 0
-        self._last_progress = time.monotonic()
-
-    def _producer(self) -> None:
-        _log = self._log
-        _t0 = time.monotonic()
-        try:
-            batch: list = []
-            for sample in self._dataset:
-                if self._stop.is_set():
-                    return
-                self._samples_seen += 1
-                self._last_progress = time.monotonic()
-                _n = self._samples_seen
-                if _n == 1:
-                    _log.info(
-                        f"producer: first sample received"
-                        f" after {time.monotonic() - _t0:.2f}s"
-                    )
-                batch.append(sample)
-                if len(batch) >= self._batch_size:
-                    self._put_with_stop(_collate_batch(batch))
-                    self._batches_built += 1
-                    if self._stop.is_set():
-                        return
-                    batch = []
-            if batch and not self._stop.is_set():
-                self._put_with_stop(_collate_batch(batch))
-                self._batches_built += 1
-        except BaseException as e:  # noqa: BLE001 - surface to consumer
-            self._error = e
-            # Push the exception itself so cross-process consumers
-            # (which don't share ``self._error`` with us) can re-raise
-            # it. ``queue.Full`` is the same class on threading.Queue
-            # and multiprocessing.Queue.
-            try:
-                self._queue.put_nowait(e)
-            except queue.Full:
-                pass
-        finally:
-            # Put the sentinel in a non-blocking way: if the main thread has
-            # already abandoned the iterator the queue may be full of items
-            # nobody will consume, and blocking here would deadlock.
-            try:
-                self._queue.put_nowait(self._SENTINEL)
-            except queue.Full:
-                pass
-
-    def _put_with_stop(self, item) -> None:
-        """``queue.put`` with a short timeout so ``stop()`` is responsive
-        even when the consumer stops reading and the queue is full."""
-        while not self._stop.is_set():
-            try:
-                self._queue.put(item, timeout=0.5)
-                return
-            except queue.Full:
-                continue
-
-    def start(self) -> None:
-        """Start the producer thread. Idempotent; safe to call multiple times.
-
-        Non-owners (processes that share the queue with the owner) are
-        no-ops here: there is no producer to start, the owner's thread
-        is what feeds the queue.
-        """
-        if not self._is_owner:
-            return
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(
-            target=self._producer, name="hf-prefetch", daemon=True
-        )
-        self._thread.start()
-        # Watchdog: if the producer makes no progress for an extended
-        # time, log it so the user can see what stage is stuck (dataset
-        # iter? tokenize? collate? queue.put?). The watchdog only
-        # observes; it does not interrupt the producer. Interval is
-        # 30s because at 1 sample / 0.5s the per-tick log is just noise.
-        self._watchdog_thread = threading.Thread(
-            target=self._watchdog, name="hf-prefetch-watchdog", daemon=True
-        )
-        self._watchdog_thread.start()
-
-    def _watchdog(self) -> None:
-        _log = self._log
-        while not self._stop.is_set():
-            time.sleep(30.0)
-            idle = time.monotonic() - self._last_progress
-            if idle > 30.0:
-                _log.warning(
-                    f"prefetch watchdog: samples={self._samples_seen},"
-                    f" batches={self._batches_built}, idle={idle:.1f}s,"
-                    f" error={type(self._error).__name__ if self._error else 'None'}"
-                )
+    def __init__(self, q):
+        self._q = q
 
     def __iter__(self):
-        self.start()
-        while True:
-            item = self._queue.get()
-            if item is self._SENTINEL:
-                # End of stream. In the single-process case the
-                # producer's exception is also in self._error; in the
-                # cross-process case the exception was already pushed
-                # into the queue and re-raised via the
-                # ``isinstance(item, BaseException)`` branch below
-                # before we ever see the sentinel.
-                if self._error is not None and not isinstance(
-                    self._error, StopIteration
-                ):
-                    raise self._error
-                return
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+        return self
 
-    def stop(self) -> None:
-        """Signal the producer to exit at the next sample boundary.
+    def __next__(self):
+        item = self._q.get()
+        if item is self._SENTINEL:
+            raise StopIteration
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
-        Non-owners have no producer to signal; this is a no-op for them.
+
+class _PrefetchBatcher:
+    """One-deep async prefetch fanning out into per-rank queues.
+
+    Constructed **only on the TP owner rank**. Spawns one daemon
+    worker that loops::
+
+        fetch batch  ->  for q in queues: q.put(batch)  ->  repeat
+
+    The queue ``maxsize=2`` caps in-flight batches at 2 per rank.
+    When any consumer is slow, the worker blocks on that consumer's
+    ``queue.put`` — correct backpressure for TP. On end-of-stream a
+    ``None`` sentinel is broadcast to every queue; on exception the
+    exception object itself is broadcast (each consumer's
+    :class:`_QueueIterator` re-raises it).
+
+    There is no owner-side fast path: the owner reads from its own
+    queue via :class:`_QueueIterator` exactly like every non-owner
+    rank, so the consumer code is uniform across ranks.
+    """
+
+    _SENTINEL = None
+
+    def __init__(self, dataset, batch_size: int, queues):
         """
-        self._stop.set()
+        Args:
+            dataset: an iterable yielding raw samples.
+            batch_size: number of samples to collate per output batch.
+            queues: list of queue-likes (``mp.Queue`` cross-process,
+                ``queue.Queue`` in-process), one per consumer rank
+                **including the owner's own queue**. The worker
+                broadcasts each batch into every queue here.
+        """
+        if not queues:
+            raise ValueError("_PrefetchBatcher: queues must be non-empty")
+        self._batch_size = batch_size
+        self._queues = list(queues)
+        self._iter = iter(dataset)
+        self._stop = threading.Event()
+        self._log = logging.getLogger(__name__)
+        self._t0 = time.monotonic()
+        self._first_sample_logged = False
+        self._worker = threading.Thread(
+            target=self._worker_loop, name="hf-prefetch", daemon=True,
+        )
+        self._worker.start()
+
+    def _fetch_one(self):
+        """Pull ``batch_size`` samples from the dataset and collate.
+
+        Returns the collated batch dict, or :attr:`_SENTINEL` if the
+        dataset iterator is exhausted before any sample was read.
+        """
+        batch = []
+        for _ in range(self._batch_size):
+            try:
+                batch.append(next(self._iter))
+            except StopIteration:
+                break
+        if not batch:
+            return self._SENTINEL
+        if not self._first_sample_logged:
+            self._log.info(
+                f"prefetch: first sample after"
+                f" {time.monotonic() - self._t0:.2f}s"
+            )
+            self._first_sample_logged = True
+        return _collate_batch(batch)
+
+    def _broadcast(self, item) -> None:
+        """Put ``item`` into every consumer queue. Blocking — slow
+        consumers gate the worker, which is the backpressure we want."""
+        for q in self._queues:
+            q.put(item)
+
+    def _worker_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                result = self._fetch_one()
+            except BaseException as e:  # noqa: BLE001 — propagate
+                self._broadcast(e)
+                return
+            self._broadcast(result)
+            if result is self._SENTINEL:
+                return  # end of stream; consumers will raise StopIteration
 
     def close(self, timeout: float = 2.0) -> None:
-        """Stop the producer and wait briefly for the thread to join.
-        Avoids a noisy GIL-state warning at interpreter finalization when
-        the daemon producer is still mid-fetch when the process exits."""
-        self.stop()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
+        """Signal the worker to stop and wait briefly for it to exit.
+
+        Worker is a daemon thread, so a stuck ``queue.put`` (e.g.
+        consumer abandoned mid-stream) will be killed at interpreter
+        exit even if the join times out.
+        """
+        self._stop.set()
+        if self._worker is not None:
+            self._worker.join(timeout=timeout)
 
 
 def create_dummy_dataloader(batch_size: int, seq_len: int, vocab_size: int):
@@ -1042,7 +975,7 @@ def _train_worker(
     gpus: list[int],
     port: int,
     run_dir_path: str,
-    shared_batch_queue=None,
+    shared_batch_queues=None,
 ):
     """Single-worker training loop (one process per GPU).
 
@@ -1138,11 +1071,25 @@ def _train_worker(
         dataloader = create_dummy_dataloader(
             args.batch_size, args.seq_len, config.vocab_size
         )
-        dataloader_is_prefetched = False
+        prefetcher = None
     else:
+        # Per-rank read path: every rank pulls from its own queue via
+        # a tiny :class:`_QueueIterator`. The owner (rank 0)
+        # additionally spawns a :class:`_PrefetchBatcher` that
+        # broadcasts each batch into **every** rank's queue, so the
+        # consumer code is uniform — there is no owner / non-owner
+        # branching at the consumer side. For single-GPU runs the
+        # caller passes ``shared_batch_queues=None`` and we use a
+        # local in-process ``queue.Queue`` as the single rank's queue.
+        if shared_batch_queues is None:
+            my_queue = queue.Queue(maxsize=2)
+            all_queues = [my_queue]
+        else:
+            my_queue = shared_batch_queues[rank]
+            all_queues = list(shared_batch_queues)
         if rank == 0:
-            # Owner: build the dataset, the tokenizer, and start the
-            # producer thread. All the IO + tokenize cost is paid here.
+            # Owner: build the dataset and start the producer.
+            # All the IO + tokenize cost is paid here.
             tokenizer = load_tokenizer(args.tokenizer_path)
             if args.stage == "sft":
                 hf_name = args.sft_dataset_hf
@@ -1166,23 +1113,15 @@ def _train_worker(
                 text_field=args.text_field,
                 shuffle=args.shuffle,
             )
-            dataloader = _PrefetchBatcher(
-                dataset, batch_size=args.batch_size,
-                shared_queue=shared_batch_queue, is_owner=True,
+            prefetcher = _PrefetchBatcher(
+                dataset, batch_size=args.batch_size, queues=all_queues,
             )
-            dataloader_is_prefetched = True
-            dataloader.start()
         else:
-            # Non-owner: don't touch the dataset / tokenizer / parquet
-            # at all. Just attach to the shared queue the owner is
-            # filling. This is the only way all ranks can be sure to
-            # see the same input on every step.
-            dataloader = _PrefetchBatcher(
-                dataset=None, batch_size=args.batch_size,
-                shared_queue=shared_batch_queue, is_owner=False,
-            )
-            dataloader_is_prefetched = True
-            # No start() needed: the owner's thread is doing the work.
+            # Non-owner: no dataset, no tokenizer, no worker thread.
+            # The owner's prefetch worker is already pushing into our
+            # queue; we just need an iterator that drains it.
+            prefetcher = None
+        dataloader = _QueueIterator(my_queue)
 
     # ---- TP model ----
     from src.models.tp_model import TPHippoModel
@@ -1460,8 +1399,8 @@ def _train_worker(
             if global_step >= args.max_steps:
                 break
     finally:
-        if dataloader_is_prefetched:
-            dataloader.close()
+        if prefetcher is not None:
+            prefetcher.close()
         dist.destroy_process_group()
 
 
@@ -1491,28 +1430,34 @@ def train(args):
 
     if len(gpus) == 1:
         # No TP plumbing needed; just run the worker inline. The
-        # worker will fall back to a local threading.Queue for the
-        # dataloader (no cross-process sharing needed).
+        # worker will allocate its own in-process ``queue.Queue``
+        # for the dataloader (no cross-process sharing needed).
         _train_worker(
             rank=0, args=args, gpus=gpus, port=0,
-            run_dir_path=str(run_dir), shared_batch_queue=None,
+            run_dir_path=str(run_dir), shared_batch_queues=None,
         )
     else:
         import torch.multiprocessing as mp
         port = 29500 + (os.getpid() % 1000)
         # TP shards weights but REPLICATES the input. Therefore all
-        # ranks must consume the exact same batches on every step,
-        # which means data loading has to be centralised: one process
-        # owns the dataset iterator and producer, every other process
-        # just consumes the same shared queue. Building an
-        # independent producer per rank is incorrect (different
-        # iterators, different timings, no cross-rank synchronisation
-        # on the input).
+        # ranks must consume the exact same batches on every step.
+        # We centralise the dataset iterator on rank 0 (the owner)
+        # and fan each batch out to every rank via per-rank queues
+        # — one ``mp.Queue`` per rank, allocated in the parent and
+        # passed to every child. The owner's prefetch worker
+        # broadcasts each batch into every queue; each rank
+        # consumes from ``shared_batch_queues[rank]`` via a
+        # uniform :class:`_QueueIterator`. Building an independent
+        # producer per rank is incorrect (different iterators,
+        # different timings, no cross-rank synchronisation on the
+        # input).
         ctx = mp.get_context("spawn")
-        shared_batch_queue: "mp.Queue" = ctx.Queue(maxsize=2)
+        shared_batch_queues: list = [
+            ctx.Queue(maxsize=2) for _ in range(len(gpus))
+        ]
         mp.spawn(
             _train_worker,
-            args=(args, gpus, port, str(run_dir), shared_batch_queue),
+            args=(args, gpus, port, str(run_dir), shared_batch_queues),
             nprocs=len(gpus),
             join=True,
         )
