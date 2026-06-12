@@ -106,3 +106,101 @@ class StreamingDataset(IterableDataset):
     def __len__(self) -> int:
         # Streaming: arbitrary large number for any caller that needs it.
         return 1_000_000
+
+
+class MultiSourceStreamingDataset(IterableDataset):
+    """Stream from multiple sub-datasets with a phase schedule.
+
+    Each phase is a list of ``(sub_index, weight)`` pairs. The draw
+    order within a phase repeats each sub index by its weight, e.g.
+    ``[(0, 2), (1, 1)]`` produces ``[0, 0, 1, 0, 0, 1, ...]`` until
+    sub 0 and sub 1 are both exhausted. Then the next phase starts.
+    When all phases are exhausted, the schedule restarts from phase 0
+    (infinite stream).
+
+    Sub iterators are pulled lazily — each ``StreamingDataset`` only
+    resolves its underlying source on first ``__iter__``, so a phase
+    that doesn't include a given sub pays zero network cost.
+
+    Used by the "ultra fineweb L3 multi-source" loader: phase 0 is
+    multi-style (en *2 + zh *1), phase 1 is QA (en *2 + zh *1).
+    """
+
+    def __init__(self, sub_datasets, phase_schedule):
+        """
+        Args:
+            sub_datasets: list of underlying iterable datasets
+                (typically :class:`StreamingDataset` instances). Each
+                must be a tokenized stream yielding ``{input_ids, labels}``
+                dicts so the upstream :class:`PrefetchBatcher` sees a
+                uniform sample shape.
+            phase_schedule: list of phases; each phase is a list of
+                ``(sub_index, weight)`` pairs. ``sub_index`` must be
+                in ``[0, len(sub_datasets))`` and ``weight >= 1``.
+        """
+        super().__init__()
+        if not sub_datasets:
+            raise ValueError(
+                "MultiSourceStreamingDataset: sub_datasets must be non-empty"
+            )
+        if not phase_schedule:
+            raise ValueError(
+                "MultiSourceStreamingDataset: phase_schedule must be non-empty"
+            )
+        n = len(sub_datasets)
+        for pi, phase in enumerate(phase_schedule):
+            for idx, w in phase:
+                if not (0 <= idx < n):
+                    raise ValueError(
+                        f"phase {pi} references sub index {idx}"
+                        f" but only {n} sub_datasets provided"
+                    )
+                if w < 1:
+                    raise ValueError(
+                        f"phase {pi} weight must be >= 1, got {w} for sub {idx}"
+                    )
+        self._subs = list(sub_datasets)
+        self._phases = phase_schedule
+
+    def __iter__(self):
+        # Pre-compute the per-phase draw list, e.g. [0, 0, 1] for
+        # phase [(0, 2), (1, 1)]. Sampling from this list cyclically
+        # is O(1) per draw and is what gives the 2:1 en:zh weighting.
+        phase_draw_lists = []
+        for phase in self._phases:
+            draw = []
+            for idx, w in phase:
+                draw.extend([idx] * w)
+            phase_draw_lists.append(draw)
+
+        # Infinite stream: each outer-loop iteration walks every
+        # phase. A phase completes when every sub in it has been
+        # drained; a single sub dying mid-phase is fine — we just
+        # skip its draw slots for the rest of that phase. This
+        # matches the "multi-style first, then QA" contract at the
+        # block level rather than the sample level.
+        while True:
+            for draw_list in phase_draw_lists:
+                # Lazily create per-sub iterators on phase entry so
+                # phases that don't reference a given sub still pay
+                # zero cost. ``dict.get`` returns None for skipped subs.
+                iters = {}
+                for idx in set(draw_list):
+                    iters[idx] = iter(self._subs[idx])
+
+                any_alive = True
+                while any_alive:
+                    any_alive = False
+                    for idx in draw_list:
+                        sub_iter = iters.get(idx)
+                        if sub_iter is None:
+                            continue
+                        try:
+                            yield next(sub_iter)
+                            any_alive = True
+                        except StopIteration:
+                            iters[idx] = None  # mark exhausted
+
+    def __len__(self) -> int:
+        # Streaming: arbitrary large number for any caller that needs it.
+        return 1_000_000

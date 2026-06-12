@@ -104,6 +104,29 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ModelScope dataset id for pretraining (primary).")
     p.add_argument("--pretrain_config", type=str,
                    default="Ultra-FineWeb-L3-en-QA-Synthetic")
+    # ---- Multi-source pretrain (Ultra-FineWeb-L3) ----
+    # When ``--pretrain_multi_source`` is true, the loader streams
+    # 4 subsets in a 2-phase schedule: phase 0 is multi-style
+    # (English *2 + Chinese *1), phase 1 is QA (English *2 + Chinese
+    # *1). When all 4 are exhausted, the schedule restarts from
+    # phase 0. The single-source ``--pretrain_config`` is ignored in
+    # this mode. Set to false to fall back to the single-source path.
+    p.add_argument("--pretrain_multi_source", type=bool, default=False,
+                   help="Stream 4 Ultra-FineWeb-L3 subsets (en/zh x "
+                        "multi-style/QA) with a 2-phase, 2:1 en:zh "
+                        "schedule. Overrides --pretrain_config.")
+    p.add_argument("--pretrain_en_multi_config", type=str,
+                   default="Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
+                   help="Multi-source mode: English multi-style subset.")
+    p.add_argument("--pretrain_zh_multi_config", type=str,
+                   default="Ultra-FineWeb-L3-zh-Multi-Style-Synthetic",
+                   help="Multi-source mode: Chinese multi-style subset.")
+    p.add_argument("--pretrain_en_qa_config", type=str,
+                   default="Ultra-FineWeb-L3-en-QA-Synthetic",
+                   help="Multi-source mode: English QA subset.")
+    p.add_argument("--pretrain_zh_qa_config", type=str,
+                   default="Ultra-FineWeb-L3-zh-QA-Synthetic",
+                   help="Multi-source mode: Chinese QA subset.")
     p.add_argument("--sft_dataset_hf", type=str,
                    default="openbmb/UltraData-SFT-2605",
                    help="HF dataset id for SFT (fallback source).")

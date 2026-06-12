@@ -16,7 +16,7 @@ from .sources import (
     load_hf_streaming,
     load_streaming_with_fallback,
 )
-from .streaming import StreamingDataset
+from .streaming import MultiSourceStreamingDataset, StreamingDataset
 
 __all__ = [
     "get_cache_dir", "cache_path_for",
@@ -28,4 +28,5 @@ __all__ = [
     "network_exceptions",
     "load_modelscope_streaming", "load_hf_streaming", "load_streaming_with_fallback",
     "StreamingDataset",
+    "MultiSourceStreamingDataset",
 ]

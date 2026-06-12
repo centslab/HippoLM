@@ -36,6 +36,7 @@ from src.models.tp_layers import init_tp
 from src.models.tp_model import TPHippoModel
 from src.training import save_checkpoint
 from src.training.data import (
+    MultiSourceStreamingDataset,
     PrefetchBatcher,
     QueueIterator,
     StreamingDataset,
@@ -209,23 +210,80 @@ def _setup_worker(
                 ms_name = args.sft_dataset_ms
                 config_name = args.sft_config
                 is_sft = True
+                dataset = StreamingDataset(
+                    dataset_name=hf_name,
+                    ms_dataset_name=ms_name,
+                    use_modelscope=args.use_modelscope,
+                    tokenizer=tokenizer,
+                    split="train",
+                    max_seq_len=args.seq_len,
+                    is_sft=is_sft,
+                    config_name=config_name,
+                    text_field=args.text_field,
+                    shuffle=args.shuffle,
+                )
+            elif getattr(args, "pretrain_multi_source", False):
+                # Ultra-FineWeb-L3 multi-source: 4 subsets in a
+                # 2-phase schedule (multi-style first, then QA,
+                # 2:1 en:zh). Each sub is its own StreamingDataset
+                # so the per-subset network/cache config is
+                # independent. ``MultiSourceStreamingDataset`` lazily
+                # opens each sub only when its phase is reached.
+                sub_specs = [
+                    ("en_multi", args.pretrain_en_multi_config),
+                    ("zh_multi", args.pretrain_zh_multi_config),
+                    ("en_qa",    args.pretrain_en_qa_config),
+                    ("zh_qa",    args.pretrain_zh_qa_config),
+                ]
+                subs = []
+                for label, cfg in sub_specs:
+                    logger.info(
+                        f"Multi-source pretrain sub [{label}]:"
+                        f" hf={args.pretrain_dataset_hf}"
+                        f" ms={args.pretrain_dataset_ms}"
+                        f" config={cfg}"
+                    )
+                    subs.append(StreamingDataset(
+                        dataset_name=args.pretrain_dataset_hf,
+                        ms_dataset_name=args.pretrain_dataset_ms,
+                        use_modelscope=args.use_modelscope,
+                        tokenizer=tokenizer,
+                        split="train",
+                        max_seq_len=args.seq_len,
+                        is_sft=False,
+                        config_name=cfg,
+                        text_field=args.text_field,
+                        shuffle=args.shuffle,
+                    ))
+                # Phase 0: multi-style, en *2 + zh *1.
+                # Phase 1: QA, en *2 + zh *1.
+                schedule = [
+                    [(0, 2), (1, 1)],  # multi-style block
+                    [(2, 2), (3, 1)],  # QA block
+                ]
+                dataset = MultiSourceStreamingDataset(subs, schedule)
+                logger.info(
+                    f"Multi-source pretrain: 4 subsets, "
+                    f"phase_schedule={schedule} "
+                    f"(multi-style first, then QA, en:zh=2:1)"
+                )
             else:
                 hf_name = args.pretrain_dataset_hf
                 ms_name = args.pretrain_dataset_ms
                 config_name = args.pretrain_config
                 is_sft = False
-            dataset = StreamingDataset(
-                dataset_name=hf_name,
-                ms_dataset_name=ms_name,
-                use_modelscope=args.use_modelscope,
-                tokenizer=tokenizer,
-                split="train",
-                max_seq_len=args.seq_len,
-                is_sft=is_sft,
-                config_name=config_name,
-                text_field=args.text_field,
-                shuffle=args.shuffle,
-            )
+                dataset = StreamingDataset(
+                    dataset_name=hf_name,
+                    ms_dataset_name=ms_name,
+                    use_modelscope=args.use_modelscope,
+                    tokenizer=tokenizer,
+                    split="train",
+                    max_seq_len=args.seq_len,
+                    is_sft=is_sft,
+                    config_name=config_name,
+                    text_field=args.text_field,
+                    shuffle=args.shuffle,
+                )
             prefetcher = PrefetchBatcher(
                 dataset, batch_size=args.batch_size, queues=all_queues,
             )

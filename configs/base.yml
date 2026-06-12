@@ -69,6 +69,17 @@ use_modelscope: true
 pretrain_dataset_hf: openbmb/Ultra-FineWeb-L3
 pretrain_dataset_ms: OpenBMB/Ultra-FineWeb-L3
 pretrain_config: Ultra-FineWeb-L3-en-QA-Synthetic
+# Multi-source pretrain: stream 4 Ultra-FineWeb-L3 subsets in a
+# 2-phase schedule (multi-style first, then QA), with English
+# weighted 2x over Chinese. Phase 0: en_multi *2 + zh_multi *1.
+# Phase 1: en_qa *2 + zh_qa *1. When all 4 are exhausted, the
+# schedule restarts from phase 0 (infinite stream). When false,
+# the single-source ``pretrain_config`` path is used.
+pretrain_multi_source: true
+pretrain_en_multi_config: Ultra-FineWeb-L3-en-Multi-Style-Synthetic
+pretrain_zh_multi_config: Ultra-FineWeb-L3-zh-Multi-Style-Synthetic
+pretrain_en_qa_config: Ultra-FineWeb-L3-en-QA-Synthetic
+pretrain_zh_qa_config: Ultra-FineWeb-L3-zh-QA-Synthetic
 sft_dataset_hf: openbmb/UltraData-SFT-2605
 sft_dataset_ms: OpenBMB/UltraData-SFT-2605
 sft_config: null
