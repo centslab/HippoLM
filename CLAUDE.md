@@ -30,8 +30,9 @@ block sizes, and precision flags.
 
 ## Training
 
-- Hardware target: 8x V100-class GPUs, tight VRAM budget — most
-  optimization work targets the boundary, not the center.
+- Hardware target: 8x V100-class 16G GPUs or single 5060 Ti 16G
+  GPU, tight VRAM budget — mostoptimization work targets
+  the boundary, not the center.
 - Training is data-parallel-style across the TP group: forward
   and backward on GPU, optimizer state on CPU pinned memory
   (BF16 for AdamW, int8-quantized momentum for Muon).
