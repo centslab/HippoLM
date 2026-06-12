@@ -69,6 +69,8 @@ from typing import List, Optional, Protocol, Tuple
 import torch
 import torch.nn as nn
 
+from .precision_config import DType, PrecisionConfig, TensorPrecision
+
 
 # --------------------------------------------------------------------------- #
 # Per-param state descriptor.                                                 #
@@ -195,11 +197,59 @@ class CPUAdamW:
         betas: Tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
+        precision: Optional[PrecisionConfig] = None,
     ) -> None:
+        """CPU-offloaded AdamW with configurable per-tensor precision.
+
+        ``precision`` controls the storage dtypes of:
+
+        - ``s.accum``   (the grad accumulator)  ← ``precision.gradients``
+        - ``s.m``       (1st moment)            ← ``precision.adamw_m``
+        - ``s.exp_avg_sq`` (2nd moment)         ← ``precision.adamw_v``
+
+        Defaults (when ``precision`` is ``None``) match the canonical
+        yml: BF16 for all three. The :meth:`step` algorithm is
+        dtype-agnostic — it always promotes to FP32 for the
+        divisor / factor math — so any combination of these
+        dtypes produces the same numerical answer up to casting
+        error.
+        """
         self.lr = lr
         self.beta1, self.beta2 = betas
         self.eps = eps
         self.weight_decay = weight_decay
+        # If no precision passed, use the dataclass defaults (which
+        # already match the canonical yml).
+        precision = precision or PrecisionConfig()
+
+        # Resolve dtypes once (avoids per-param .to_torch() calls).
+        accum_dtype = precision.gradients.dtype.to_torch()
+        m_dtype = precision.adamw_m.dtype.to_torch()
+        v_dtype = precision.adamw_v.dtype.to_torch()
+        # Quantized m / v are not supported (AdamW's m and v are
+        # magnitudes / squared magnitudes; quantizing them loses
+        # the precision that the FP32 promotion in step() is
+        # supposed to recover). Fall back to FP32 storage and
+        # warn — explicit user override of an unsupported
+        # combination should not silently change the math.
+        if precision.adamw_m.dtype.is_integer:
+            m_dtype = torch.float32
+            import warnings
+            warnings.warn(
+                f"CPUAdamW: adamw_m dtype={precision.adamw_m.dtype.value}"
+                f" is integer-quantized; falling back to FP32 storage."
+                f" Quantizing m/v is not supported (the FP32"
+                f" promotion in step() assumes a floating source).",
+                stacklevel=2,
+            )
+        if precision.adamw_v.dtype.is_integer:
+            v_dtype = torch.float32
+            import warnings
+            warnings.warn(
+                f"CPUAdamW: adamw_v dtype={precision.adamw_v.dtype.value}"
+                f" is integer-quantized; falling back to FP32 storage.",
+                stacklevel=2,
+            )
 
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
@@ -212,15 +262,9 @@ class CPUAdamW:
             n = p.numel()
             self.state[id(p)] = _ParamState(
                 param=p,
-                # BF16 accum: matches the new grad-transfer dtype.
-                accum=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
-                # v is BF16 (was FP32 in the FP16 era; BF16 has
-                # enough exponent range that ``g²`` doesn't
-                # underflow). See dataclass docstring above.
-                exp_avg_sq=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
-                # m is BF16: magnitude bounded, native dtype on
-                # the new 5060Ti hardware.
-                m=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
+                accum=torch.zeros(n, dtype=accum_dtype, device="cpu").pin_memory(),
+                exp_avg_sq=torch.zeros(n, dtype=v_dtype, device="cpu").pin_memory(),
+                m=torch.zeros(n, dtype=m_dtype, device="cpu").pin_memory(),
                 kind="adamw",
                 shape=p.shape,
             )
@@ -366,12 +410,63 @@ class CPUMuon:
         nesterov: bool = True,
         ns_steps: int = 5,
         weight_decay: float = 0.0,
+        precision: Optional[PrecisionConfig] = None,
     ) -> None:
+        """CPU-offloaded Muon with configurable precision.
+
+        ``precision`` controls:
+
+        - ``s.accum``    (grad accumulator)     ← ``precision.gradients``
+        - ``s.int8_q``   (quantized momentum)   ← ``precision.muon_momentum``
+        - ``s.int8_scale`` (per-row scale)      ← always BF16 (the
+          scale needs FP32-like dynamic range to avoid underflow
+          on quiet rows; BF16 is the cheapest dtype that
+          guarantees this)
+
+        Supported momentum dtypes: ``int8`` (default), ``int4``
+        (raises :class:`NotImplementedError`; int4 is on the
+        roadmap but the packing scheme is not finalized). Floating
+        dtypes (``fp16``/``bf16``/``fp32``) are accepted but
+        stored as int8 in this version (the Newton-Schulz path
+        orthogonalizes a 2-D matrix; the storage precision only
+        matters for the EMA, not the orthogonalization quality).
+        A floating ``muon_momentum`` with a non-int storage dtype
+        triggers a warning and falls back to int8.
+        """
         self.lr = lr
         self.momentum = momentum
         self.nesterov = nesterov
         self.ns_steps = ns_steps
         self.weight_decay = weight_decay
+        precision = precision or PrecisionConfig()
+
+        accum_dtype = precision.gradients.dtype.to_torch()
+        # Resolve momentum storage. int8 is the only fully-supported
+        # quantized storage; int4 is on the roadmap but not yet
+        # implemented (the int8_q buffer would need to pack 2
+        # elements per byte and the dequant path would need to
+        # unpack).
+        mom_dtype_cfg = precision.muon_momentum.dtype
+        if mom_dtype_cfg == DType.INT4:
+            raise NotImplementedError(
+                "CPUMuon: muon_momentum dtype=int4 is not yet implemented."
+                " Use int8 (the current default) or a floating dtype"
+                " (which falls back to int8 storage)."
+            )
+        if mom_dtype_cfg.is_floating:
+            import warnings
+            warnings.warn(
+                f"CPUMuon: muon_momentum dtype={mom_dtype_cfg.value}"
+                f" is floating; falling back to int8 storage (the"
+                f" EMA storage is the only thing affected, not the"
+                f" Newton-Schulz output precision).",
+                stacklevel=2,
+            )
+            mom_storage_dtype = torch.int8
+        else:
+            mom_storage_dtype = mom_dtype_cfg.to_torch()  # int8
+        # Scale is always BF16 — see docstring.
+        scale_dtype = torch.bfloat16
 
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
@@ -390,16 +485,13 @@ class CPUMuon:
             shape = tuple(p.shape)
             st = _ParamState(
                 param=p,
-                # BF16 accum: matches the new grad-transfer dtype.
-                accum=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
-                # int8 quantized momentum (1 byte/elt vs 2 for
-                # FP16, halves Muon's CPU RAM cost).
-                int8_q=torch.zeros(n, dtype=torch.int8, device="cpu").pin_memory(),
-                # BF16 per-row scale (FP32-like dynamic range; no
-                # underflow risk on quiet rows). For a 2-D
-                # ``[rows, cols]`` matrix, ``scale`` is
-                # ``[rows]`` — tiny relative to the int8 buffer.
-                int8_scale=torch.zeros(shape[0], dtype=torch.bfloat16, device="cpu").pin_memory(),
+                accum=torch.zeros(n, dtype=accum_dtype, device="cpu").pin_memory(),
+                int8_q=torch.zeros(n, dtype=mom_storage_dtype, device="cpu").pin_memory(),
+                # Scale is always BF16; the precision config does
+                # not currently expose ``scale_dtype``. If we
+                # later add one, switch this to the configured
+                # value.
+                int8_scale=torch.zeros(shape[0], dtype=scale_dtype, device="cpu").pin_memory(),
                 kind="muon",
                 shape=shape,
             )
@@ -563,13 +655,18 @@ def accumulate_grads_to_cpu(
     CPU add. This avoids the race where ``s.accum.add_(src)`` runs
     on the CPU before the DMA copy populates ``src``.
 
-    The cast to BF16 happens BEFORE the DMA so the transfer
-    itself is BF16 (2 bytes/elt, same as FP16 but with FP32-like
-    dynamic range, so no overflow on the grad copy or the m
-    update downstream). The src grad is the training dtype
-    (FP16 in this project), so the cast is a down-cast on the
-    GPU. We do the cast on the GPU first, then the DMA, so the
-    PCIe transfer is already in BF16.
+    The cast target is read from ``s.accum.dtype`` (the
+    ``gradients`` precision in :class:`PrecisionConfig`). BF16 is
+    the default; FP16 / FP32 also work, and integer dtypes
+    (int8 / int4) cast the rounded-integer grad into the
+    accumulator's storage — but in practice the training loop
+    uses a floating dtype for ``gradients`` because the
+    grad-to-accumulator add is an FP add, not an int add.
+
+    The cast happens BEFORE the DMA so the transfer itself
+    matches the storage dtype. We do the cast on the GPU first,
+    then the DMA, so the PCIe transfer is already in the
+    target dtype.
     """
     pending: list[tuple[torch.Tensor, torch.Tensor]] = []
     for opt in optimizers:
@@ -577,12 +674,12 @@ def accumulate_grads_to_cpu(
             g = s.param.grad
             if g is None:
                 continue
-            # Issue the async copy: cast to BF16 on the GPU
-            # first (matches the new accum dtype; no FP16
-            # overflow on the DMA), then flatten, then DMA.
+            # Cast on the GPU first (matches s.accum's dtype;
+            # no FP16 overflow on the DMA if accum is BF16), then
+            # flatten, then DMA.
             src_cpu = (
                 g.detach()
-                .to(torch.bfloat16)
+                .to(s.accum.dtype)
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
             )
@@ -616,6 +713,7 @@ def build_param_groups(
     lr_adamw: float = 1e-4,
     weight_decay: float = 0.01,
     muon_momentum: float = 0.95,
+    precision: Optional[PrecisionConfig] = None,
 ) -> Tuple[List, List]:
     """Build a (muon_optimizer, adamw_optimizer) pair for a single
     rank's model fragment.
@@ -625,6 +723,12 @@ def build_param_groups(
           KDA A_log/dt_bias with ``_no_weight_decay``): AdamW
         - 2D Linear weights: Muon
         - Embedding + lm_head: AdamW (per user spec)
+
+    ``precision`` (optional :class:`PrecisionConfig`) is forwarded
+    to both optimizers; the model weights themselves are
+    constructed at the dtype from ``precision.model_weights`` by
+    the caller (``scripts.train`` / ``src.training.loop``).
+    Defaults to the canonical yml precision when ``None``.
     """
     muon_params: list[nn.Parameter] = []
     adamw_params: list[nn.Parameter] = []
@@ -663,6 +767,7 @@ def build_param_groups(
         nesterov=True,
         ns_steps=5,
         weight_decay=0.0,   # decoupled wd applied elsewhere if needed
+        precision=precision,
     )
     adamw_opt = CPUAdamW(
         adamw_params,
@@ -670,5 +775,6 @@ def build_param_groups(
         betas=(0.9, 0.95),
         eps=1e-8,
         weight_decay=weight_decay,
+        precision=precision,
     )
     return muon_opt, adamw_opt

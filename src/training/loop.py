@@ -47,6 +47,7 @@ from src.training.param_offload import (
     build_param_groups,
     zero_cpu_grad_accum,
 )
+from src.training.precision_config import PrecisionConfig
 from src.training.tokenizer import load_tokenizer
 
 log = logging.getLogger(__name__)
@@ -235,7 +236,18 @@ def _setup_worker(
     # ---- TP model ----
     init_tp(world_size=len(gpus), devices=gpus, backend=backend)
     torch.manual_seed(args.seed)
-    model = TPHippoModel(config, devices=gpus, dtype=torch.float16)
+    # Resolve the precision config: ``args.precision`` is a raw
+    # yml-shaped dict (set by the CLI overlay in
+    # ``scripts.cli.parse_args``); convert to a typed
+    # ``PrecisionConfig`` so the model_weights dtype flows into
+    # the model construction and the optimizer-state dtypes
+    # flow into ``build_param_groups`` below. ``None`` /
+    # missing means the canonical yml defaults.
+    precision = PrecisionConfig.from_dict(
+        getattr(args, "precision", None)
+    )
+    weight_dtype = precision.model_weights.dtype.to_torch()
+    model = TPHippoModel(config, devices=gpus, dtype=weight_dtype)
     dist.barrier()
     model.sync_replicated_from(gpus[0])
     if rank == 0:
@@ -260,6 +272,7 @@ def _setup_worker(
         lr_adamw=args.learning_rate,
         weight_decay=args.weight_decay,
         muon_momentum=args.muon_momentum,
+        precision=precision,
     )
     n_muon = sum(s.param.numel() for s in muon_opt.state.values())
     n_adamw = sum(s.param.numel() for s in adamw_opt.state.values())

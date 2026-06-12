@@ -1,7 +1,8 @@
 """CLI argument parsing for the training entry point.
 
-Builds the argparse parser and applies the YAML config overlay
-before returning the :class:`argparse.Namespace`. The script
+Builds the argparse parser, applies the YAML config overlay
+(yaml values become parser defaults — explicit CLI flags win),
+and returns the :class:`argparse.Namespace`. The script
 itself (``scripts/train.py``) imports :func:`parse_args` and
 hands the result to :func:`scripts.train.train`.
 
@@ -10,19 +11,24 @@ before the PR-3..PR-6 refactor. The CLI surface (~50 flags) is
 mechanical and changes on a different cadence from the training
 loop; keeping it in its own module makes both easier to read.
 
-YAML overlay behavior: every top-level key in the YAML that
-matches an existing argparse attribute overrides the CLI
-default. Nested dicts (e.g. ``precision.model_weights.dtype``)
-are silently dropped because ``hasattr`` does not recognize
-dotted keys. This is a known limitation tracked for the
-precision-wiring phase (it needs nested-dict support in the
-overlay matcher).
+Overlay precedence (PR-9 follow-up):
+
+  - YAML is canonical for **defaults** (the yml in
+    :file:`configs/base.yml` defines the project's default
+    precision / batch / lr / etc.).
+  - **CLI flags win** when explicitly passed: any value the
+    user supplies on the command line overrides the yml.
+  - Nested dicts (e.g. ``precision: { model_weights: {...} }``)
+    flow through as a single attribute (``args.precision`` is
+    the whole dict); the training loop constructs the typed
+    :class:`PrecisionConfig` from it via
+    :meth:`PrecisionConfig.from_dict`.
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,8 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---- Config file ----
     p.add_argument("--config", type=str, default="configs/base.yml",
-                   help="YAML config file. Top-level keys override the "
-                        "argparse defaults below.")
+                   help="YAML config file. Top-level keys set the parser "
+                        "defaults (explicit CLI flags still win).")
 
     # ---- Model ----
     p.add_argument("--vocab_size", type=int, default=248320)
@@ -141,10 +147,30 @@ def build_parser() -> argparse.ArgumentParser:
                         " is ~2-4 on a 16 GB GPU because replicated"
                         " weights are duplicated per process.")
 
+    # ---- Precision (yml-only for now; no --precision CLI flag) ----
+    # The yml schema is::
+    #
+    #     precision:
+    #       model_weights: { dtype: fp16 }
+    #       gradients:     { dtype: bf16 }
+    #       muon_momentum: { dtype: int8, scale: per-channel }
+    #       adamw_m:       { dtype: bf16 }
+    #       adamw_v:       { dtype: bf16 }
+    #
+    # argparse has no native nested-dict type, so the precision
+    # config flows through as a raw ``dict`` (set via
+    # ``set_defaults`` from the yml payload). The training loop
+    # converts it to :class:`PrecisionConfig` via
+    # :meth:`PrecisionConfig.from_dict`.
+    p.add_argument(
+        "--precision", type=str, default=None,
+        help=argparse.SUPPRESS,  # yml-only; suppress from --help
+    )
+
     return p
 
 
-def _load_yaml(path: str) -> dict:
+def _load_yaml(path: str) -> Dict[str, Any]:
     """Tiny YAML loader used only by the overlay step. Inlined
     to avoid a circular import: ``scripts.train`` already depends
     on ``scripts.cli``, so ``scripts.cli`` cannot import from
@@ -158,21 +184,32 @@ def _load_yaml(path: str) -> dict:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    """Parse argv, apply YAML config overlay, return Namespace.
+    """Parse argv with yml-driven defaults; CLI flags win.
 
-    The overlay step: for every top-level key in the YAML that
-    matches an existing argparse attribute, the YAML value wins.
-    ``hasattr`` is the match — nested dicts (e.g. ``precision``)
-    are silently dropped because the flat matcher doesn't
-    recognize them. See the module docstring for the tracked
-    follow-up.
+    Two-pass approach:
+
+      1. ``parse_known_args`` with the hardcoded defaults to
+         discover ``--config`` (or the default ``configs/base.yml``).
+      2. Load the yml, ``parser.set_defaults(**yml_dict)`` so the
+         yml values become the parser defaults, then re-parse.
+         Any explicit CLI flag overrides the yml-set default.
+
+    Nested dicts (``precision: { ... }``) flow through as
+    whole-dict attributes — ``set_defaults`` accepts any value,
+    including a nested dict. The training loop picks up
+    ``args.precision`` and converts to :class:`PrecisionConfig`.
+
+    The yml is read but no key validation is done against the
+    parser schema. Unknown keys are simply added as
+    ``Namespace`` attributes, which is intentional: the precision
+    block and any future yml-only field don't need a matching
+    ``add_argument`` call.
     """
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if Path(args.config).exists():
-        config_dict = _load_yaml(args.config)
-        if config_dict:
-            for key, value in config_dict.items():
-                if hasattr(args, key):
-                    setattr(args, key, value)
-    return args
+    known, _ = parser.parse_known_args(argv)
+    yml_path = Path(known.config)
+    if yml_path.exists():
+        yml_dict = _load_yaml(str(yml_path))
+        if yml_dict:
+            parser.set_defaults(**yml_dict)
+    return parser.parse_args(argv)
