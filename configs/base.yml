@@ -32,10 +32,10 @@ rms_norm_eps: 0.000001
 epochs: 1
 max_steps: 1000
 batch_size: 4
-seq_len: 4096
-learning_rate: 1.0e-4
+seq_len: 1024
+learning_rate: 0.03
 weight_decay: 0.01
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 64
 fp16: true
 
 # Stage: pretrain or sft
@@ -61,7 +61,7 @@ shuffle: false
 
 # Output
 output_dir: output
-log_interval: 10
+log_interval: 1
 checkpoint_interval: 100
 
 # GPU

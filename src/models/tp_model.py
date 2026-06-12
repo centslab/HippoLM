@@ -547,6 +547,10 @@ class TPHippoModel(nn.Module):
             d: FusedCrossEntropyLoss(
                 ignore_index=-100,
                 reduction="mean",
+                # Reuse the logits buffer for dlogits in backward
+                # instead of allocating a fresh [B*T, V] tensor
+                # (~2.2 GB at seq=919, B=4, V=248320, FP16).
+                inplace_backward=True,
                 process_group=get_tp_group(),
             )
             for d in self.devices
@@ -729,8 +733,18 @@ class TPHippoModel(nn.Module):
 
         hidden_states = self.replicated_per_device[device]["norm"](x)
         sharded_logits = self.lm_head_per_device[device](hidden_states)
-        out: dict[str, torch.Tensor] = {"logits": sharded_logits}
+        out: dict[str, torch.Tensor] = {}
         if labels is not None:
+            # The training path only consumes ``out["loss"]``, so we
+            # avoid stashing the full ``[B, T, V // world]`` logit
+            # buffer (1.8 GB at B=4, T=919, V=248k) in the output
+            # dict. The CE kernel will write its dlogits back into
+            # ``shift_logits`` in-place (see ``inplace_backward``
+            # below), so the only live logit tensor during backward
+            # is the 1.8 GB ``shift_logits`` copy. The .contiguous()
+            # is required because the time-slice
+            # ``sharded_logits[..., :-1, :]`` is non-contiguous and
+            # cannot be viewed as ``[N, V // world]`` for the kernel.
             shift_logits = sharded_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Fused kernel only supports 2D ``[N, V // world]``
@@ -743,4 +757,7 @@ class TPHippoModel(nn.Module):
             # so no post-hoc mask bookkeeping is required.
             loss = self.loss_fn_per_device[device](shift_logits_2d, shift_labels_1d)
             out["loss"] = loss
+        else:
+            # Inference / generation path: caller expects logits
+            out["logits"] = sharded_logits
         return out
