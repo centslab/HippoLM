@@ -46,6 +46,8 @@ from src.training.diagnostics import log_post_opt_diag, log_pre_step_diag
 from src.training.param_offload import (
     accumulate_grads_to_cpu,
     build_param_groups,
+    flush_pending_grads,
+    register_grad_offload_hooks,
     zero_cpu_grad_accum,
 )
 from src.training.precision_config import PrecisionConfig
@@ -332,6 +334,15 @@ def _setup_worker(
         muon_momentum=args.muon_momentum,
         precision=precision,
     )
+    # Install the per-param post-accumulate-grad hooks so each
+    # param's grad is DMA'd to its CPU accumulator as soon as
+    # autograd computes it (during ``backward()``), not after.
+    # This keeps the peak GPU grad memory to "at most one
+    # param's grad" rather than "the sum of all grads". The
+    # training loop calls :func:`flush_pending_grads` once per
+    # microbatch to sync CUDA and apply the CPU adds. See
+    # :func:`register_grad_offload_hooks` for the design.
+    register_grad_offload_hooks([muon_opt, adamw_opt])
     n_muon = sum(s.param.numel() for s in muon_opt.state.values())
     n_adamw = sum(s.param.numel() for s in adamw_opt.state.values())
     n_muon_rows = sum(s.shape[0] for s in muon_opt.state.values())
@@ -429,9 +440,16 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 (loss / args.gradient_accumulation_steps).backward()
                 accumulated_loss += mb_loss
 
-                accumulate_grads_to_cpu(
-                    [muon_opt, adamw_opt], sync_device=gpus[rank],
-                )
+                # Sync CUDA and apply the CPU-side adds for the
+                # D2H transfers that the per-param hooks issued
+                # during ``backward()`` above. The hooks (see
+                # :func:`register_grad_offload_hooks`) already
+                # cleared each ``.grad`` as they fired, so the
+                # peak GPU grad memory at this point is at most
+                # one param's grad (whatever autograd is
+                # currently processing — none, since backward
+                # has returned).
+                flush_pending_grads(sync_device=gpus[rank])
                 del loss, outputs, input_ids, labels
                 microbatch_in_cycle += 1
 

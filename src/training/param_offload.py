@@ -642,11 +642,14 @@ def accumulate_grads_to_cpu(
     optimizers: List,
     sync_device: int | None = None,
 ) -> None:
-    """Copy each trainable param's ``.grad`` to its optimizer state's
-    CPU accumulator and free the GPU copy.
+    """Manual-path copy of each trainable param's ``.grad`` to its
+    optimizer state's CPU accumulator and free the GPU copy.
 
-    Safe to call on either AdamW or Muon states: the state object
-    has the same ``accum`` slot in both.
+    This is the post-backward batched path. It is kept for the
+    manual code paths (unit tests that set ``.grad`` directly,
+    or any caller that has not installed the per-param streaming
+    hooks via :func:`register_grad_offload_hooks`). The training
+    loop uses the streaming path.
 
     The async ``.to("cpu")`` is issued first (with a flattened
     view of the grad, so the resulting ``src_cpu`` matches the
@@ -695,6 +698,137 @@ def accumulate_grads_to_cpu(
 
     for target, src in pending:
         target.add_(src)
+
+
+# --------------------------------------------------------------------------- #
+# Streaming per-param D2H via post-accumulate-grad hooks.                      #
+# --------------------------------------------------------------------------- #
+# Module-level queue for in-flight D2H transfers issued by the
+# hooks. Each entry is ``(accum, src_cpu)`` where ``src_cpu`` is
+# a CPU tensor whose data is being DMA'd in asynchronously.
+# :func:`flush_pending_grads` syncs CUDA and applies the adds.
+_pending_grads: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+
+def register_grad_offload_hooks(optimizers: List) -> None:
+    """Install a per-param post-accumulate-grad hook that streams
+    each param's grad to the CPU as it is computed.
+
+    Why hooks (and not a post-backward loop):
+
+      The post-backward path (``accumulate_grads_to_cpu``)
+      iterates over the optimizer state after ``loss.backward()``
+      has returned. By that point autograd has already populated
+      ``.grad`` for every trainable param on the GPU. The peak
+      GPU memory is therefore ``model + activations + sum(grads)``
+      at the instant backward finishes, before the function has
+      a chance to issue the first DMA. For a 624 M-param model
+      in FP16, ``sum(grads) ≈ 1.2 GB`` — the user's report.
+
+      A post-accumulate-grad hook fires as autograd propagates
+      the grad to a specific param, BEFORE the next param's
+      backward runs. The hook can issue the DMA and clear the
+      GPU grad immediately, so the peak GPU grad memory is
+      bounded to "at most one param's grad" (the one autograd is
+      currently propagating to) plus the cast-buffer transient.
+
+    The hook closes over the per-param ``_ParamState`` so it
+    can find the right CPU accumulator. Each hook returns
+    ``None`` (no replacement grad) and also explicitly sets
+    ``p.grad = None`` as a belt-and-suspenders — the engine's
+    "return None leaves .grad as-is" semantics mean our explicit
+    clear is the source of truth.
+
+    The cast target is ``s.accum.dtype`` (the
+    ``gradients`` precision in :class:`PrecisionConfig`). BF16 is
+    the default and matches the PCIe bandwidth: BF16 and FP16
+    are both 2 bytes/elt so the DMA size is the same, but the
+    BF16 accumulator matches the BF16 m/v storage in the
+    AdamW path so no further cast is needed at step() time.
+
+    Must be called AFTER ``build_param_groups`` (so the per-param
+    state exists) and BEFORE the first ``backward()``. Typically
+    called once per worker in :func:`_setup_worker`.
+    """
+    seen: set[int] = set()
+    for opt in optimizers:
+        for s in opt.state.values():
+            p = s.param
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            p.register_post_accumulate_grad_hook(_make_offload_hook(s))
+    # Defensive: clear any stale entries (e.g. from a previous
+    # run sharing the module-level queue).
+    _pending_grads.clear()
+
+
+def _make_offload_hook(s: _ParamState):
+    """Build the post-accumulate-grad hook for one param. Closes
+    over ``s`` so the hook can find the CPU accumulator and the
+    target dtype without a per-call dict lookup.
+    """
+    p = s.param
+    accum = s.accum
+    target_dtype = accum.dtype
+
+    def hook(g: torch.Tensor | None) -> None:
+        if g is None:
+            # The param had no grad this backward (e.g. it was
+            # in a no-grad branch). Nothing to offload.
+            return None
+        # Cast on the GPU (so the DMA carries the accum dtype,
+        # not the param's training dtype), flatten to match the
+        # 1-D ``accum`` shape, then issue the async D2H. The
+        # .detach() prevents the resulting CPU tensor from
+        # carrying autograd metadata (we never want to backprop
+        # through a grad-DMA).
+        src = (
+            g.detach()
+            .to(target_dtype)
+            .reshape(-1)
+            .to("cpu", non_blocking=True)
+        )
+        _pending_grads.append((accum, src))
+        # Free the GPU grad right now so the memory is available
+        # for the next param's backward. The hook return value
+        # replaces .grad per PyTorch's contract; returning None
+        # means "don't replace", so our explicit clear is what
+        # actually empties .grad.
+        p.grad = None
+        return None
+
+    return hook
+
+
+def flush_pending_grads(sync_device: int | None = None) -> None:
+    """Sync CUDA and apply the CPU-side adds for any D2H transfers
+    issued by the post-accumulate-grad hooks since the last flush.
+
+    The training loop calls this after each microbatch's
+    ``backward()`` and before the next forward pass. The
+    accumulate-on-CPU side is commutative and idempotent within
+    a single microbatch, so the order of pending entries does
+    not matter.
+
+    Idempotent and safe to call when no DMAs are pending (no
+    synchronize, no work). Safe to call multiple times per
+    microbatch, though the training loop calls it once.
+
+    For the manual path (no hooks installed — e.g. unit tests
+    that set ``.grad`` directly), use
+    :func:`accumulate_grads_to_cpu` instead.
+    """
+    if not _pending_grads:
+        return
+    if sync_device is not None:
+        torch.cuda.synchronize(sync_device)
+    else:
+        torch.cuda.synchronize()
+    # apply_ in place; order doesn't matter for the add.
+    for target, src in _pending_grads:
+        target.add_(src)
+    _pending_grads.clear()
 
 
 def zero_cpu_grad_accum(optimizers: List) -> None:
