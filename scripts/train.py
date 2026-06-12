@@ -910,15 +910,15 @@ def _compute_and_clip_grad_norm(
     optimizers: list,
     max_norm: float,
 ) -> float:
-    """Compute the TP-reduced L2 norm of the accumulated grads and
+    """Compute the TP-reduced L2 norm of the accumulated CPU grads and
     clip them in place if the norm exceeds ``max_norm``.
 
-    v0.0.2: the grads live on the GPU in FP32 (cast in
-    :func:`accumulate_grads_to_cpu`). The squared sum is computed
-    in FP32 on the GPU and all-reduced across the TP group, so a
-    parameter that is sharded across N ranks contributes ``1/N`` of
-    its squared L2 to each rank's local sum, and the reduction
-    makes the global norm exact.
+    The accumulated grads (``s.accum``) live on CPU in FP16 as 1-D
+    tensors; we promote to FP32 for the norm computation (FP16
+    overflows past ~65k). The squared sum is all-reduced across the
+    TP group, so a parameter that is sharded across N ranks
+    contributes ``1/N`` of its squared L2 to each rank's local sum,
+    and the reduction makes the global norm exact.
 
     Returns the **pre-clip** total norm. If ``max_norm <= 0`` the
     function is a no-op and returns 0.0 (caller can use this to
@@ -929,54 +929,55 @@ def _compute_and_clip_grad_norm(
     import torch.distributed as dist
     from src.models.tp_layers import get_tp_group, get_tp_world_size
 
+    sq_sum = torch.zeros(1, dtype=torch.float32, device="cpu")
+    n_tensors = 0
     # Grab the device from the first param we see. The optimizer
     # state is keyed on the param itself, and the param was created
     # on ``gpus[rank]`` during model construction, so its
     # ``.device`` is guaranteed to be the device the NCCL group is
     # bound to. We deliberately do NOT use ``torch.cuda.current_device()``
     # here: it's a per-thread default that can drift away from the
-    # NCCL backend's device constraint.
+    # NCCL backend's device constraint if anything else (TP setup,
+    # another module) called ``set_device`` in between. Reading
+    # ``.device`` off a real param is the only source of truth.
     reduce_device: Optional[torch.device] = None
-    n_tensors = 0
-    # Per-tensor squared sums on the GPU (FP32). We accumulate
-    # them in a Python list and reduce with one all-reduce of the
-    # total at the end.
-    gpu_sq_sums: list[torch.Tensor] = []
     for opt in optimizers:
         for s in opt.state.values():
-            g = s.param.grad
-            if g is None:
-                continue
             if reduce_device is None:
-                reduce_device = g.device
-            # g is FP32 (cast by accumulate_grads_to_cpu). pow(2)
-            # and sum stay on the GPU; the result is a 1-element
-            # tensor that we keep on the device for the all-reduce.
-            gpu_sq_sums.append(g.detach().float().pow(2).sum())
+                reduce_device = s.param.device
+            # ``accum`` is a CPU FP16 1-D buffer; promote to FP32
+            # before squaring so very large grads don't overflow.
+            sq_sum += s.accum.detach().float().pow(2).sum()
             n_tensors += 1
 
     if n_tensors == 0 or reduce_device is None:
         return 0.0
 
-    total_sq = torch.stack(gpu_sq_sums).sum()
-
-    # TP-reduce the squared norm. Each rank owns a disjoint shard
-    # of the sharded params, so the per-rank ``total_sq`` is
-    # ``1/world_size`` of the global squared norm; ``SUM`` recovers
+    # TP-reduce the squared norm. Each rank owns a disjoint shard of
+    # the sharded params, so the per-rank ``sq_sum`` is already
+    # ``(1/world_size)`` of the global squared norm; ``SUM`` recovers
     # the global value. When world_size == 1 the reduction is a
-    # no-op (we still call it through the default group, which is
-    # a no-op for world_size==1 because we wrap in an if).
+    # no-op and we skip it (and avoid touching the default process
+    # group, which may not be initialized).
+    #
+    # The TP group is NCCL-backed, so the all-reduce tensor must
+    # live on a CUDA device. We compute the per-rank sum on CPU
+    # (because the accumulated grads ``s.accum`` are CPU FP16
+    # buffers), then move a 1-element sum to the worker's
+    # NCCL-bound CUDA device for the collective, and move it back
+    # to CPU for the sqrt. The 1-element H2D/D2H copy is
+    # negligible compared to the reduction.
     if get_tp_world_size() > 1:
-        dist.all_reduce(total_sq, op=dist.ReduceOp.SUM, group=get_tp_group())
-    total_norm = total_sq.sqrt().item()
+        gpu_sq_sum = sq_sum.to(reduce_device, non_blocking=True)
+        dist.all_reduce(gpu_sq_sum, op=dist.ReduceOp.SUM, group=get_tp_group())
+        sq_sum = gpu_sq_sum.to("cpu", non_blocking=True)
+    total_norm = sq_sum.sqrt().item()
 
     if total_norm > max_norm:
         scale = max_norm / (total_norm + 1e-6)
         for opt in optimizers:
             for s in opt.state.values():
-                g = s.param.grad
-                if g is not None:
-                    g.mul_(scale)
+                s.accum.mul_(scale)
 
     return total_norm
 
@@ -1281,16 +1282,16 @@ def _train_worker(
                 microbatch_in_cycle += 1
 
                 if microbatch_in_cycle >= args.gradient_accumulation_steps:
-                    # Inf/nan check on the accumulated grads (now on
-                    # the GPU as FP32). If any param's grad is
-                    # non-finite we skip the optimizer step so the
-                    # state (BF16 m/v; int8 momentum) doesn't get
-                    # poisoned.
+                    # Inf/nan check on the accumulated CPU grads.
+                    # ``s.accum`` holds the post-clip grad in FP16
+                    # (FP16 can underflow to 0 for very small grads
+                    # — that's fine — but NaN/Inf must trigger a
+                    # skip). The check runs on the CPU pinned buffer
+                    # directly, so no extra H2D copy is needed.
                     found_inf = False
                     for opt in (muon_opt, adamw_opt):
                         for s in opt.state.values():
-                            g = s.param.grad
-                            if g is not None and not torch.isfinite(g).all():
+                            if not torch.isfinite(s.accum).all():
                                 found_inf = True
                                 break
                         if found_inf:
@@ -1317,50 +1318,42 @@ def _train_worker(
                         #   - per-optimizer non-finite counts after step
                         if global_step < _DIAG_STEPS and rank == 0:
                             import math as _math
-                            def _amax(t):
+                            def _amax_cpu(t):
                                 if t is None:
                                     return 0.0
                                 return t.detach().abs().max().item()
-                            # Muon: acc = max abs of param.grad (FP32 on GPU);
-                            #       mom = max abs of the dequantized momentum
-                            #       (int8_q * int8_scale, max per row).
+                            # CPU offload: grads are in ``s.accum``
+                            # (FP16 pinned); state (m for AdamW,
+                            # momentum for Muon) lives in
+                            # ``s.exp_avg_sq`` (FP16 pinned for Muon,
+                            # FP32 pinned for AdamW v). The param is
+                            # the only GPU tensor in the diagnostic.
                             muon_acc = max(
-                                (_amax(s.param.grad) for s in muon_opt.state.values()
-                                 if s.param.grad is not None),
+                                (_amax_cpu(s.accum) for s in muon_opt.state.values()),
                                 default=0.0,
                             )
-                            muon_mom_vals = []
-                            for s in muon_opt.state.values():
-                                if s.int8_q is None or s.int8_scale is None:
-                                    continue
-                                # Max per-row dequantized abs = int8_max * scale
-                                row_mom_max = (
-                                    s.int8_q.view(s.shape[0], s.shape[1])
-                                    .abs().amax(dim=1).float()
-                                    * s.int8_scale.float()
-                                )
-                                muon_mom_vals.append(row_mom_max.max().item())
-                            muon_mom = max(muon_mom_vals, default=0.0)
+                            muon_mom = max(
+                                (_amax_cpu(s.exp_avg_sq) for s in muon_opt.state.values()),
+                                default=0.0,
+                            )
                             muon_pmax = max(
-                                (_amax(s.param.data) for s in muon_opt.state.values()),
+                                (_amax_cpu(s.param.data) for s in muon_opt.state.values()),
                                 default=0.0,
                             )
-                            # AdamW: acc = max abs of param.grad; v = max abs of v (BF16).
                             adamw_acc = max(
-                                (_amax(s.param.grad) for s in adamw_opt.state.values()
-                                 if s.param.grad is not None),
+                                (_amax_cpu(s.accum) for s in adamw_opt.state.values()),
                                 default=0.0,
                             )
                             adamw_v = max(
-                                (_amax(s.exp_avg_sq) for s in adamw_opt.state.values()),
+                                (_amax_cpu(s.exp_avg_sq) for s in adamw_opt.state.values()),
                                 default=0.0,
                             )
                             adamw_m = max(
-                                (_amax(s.m) for s in adamw_opt.state.values()),
+                                (_amax_cpu(s.m) for s in adamw_opt.state.values()),
                                 default=0.0,
                             )
                             adamw_pmax = max(
-                                (_amax(s.param.data) for s in adamw_opt.state.values()),
+                                (_amax_cpu(s.param.data) for s in adamw_opt.state.values()),
                                 default=0.0,
                             )
                             logger.info(
@@ -1395,7 +1388,7 @@ def _train_worker(
                                 )
                             else:
                                 _pmax = max(
-                                    (_amax(s.param.data) for s in muon_opt.state.values()),
+                                    (_amax_cpu(s.param.data) for s in muon_opt.state.values()),
                                     default=0.0,
                                 )
                                 logger.info(
@@ -1423,7 +1416,7 @@ def _train_worker(
                                 )
                             else:
                                 _pmax = max(
-                                    (_amax(s.param.data) for s in adamw_opt.state.values()),
+                                    (_amax_cpu(s.param.data) for s in adamw_opt.state.values()),
                                     default=0.0,
                                 )
                                 logger.info(

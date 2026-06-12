@@ -1,25 +1,54 @@
-"""GPU-based optimizers for HippoLM v0.0.2.
+"""Per-parameter optimizers with CPU offload for HippoLM.
 
-Design (v0.0.2 spec):
-  - AdamW: BF16 m, v on the param's device (GPU). Grad input is
-    cast to FP32 inside step. Factor computed in FP32 and applied
-    via FP32 add followed by cast to the FP16 param (no FP16 factor
-    cast). V100 has no BF16 tensor cores; m and v are kept in BF16
-    for storage (8-bit exponent → no g*g underflow, 7-bit mantissa
-    is sufficient for the per-element EMA signal).
-  - Muon: int8-quantized momentum with FP16 per-row scale factors
-    (arXiv:2509.23106). Dequantize to FP32 for the SGD update and
-    Newton-Schulz orthogonalization; requantize after. NS runs in
-    FP16 (tensor cores). Apply via FP32 add + cast to FP16.
-  - All gradients are cast to FP32 in place on the GPU by
-    ``accumulate_grads_to_cpu`` (kept name; no PCIe transfer). The
-    optimizer state lives on the GPU and the step runs entirely
-    on-device. No PCIe bandwidth bottleneck.
+Implements two optimizer variants used together via param groups:
 
-No gradient is stored on the GPU between micro-batches in the
-"copy to CPU and sum there" sense; ``.grad`` accumulates naturally
-on the GPU across ``gradient_accumulation_steps`` micro-batches via
-PyTorch's autograd, then the optimizer step consumes the mean grad.
+  - :class:`CPUAdamW`     — AdamW with FP16 m and FP32 v state on
+    CPU pinned memory. The forward / backward happen on the GPU
+    in the param's training dtype (FP16 in this project). After
+    each micro-batch's backward, :func:`accumulate_grads_to_cpu`
+    copies the GPU ``.grad`` to a per-param CPU accumulator
+    (FP16, pinned) and frees the GPU copy. On ``step()`` the
+    accumulator is consumed: m, v are updated in place on the
+    CPU; the per-element update factor is computed in FP32 (to
+    avoid FP16 underflow on the divisor), then cast to FP16 and
+    streamed chunk-wise to the GPU param and applied in place.
+    This is the DeepSpeed ZeRO-Offload pattern with FP16 state.
+
+  - :class:`CPUMuon`      — Muon (Newton-Schulz orthogonalization
+    of the momentum matrix) with FP16 momentum on CPU pinned
+    memory. The NS iteration is a sequence of matrix multiplies,
+    which is *much* faster on the GPU than on the CPU, so each
+    step streams the chunked momentum to the GPU, runs 5 NS
+    iterations in FP16 (tensor cores), and applies the resulting
+    update to the GPU param directly. The CPU-side momentum
+    state is only updated by accumulating the grad, which is
+    cheap.
+
+Both optimizers follow the same API surface as ``torch.optim.Optimizer``
+minimally — ``step()`` consumes whatever gradients are present on
+the parameters and ``zero_grad()`` clears them.
+
+No gradient is stored on the GPU between steps. The training loop
+copies each micro-batch's ``.grad`` to CPU and adds it to the
+optimizer state's accumulator; only after ``gradient_accumulation_steps``
+micro-batches does ``step()`` actually run.
+
+Conventions
+-----------
+- Param ``.data`` lives on the GPU (FP16).
+- ``.grad`` is materialised on the GPU only during ``backward()``;
+  immediately after, the training loop calls
+  :func:`accumulate_grads_to_cpu` which copies ``.grad`` to the
+  per-param CPU accumulator and frees the GPU copy. So between
+  micro-batches the GPU holds zero gradient memory.
+- Optimizer state (m, v for AdamW; momentum for Muon) is FP16
+  (and FP32 v for AdamW) on CPU pinned memory. For ~624 M params
+  this is roughly 2 × 2 × 624 M bytes = 2.5 GB CPU RAM (AdamW)
+  or 1 × 2 × 624 M = 1.25 GB (Muon). The FP16 trade is a
+  deliberate design choice for CPU RAM and DMA bandwidth; the
+  FP32 divisor math in AdamW preserves precision where it matters
+  (preventing the FP16 v underflow that would otherwise blow up
+  the per-element factor).
 """
 from __future__ import annotations
 
@@ -31,69 +60,58 @@ import torch.nn as nn
 
 
 # --------------------------------------------------------------------------- #
-# Streaming chunk sizes for the v0.0.2 GPU optimizer step.                    #
-# --------------------------------------------------------------------------- #
-# The chunk size bounds the per-chunk peak VRAM of the FP32 temp tensors
-# the AdamW / Muon step creates from the FP16 / BF16 storage. At
-# ``_ADAMW_CHUNK = 1<<20`` elements per chunk:
-#   - AdamW peak per chunk: 4 × 1M × 4 B = 16 MB
-#     (g_c, m_c, v_c, p_c — PyTorch's caching allocator
-#     reuses one temp across the four .float() calls, so
-#     effective peak is closer to 12-16 MB depending on the
-#     allocator state).
-#   - Muon peak per chunk: similar (the SGD update is the
-#     streamed part; the dequantize/quantize and Newton-Schulz
-#     stay full-matrix but each is small: at most
-#     rows*cols*4 B ≈ 12 MB for the 3072×1024 FFN down_proj).
-#
-# 1 M elements / chunk is a good V100 trade-off: the kernel
-# work per chunk (≈1 ms of FMAs at 1 M elements) is large
-# relative to the launch overhead (≈40 µs), and the peak
-# temp is bounded regardless of ``numel``. For 254 M-param
-# params this is 254 chunks per step; for 1 M-param params
-# it is a single chunk (no overhead vs. un-chunked).
-_ADAMW_CHUNK = 1 << 20  # 1 M elements per chunk
-_MUON_CHUNK = 1 << 20   # 1 M elements per chunk
-
-
-# --------------------------------------------------------------------------- #
 # Per-param state descriptor.                                                 #
 # --------------------------------------------------------------------------- #
 @dataclass
 class _ParamState:
-    """Per-parameter GPU state for AdamW or Muon."""
+    """Per-parameter CPU-side state for either AdamW or Muon."""
 
     param: nn.Parameter
-    # AdamW state: BF16 m, v on the param's device.
+    # The CPU accumulator. For both AdamW and Muon this is the
+    # destination of :func:`accumulate_grads_to_cpu`: each
+    # micro-batch's ``.grad`` is added in here on the CPU, and
+    # the training loop's :func:`zero_cpu_grad_accum` zeros it
+    # out at the end of the accumulation cycle.
+    accum: torch.Tensor
+    # AdamW-specific state (set when ``kind == 'adamw'``).
+    # m is FP16 (magnitude stays bounded by the grad scale, and
+    # FP16 is sufficient for the per-element update).
+    # v is FP32 (an FP16 v underflows to 0 for typical grad
+    # magnitudes 1e-4 to 1e-3, which makes ``1/sqrt(v)`` blow
+    # up to ~1e9 * m and overflow the FP16 cast on the
+    # per-element factor). FP32 v has ~28 bits of dynamic range
+    # — way more than the ~12 bits of FP16.
     m: torch.Tensor | None = None
     exp_avg_sq: torch.Tensor | None = None
-    # Muon state: int8 quantized momentum + FP16 per-row scale.
-    int8_q: torch.Tensor | None = None
-    int8_scale: torch.Tensor | None = None
-    # Legacy v0.0.1 fields kept as None for API compat (no longer used).
-    accum: torch.Tensor | None = None
-    pinned_in: torch.Tensor | None = None
-    kind: str = "adamw"
+    # Cached for Muon: original param shape for reshape on GPU.
     shape: tuple = field(default_factory=tuple)
+    # Step counter (per param; cheap).
     step: int = 0
+    # "adamw" or "muon".
+    kind: str = "adamw"
 
 
 # --------------------------------------------------------------------------- #
-# GPU AdamW (BF16 state)                                                      #
+# CPU AdamW                                                                   #
 # --------------------------------------------------------------------------- #
-class GPUAdamW:
-    """AdamW with BF16 m, v on the param's device (GPU).
-
-    The ``.grad`` is whatever the model backward produced (FP16 in
-    v0.0.2). The step casts it to FP32 for the math, stores m and v
-    as BF16 (in-place cast), computes the factor in FP32, and
-    applies the update to the FP16 param via a temporary FP32 copy
-    (so the small update factor is not rounded to FP16 precision
-    before the add).
+class CPUAdamW:
+    """AdamW with CPU-side m, v state, GPU-side params.
 
     Memory layout per trainable param:
-        GPU (param.dtype=FP16): param, .grad (FP32 after the cast)
-        GPU (BF16): m, v (numel each)
+        CPU pinned: m (FP16, numel), v (FP32, numel), accum (FP16, numel)
+        GPU:         param (training dtype, e.g. FP16), .grad (transient)
+
+    On :meth:`step`:
+        1. Read the latest accumulated grad (CPU pinned, FP16).
+        2. Update m, v in place (FP16 / FP32 respectively).
+        3. Compute the update factor in FP32 then cast to FP16
+           (chunked, streamed to the GPU).
+        4. Apply ``p -= lr * factor`` in place on the GPU.
+
+    The training loop is expected to call
+    :func:`accumulate_grads_to_cpu` after each micro-batch's
+    backward() to copy ``.grad`` into ``accum`` and free the GPU
+    copy. :meth:`step` then sees the accumulated grad on CPU.
     """
 
     def __init__(
@@ -108,6 +126,7 @@ class GPUAdamW:
         self.beta1, self.beta2 = betas
         self.eps = eps
         self.weight_decay = weight_decay
+
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
         for p in params:
@@ -117,144 +136,113 @@ class GPUAdamW:
                 continue
             seen.add(id(p))
             n = p.numel()
-            device = p.device
             self.state[id(p)] = _ParamState(
                 param=p,
-                m=torch.zeros(n, dtype=torch.bfloat16, device=device),
-                exp_avg_sq=torch.zeros(n, dtype=torch.bfloat16, device=device),
+                accum=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
+                # v is FP32 to prevent underflow (see dataclass
+                # docstring above).
+                exp_avg_sq=torch.zeros(n, dtype=torch.float32, device="cpu").pin_memory(),
+                # m is FP16 (magnitude bounded; safe precision-wise).
+                m=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
                 kind="adamw",
                 shape=p.shape,
             )
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for s in self.state.values():
-            if set_to_none:
-                s.param.grad = None
-            elif s.param.grad is not None:
-                s.param.grad.detach_().zero_()
+            s.param.grad = None
+            # NOTE: do NOT zero accum here — that would discard
+            # the user's gradient accumulation across micro-batches.
+            # The training loop is responsible for resetting accum
+            # at the start of each accumulation cycle (via
+            # :func:`zero_cpu_grad_accum`).
+
+    # Per-chunk size for the streaming factor / update path.
+    # 4 M elements is the sweet spot on V100 PCIe: 8 MB FP16 per
+    # chunk keeps the GPU transient well under the 16 GB ceiling
+    # and overlaps the H2D copy with the next chunk's compute.
+    _STREAM_CHUNK_NUMEL = 4 * 1024 * 1024
 
     def step(self) -> None:
-        """Streamed AdamW step.
-
-        v0.0.1 path: cast the whole ``.grad`` / ``.m`` / ``.v`` /
-        ``.data`` to FP32 simultaneously → 4× numel bytes peak
-        temp per param (≈6 GB peak for the 254M-param embedding
-        alone).
-
-        This v0.0.2 path chunks the flat param into pieces of
-        ``_ADAMW_CHUNK`` elements (1 M by default ≈ 4 MB at
-        FP32) and runs the m / v / denom / factor / apply math
-        one chunk at a time, so the per-chunk peak is bounded to
-        5 × 4 MB ≈ 20 MB regardless of ``numel``.
-
-        Trade-off: a Python-level loop over chunks adds
-        launch-overhead (≈40 µs per chunk on V100), but the
-        kernel work per chunk is large enough to amortise it
-        (≈1 ms each), so end-to-end step time is unchanged in
-        practice.
-
-        Note: the writeback of m / v into the BF16 state
-        happens BEFORE the in-place ``m_c.div_(bc1).div_(denom)``
-        that turns m_c into the factor. The un-chunked v0.0.1
-        path did the writeback first too (``s.m.copy_(...)``
-        then ``factor = (m_fp32 / bc1) / denom``) for the same
-        reason — once the factor is computed in place, the
-        updated m is gone from m_c. Doing the writeback first
-        preserves the (FP32-rounded-to-BF16) updated m in
-        storage for the next step, then re-derives the factor
-        from the FP32 local m_c.
-        """
         beta1, beta2 = self.beta1, self.beta2
         lr = self.lr
         eps = self.eps
         wd = self.weight_decay
-        chunk_size = _ADAMW_CHUNK
+        CHUNK = self._STREAM_CHUNK_NUMEL
         for s in self.state.values():
-            p = s.param
-            g = p.grad
-            if g is None:
+            if s.accum.abs().sum().item() == 0:
+                # No accumulated grad (shouldn't happen if the
+                # training loop is correct, but guard against
+                # unnecessary work).
                 continue
             s.step += 1
             step = s.step
             bc1 = 1.0 - beta1 ** step
             bc2 = 1.0 - beta2 ** step
-
-            flat_p = p.data.view(-1)
-            flat_g = g.reshape(-1)
-            flat_m = s.m.view(-1)
-            flat_v = s.exp_avg_sq.view(-1)
-            n = flat_p.numel()
-
-            for start in range(0, n, chunk_size):
-                end = min(start + chunk_size, n)
-
-                # Load chunk-sized FP32 views; PyTorch's caching
-                # allocator reuses one temporary buffer across
-                # iterations, so the peak per chunk is
-                # 4 × chunk_size × 4 B ≈ 16 MB, not 5 × that.
-                g_c = flat_g[start:end].float()
-                m_c = flat_m[start:end].float()
-                v_c = flat_v[start:end].float()
-                p_c = flat_p[start:end].float()
-
-                # m, v updates in FP32. These are the same
-                # numerics as the un-chunked path, just on
-                # chunk-sized views.
-                m_c.mul_(beta1).add_(g_c, alpha=1.0 - beta1)
-                v_c.mul_(beta2).addcmul_(g_c, g_c, value=1.0 - beta2)
-
-                # Writeback m / v to BF16 storage BEFORE the
-                # in-place factor computation overwrites m_c.
-                # Matches the un-chunked path's order:
-                #   s.m.copy_(m_fp32.to(bf16))  ← here
-                #   factor = (m_fp32 / bc1) / denom  ← below
-                # Without this ordering, the next step's
-                # m_c = flat_m.float() would read the
-                # factor (sign(g)) rather than the EMA, and
-                # the optimizer would diverge.
-                flat_m[start:end].copy_(m_c.to(torch.bfloat16))
-                flat_v[start:end].copy_(v_c.to(torch.bfloat16))
-
-                # Factor in FP32 (in-place; m_c is destroyed).
-                denom = (v_c / bc2).sqrt_().add_(eps)
-                factor = m_c.div_(bc1).div_(denom)
-
-                # Apply to FP16 param via FP32 add. Decoupled
-                # weight decay folds into p_c before the factor
-                # add so the per-step math is identical to the
-                # un-chunked version.
-                if wd != 0.0:
-                    p_c.mul_(1.0 - lr * wd)
-                p_c.add_(factor, alpha=-lr)
-
-                # Writeback the updated p to FP16 storage.
-                flat_p[start:end].copy_(p_c.to(torch.float16))
+            g = s.accum
+            m = s.m
+            v = s.exp_avg_sq
+            # Update m (FP16, in place) and v (FP32, in place).
+            # The dedicated ``m`` buffer keeps ``m`` and ``g``
+            # (which is ``s.accum``) aliased-free: the chained
+            # ``m.mul_(beta1).add_(g, ...)`` would otherwise
+            # mutate ``g`` mid-chain and produce the wrong
+            # update on every step.
+            m.mul_(beta1).add_(g, alpha=1.0 - beta1)
+            v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+            # Decoupled weight decay: applied in place on the GPU
+            # once, before the streaming factor / apply loop.
+            # Folding it into the per-element factor would also
+            # work but would require an extra H2D per chunk.
+            if wd != 0.0:
+                s.param.data.mul_(1.0 - lr * wd)
+            # Streaming update: chunk the param so the peak GPU
+            # memory for the FP32 divisor / FP16 factor transfer
+            # is bounded to ``CHUNK`` elements regardless of
+            # ``numel``. The chunked path is bit-identical to
+            # the un-chunked path because the operations are
+            # element-wise.
+            #
+            # FP16 SAFETY: do the divisor math in FP32. Pure
+            # FP16 ``1/sqrt(v)`` would underflow when v ≈ 0
+            # (FP16 smallest normal is ~6e-8; reciprocals of
+            # small v round to 0). The up-cast is a ``numel``
+            # op — cheap relative to the GPU transfer.
+            p_flat = s.param.data.view(-1)
+            n = p_flat.numel()
+            for start in range(0, n, CHUNK):
+                end = min(start + CHUNK, n)
+                v_chunk = v[start:end]
+                denom = (v_chunk / bc2).sqrt_().add_(eps)    # FP32, chunk
+                factor = (m[start:end].float() / bc1) / denom  # FP32, chunk
+                # Stream the FP32 factor to the GPU as the param
+                # dtype (FP16) and apply in place.
+                p_flat[start:end].add_(
+                    factor.to(
+                        device=s.param.device, dtype=s.param.dtype,
+                        non_blocking=True,
+                    ),
+                    alpha=-lr,
+                )
+            # Reset accum to zero for the next accumulation cycle.
+            s.accum.zero_()
 
 
 # --------------------------------------------------------------------------- #
-# GPU Muon (int8 momentum, FP16 per-row scale)                               #
+# CPU Muon                                                                    #
 # --------------------------------------------------------------------------- #
-class GPUMuon:
-    """Muon with int8-quantized momentum + FP16 per-row scale.
+class CPUMuon:
+    """Muon with CPU momentum, GPU Newton-Schulz.
 
-    The 2-D momentum matrix m is stored as ``[rows, cols]`` reshaped
-    to a flat int8 buffer plus a per-row FP16 scale factor. The
-    per-row symmetric quantization is::
+    State per param:
+        CPU pinned: accum (FP16, numel), momentum (FP16, numel)
+        GPU:         param (FP16), .grad (transient)
 
-        scale[i] = max(|m[i, :]|) / 127
-        q[i, j] = round(m[i, j] / scale[i]).clip(-128, 127)
-
-    On each step:
-      1. Dequantize m to FP32.
-      2. SGD update in FP32: m = beta*m + (1-beta)*g.
-      3. Requantize to int8 for storage.
-      4. Newton-Schulz orthogonalize the dequantized m (cast to
-         FP16 for tensor cores) → orthogonalized update u.
-      5. Apply to FP16 param via FP32 add + cast to FP16.
-
-    The quantization noise (~0.4% of |m|) is well below the NS
-    update's magnitude, so the int8 storage does not noticeably
-    affect the learning trajectory. Reference: arXiv:2509.23106.
+    The training loop's :func:`accumulate_grads_to_cpu` adds the
+    GPU ``.grad`` to ``accum`` (CPU, FP16). On :meth:`step` we
+    update momentum on the CPU, then stream each chunk to the
+    GPU, run Newton-Schulz (FP16 tensor cores), and apply the
+    resulting update to the GPU param.
     """
 
     _NS_COEFFS = (3.4445, -4.7750, 2.0315)
@@ -273,6 +261,7 @@ class GPUMuon:
         self.nesterov = nesterov
         self.ns_steps = ns_steps
         self.weight_decay = weight_decay
+
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
         for p in params:
@@ -283,66 +272,36 @@ class GPUMuon:
             seen.add(id(p))
             if p.ndim < 2:
                 raise ValueError(
-                    f"GPUMuon got {p.ndim}D param of shape {tuple(p.shape)}; "
-                    f"use GPUAdamW for 1D params."
+                    f"CPUMuon got {p.ndim}D param of shape {tuple(p.shape)}; "
+                    f"use CPUAdamW for 1D params."
                 )
             n = p.numel()
-            device = p.device
-            shape = tuple(p.shape)
-            self.state[id(p)] = _ParamState(
+            st = _ParamState(
                 param=p,
-                int8_q=torch.zeros(n, dtype=torch.int8, device=device),
-                # one scale per row; for a 2-D [rows, cols] matrix
-                # this is the natural "outer axis" quantization
-                # granularity (matches the row-direction Newton-
-                # Schulz convention).
-                int8_scale=torch.zeros(shape[0], dtype=torch.float16, device=device),
+                accum=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
                 kind="muon",
-                shape=shape,
+                shape=p.shape,
             )
+            # Momentum buffer in FP16 (magnitude stays bounded by
+            # the grad scale; safe precision-wise).
+            st.exp_avg_sq = torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory()
+            self.state[id(p)] = st
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for s in self.state.values():
-            if set_to_none:
-                s.param.grad = None
-            elif s.param.grad is not None:
-                s.param.grad.detach_().zero_()
-
-    def _dequantize(self, s: _ParamState) -> torch.Tensor:
-        """Return dequantized FP32 momentum, shape s.shape."""
-        rows, cols = s.shape[0], s.shape[1]
-        q_2d = s.int8_q.view(rows, cols).float()
-        scale_2d = s.int8_scale.float().unsqueeze(1)  # [rows, 1]
-        return q_2d * scale_2d  # FP32, [rows, cols]
-
-    def _requantize(self, m_fp32: torch.Tensor, s: _ParamState) -> None:
-        """Per-row symmetric int8 quantize m_fp32 into s.int8_q / s.int8_scale.
-
-        ``m_fp32`` is the SGD-updated momentum in FP32, shape ``s.shape``.
-        """
-        rows, cols = s.shape[0], s.shape[1]
-        m_2d = m_fp32.view(rows, cols)
-        # Per-row max abs. Clamp to 1e-8 so the scale never collapses
-        # to 0 (a row of exact zeros would otherwise divide-by-zero
-        # in the quantize step; the int8 buffer would also be filled
-        # with 0 which is fine, but the scale = 0 would be ambiguous
-        # in the next dequantize).
-        row_max = m_2d.abs().amax(dim=1).clamp(min=1e-8)
-        new_scale = (row_max / 127.0).to(torch.float16)
-        scale_2d = new_scale.float().unsqueeze(1)  # [rows, 1]
-        q_int8 = (m_2d / scale_2d).round().clamp(-128, 127).to(torch.int8)
-        s.int8_q.copy_(q_int8.view(-1))
-        s.int8_scale.copy_(new_scale)
+            s.param.grad = None
 
     def _newton_schulz(self, x: torch.Tensor) -> torch.Tensor:
-        """Newton-Schulz orthogonalization in FP16 (tensor-core path)."""
         a, b, c = self._NS_COEFFS
+        # Cast to FP16 for tensor-core matmul speed. The
+        # orthogonalization is robust to FP16 noise for typical
+        # gradient magnitudes.
         x = x.to(torch.float16)
         if x.size(0) > x.size(1):
             g = x
             for _ in range(self.ns_steps):
                 gt = g.t()
-                xtx = gt @ g  # [in, in], FP16
+                xtx = gt @ g                                  # [in, in]
                 inner = (
                     a * torch.eye(xtx.size(0), device=g.device, dtype=g.dtype)
                     + b * xtx
@@ -353,7 +312,7 @@ class GPUMuon:
         else:
             g = x
             for _ in range(self.ns_steps):
-                ggt = g @ g.t()  # [out, out], FP16
+                ggt = g @ g.t()                               # [out, out]
                 inner = (
                     a * torch.eye(ggt.size(0), device=g.device, dtype=g.dtype)
                     + b * ggt
@@ -362,139 +321,122 @@ class GPUMuon:
                 g = inner @ g
             return g
 
+    # Per-chunk row count for the streaming NS path. Each chunk
+    # is a 2-D ``[CHUNK_ROWS, cols]`` matrix; for embed
+    # (cols=1024) the chunk is ``[4096, 1024]`` = 8 MB FP16.
+    _STREAM_CHUNK_ROWS = 4096
+
     def step(self) -> None:
-        """Streamed Muon step.
-
-        The SGD-style update (dequantize → m = β·m + g →
-        requantize) and the final param update
-        (p -= lr · update) are streamed over the flat
-        ``numel`` dim in chunks of ``_MUON_CHUNK`` elements.
-        The dequantize/requantize/Newton-Schulz stay
-        full-matrix because:
-
-          - ``_dequantize`` returns a [rows, cols] FP32 tensor
-            (the dequantize itself is element-wise, but the
-            output is a dense FP32 matrix, and reshaping back
-            into a [rows, cols] view is what the NS kernel
-            expects).
-          - ``_requantize`` needs per-row max-abs, which is
-            naturally a [rows, cols] → [rows] reduction;
-            streaming it would require a running-max per row
-            across chunks, complicating the kernel for no
-            meaningful memory win (the dequantized tensor is
-            at most ~12 MB for the 3072×1024 FFN down_proj).
-          - ``_newton_schulz`` operates on the full matrix
-            because the polynomial evaluation reads/writes
-            ``g @ g.T`` (or the transposed variant), which
-            needs the whole matrix at once.
-
-        The chunks that DO get streamed are: the
-        ``m_fp32.mul_(mom).add_(g_fp32, alpha=1.0 - mom)`` line
-        and the ``p_data_fp32.add_(update, alpha=-lr)`` line.
-        Both previously allocated a [numel] FP32 copy of the
-        param / momentum that was the bulk of the per-step
-        peak (4 × numel bytes for the FFN down_proj's
-        3 M elements = 12 MB each; for the KDA's 1 M-element
-        matrices that's 4 MB; for everything else the peak
-        is the int8 momentum scale tensor). Streaming caps
-        each at chunk_size × 4 B ≈ 4 MB.
-        """
         mom = self.momentum
         lr = self.lr
         wd = self.weight_decay
         nesterov = self.nesterov
-        chunk_size = _MUON_CHUNK
+        CHUNK_ROWS = self._STREAM_CHUNK_ROWS
         for s in self.state.values():
-            p = s.param
-            g = p.grad
-            if g is None:
+            if s.accum.abs().sum().item() == 0:
                 continue
-            g_fp32 = g.float() if g.dtype != torch.float32 else g
+            # Update momentum on the CPU: m = beta*m + grad.
+            m = s.exp_avg_sq
+            m.mul_(mom).add_(s.accum, alpha=1.0 - mom)
             shape = s.shape
             rows, cols = shape[0], shape[1]
-
-            # 1) Dequantize momentum to FP32 (full matrix, but
-            # small: at most 12 MB for the 3072×1024 FFN
-            # down_proj, 4 MB for the 1024×1024 KDA matrices).
-            m_fp32 = self._dequantize(s)
-
-            # 2) SGD update in FP32, streamed over the flat
-            # tensor. ``m_fp32`` and ``g_fp32`` are both [rows,
-            # cols]; the streaming loop views them as 1-D for
-            # the in-place arithmetic and the kernel sees the
-            # same memory layout (the views are contiguous).
-            m_flat = m_fp32.view(-1)
-            g_flat = g_fp32.view(-1)
-            n = m_flat.numel()
-            for start in range(0, n, chunk_size):
-                end = min(start + chunk_size, n)
-                m_c = m_flat[start:end]
-                g_c = g_flat[start:end]
-                m_c.mul_(mom).add_(g_c, alpha=1.0 - mom)
-
-            # 3) Requantize to int8 for storage
-            self._requantize(m_fp32, s)
-
-            # 4) Decoupled weight decay
+            # Decoupled weight decay (applied once to the full param
+            # rather than per-chunk to keep semantics identical to
+            # the non-streaming path).
             if wd != 0.0:
-                p.data.mul_(1.0 - lr * wd)
-
-            # 5) NS on the dequantized FP32 momentum (cast to
-            #    FP16 for tensor-core speed).
-            update = self._newton_schulz(m_fp32)
-            update = update.to(torch.float16)
-
-            # 6) Apply to FP16 param via FP32 add, streamed
-            # over the flat tensor. Previously this allocated
-            # a [numel] FP32 copy of ``p.data`` (4 × numel
-            # bytes) plus a [numel] FP32 copy of ``update``;
-            # both are now chunked.
-            p_flat = p.data.view(-1)
-            u_flat = update.view(-1)
-            n = p_flat.numel()
-            for start in range(0, n, chunk_size):
-                end = min(start + chunk_size, n)
-                p_c = p_flat[start:end].float()
-                u_c = u_flat[start:end].float()
-                p_c.add_(u_c, alpha=-lr)
-                p_flat[start:end].copy_(p_c.to(torch.float16))
+                s.param.data.mul_(1.0 - lr * wd)
+            if rows * cols <= CHUNK_ROWS * cols:
+                # Small param: single chunk.
+                g = m.view(shape).to(s.param.device, non_blocking=True)
+                update = self._newton_schulz(g)
+                update = update.to(s.param.dtype)
+                s.param.data.add_(update, alpha=-lr)
+            else:
+                # Streaming path: chunk along the row dim so each
+                # NS iteration is on a 2-D slice well under the
+                # V100's 16 GB ceiling. The flat momentum
+                # ``m`` (1-D, ``numel``) is sliced in strides of
+                # ``CHUNK_ROWS * cols`` and reshaped per chunk.
+                for r_start in range(0, rows, CHUNK_ROWS):
+                    r_end = min(r_start + CHUNK_ROWS, rows)
+                    flat_start = r_start * cols
+                    flat_end = r_end * cols
+                    m_chunk_flat = m[flat_start:flat_end]
+                    g = m_chunk_flat.view(r_end - r_start, cols).to(
+                        s.param.device, non_blocking=True,
+                    )
+                    update = self._newton_schulz(g)
+                    update = update.to(s.param.dtype)
+                    s.param.data[r_start:r_end].add_(update, alpha=-lr)
+            # Reset grad accumulator for next accumulation cycle.
+            s.accum.zero_()
 
 
 # --------------------------------------------------------------------------- #
-# Public API                                                                  #
+# Public API: stream grads to CPU and reset                                   #
 # --------------------------------------------------------------------------- #
 def accumulate_grads_to_cpu(
     optimizers: List,
     sync_device: int | None = None,
 ) -> None:
-    """No-op in the v0.0.2 GPU-optimizer path.
+    """Copy each trainable param's ``.grad`` to its optimizer state's
+    CPU accumulator and free the GPU copy.
 
-    In v0.0.1 this function copied each param's ``.grad`` (FP16) to a
-    CPU FP16 pinned buffer and added it to the per-param CPU
-    accumulator. The CPU accumulator was consumed by the optimizer
-    step on the CPU.
+    Safe to call on either AdamW or Muon states: the state object
+    has the same ``accum`` slot in both.
 
-    In v0.0.2 the optimizer state and step live entirely on the
-    GPU. The ``.grad`` stays on the GPU in FP16 (the param dtype);
-    the optimizer step casts it to FP32 locally for the math. There
-    is no CPU transfer and no CPU accumulator, so this function
-    has nothing to do.
+    The async ``.to("cpu")`` is issued first (with a flattened
+    view of the grad, so the resulting ``src_cpu`` matches the
+    1-D ``accum`` tensor), then we sync the current CUDA device
+    (or ``sync_device`` if given) before performing the in-place
+    CPU add. This avoids the race where ``s.accum.add_(src)`` runs
+    on the CPU before the DMA copy populates ``src``.
 
-    The original signature is preserved so the training loop call
-    site does not need to change. The ``sync_device`` argument is
-    accepted but unused.
+    The cast to FP16 happens BEFORE the DMA so the transfer
+    itself is FP16 → halves the PCIe bandwidth vs FP32 and
+    matches the destination buffer dtype. The src grad is the
+    training dtype (FP16 in v0.0.2), so the cast is a no-op
+    when it is already FP16 and a down-cast when AMP promoted
+    it to FP32.
     """
-    return None
+    pending: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for opt in optimizers:
+        for s in opt.state.values():
+            g = s.param.grad
+            if g is None:
+                continue
+            # Issue the async copy; flatten so the destination
+            # ``accum`` (1-D, ``numel``, FP16) and the source have
+            # the same shape. Cast to FP16 BEFORE the DMA so the
+            # transfer itself is FP16 → halves the PCIe bandwidth
+            # vs FP32 and matches the destination buffer dtype.
+            src_cpu = (
+                g.detach()
+                .reshape(-1)
+                .to("cpu", non_blocking=True)
+                .to(torch.float16)
+            )
+            pending.append((s.accum, src_cpu))
+            # Free GPU grad immediately so the GPU memory is
+            # available for the next micro-batch's forward.
+            s.param.grad = None
+
+    if sync_device is not None:
+        torch.cuda.synchronize(sync_device)
+    else:
+        torch.cuda.synchronize()
+
+    for target, src in pending:
+        target.add_(src)
 
 
 def zero_cpu_grad_accum(optimizers: List) -> None:
-    """Reset param grads after the optimizer step (start the next
-    accumulation cycle). The function name is preserved for v0.0.1
-    call-site compatibility; the implementation just calls each
-    optimizer's ``zero_grad``.
+    """Reset CPU accumulators (call this AFTER step() to start the
+    next accumulation cycle).
     """
     for opt in optimizers:
-        opt.zero_grad(set_to_none=True)
+        for s in opt.state.values():
+            s.accum.zero_()
 
 
 def build_param_groups(
@@ -511,7 +453,7 @@ def build_param_groups(
     Standard Muon routing:
         - 1D params (RMSNorm.weight, BlockAttnRes.query,
           KDA A_log/dt_bias with ``_no_weight_decay``): AdamW
-        - 2D Linear weights: Muon (int8 momentum, GPU)
+        - 2D Linear weights: Muon
         - Embedding + lm_head: AdamW (per user spec)
     """
     muon_params: list[nn.Parameter] = []
@@ -521,18 +463,30 @@ def build_param_groups(
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
+        # Per user spec: lm_head and embed_tokens -> AdamW.
+        # The AttnRes pseudo-query lives under
+        # ``replicated.{device}.attn_res.query`` so it is also
+        # caught by the ``replicated.`` prefix here.
         if name.startswith("lm_head.") or name.startswith("replicated."):
             adamw_params.append(p)
+        # KDA short-conv weights are 3D (nn.Conv1d: [D, 1, W]).
+        # CPUMuon._newton_schulz does ``g.t()`` which only works on
+        # 2-D matrices, so we must route them to AdamW. These params
+        # are tiny (393K total) so the precision/regularization
+        # difference vs Muon is negligible. Match by name suffix
+        # (``...q_conv1d.weight``) for explicitness; the 3D guard
+        # is a backstop in case fla adds more depthwise convs.
         elif (p.ndim == 3 or any(
                 name.endswith(suffix) for suffix in
                 (".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight"))):
             adamw_params.append(p)
         elif p.ndim < 2:
+            # 1D: norms, A_log, dt_bias, o_norm.weight, lm_head.bias.
             adamw_params.append(p)
         else:
             muon_params.append(p)
 
-    muon_opt = GPUMuon(
+    muon_opt = CPUMuon(
         muon_params,
         lr=lr_muon,
         momentum=muon_momentum,
@@ -540,7 +494,7 @@ def build_param_groups(
         ns_steps=5,
         weight_decay=0.0,   # decoupled wd applied elsewhere if needed
     )
-    adamw_opt = GPUAdamW(
+    adamw_opt = CPUAdamW(
         adamw_params,
         lr=lr_adamw,
         betas=(0.9, 0.95),

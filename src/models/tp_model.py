@@ -1187,18 +1187,26 @@ class TPHippoModel(nn.Module):
                 use_reentrant=False, preserve_rng_state=False,
             )
             blocks.append(x)
-        # Last block: per-layer checkpointing (preserves the
-        # per-layer activations for the residual that feeds the
-        # final norm).
+        # Last block: NO checkpointing wrapper. KDA's autograd
+        # graph is the only one in the model that benefits from
+        # not being wrapped in ``torch.utils.checkpoint`` —
+        # because the KDA Triton kernels compute their
+        # intermediates in the forward pass and want to reuse
+        # them in backward (their backward is more expensive
+        # than re-doing the chunked forward would be, due to
+        # the extra ``g_cumsum``/``Aqk``/``Akk``/``w``/``u``
+        # tensors they cache). The other blocks' forward is
+        # cheap enough that the per-block checkpoint + recompute
+        # strategy above is a net win, but the last block would
+        # suffer the worst of both worlds (cache per-layer
+        # activations, but recompute them anyway for backward)
+        # if we kept the wrapper here.
         last_block = num_blocks - 1
         if last_block > 0:
             x = attn_res(blocks)
         last_start = last_block * block_size
         for layer in layers[last_start:]:
-            x = torch.utils.checkpoint.checkpoint(
-                layer, x,
-                use_reentrant=False, preserve_rng_state=False,
-            )
+            x = layer(x)
 
         hidden_states = self.replicated_per_device[device]["norm"](x)
         out: dict[str, torch.Tensor] = {}
