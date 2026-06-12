@@ -4,16 +4,20 @@ TP design (assumes a single process spanning N GPUs):
 
   Replicated on every rank
   ------------------------
-  - embed_tokens (full vocab x hidden; lm_head shares this storage
-    via a narrow view along the vocab dim — see :class:`TPLmHead`).
+  - embed_tokens (full vocab x hidden; the fused lm_head+CE
+    shares this storage via a narrow view along the vocab dim —
+    see :class:`TPFusedLceLoss`).
   - RMSNorm (full hidden)
   - BlockAttnRes (full hidden pseudo-query and norm)
 
   Column-parallel (output sharded, no all-reduce)
   -----------------------------------------------
   - SwiGLU gate_proj, up_proj (output = intermediate, sharded)
-  - lm_head (output = vocab, sharded; tied to a narrow view of
-    embed_tokens, so the matmul output is ``[B, T, vocab // world]``)
+  - Fused lm_head: matmul ``hidden @ embed.T`` is done inside the
+    fused linear+CE kernel along the sequence dim, so the full
+    ``[B, T, vocab // world]`` sharded logits tensor is never
+    materialised (replaces the old TPLmHead path which did the
+    matmul and then ``.contiguous()``'d a copy for the CE kernel).
   - KDA q/k/v projections (output = key_dim / value_dim, sharded
     along the head dim)
 
@@ -25,15 +29,19 @@ TP design (assumes a single process spanning N GPUs):
 
 The forward pass is: embed (replicated) -> 32 layers (attn_norm
 -> KDA -> mlp_norm -> SwiGLU -> all-reduce inside down_proj and
-inside o_proj) -> final norm -> lm_head (sharded, tied to embed)
--> fused loss (FusedCrossEntropyLoss with TP-aware all-reduce).
+inside o_proj) -> final norm -> fused lm_head+CE (sharded matmul
++ online chunked softmax) -> scalar loss.
 
 All-reduce happens once per layer (inside the FFN's down_proj,
-once inside KDA's o_proj) and once at the lm_head -> loss boundary
-(inside FusedCrossEntropyLoss, which all-reduces LSE across TP
-ranks). No communication is needed for the AttnRes path because
-its output is gathered back to full hidden before being consumed
-by KDA / FFN.
+once inside KDA's o_proj). No communication is needed at the
+lm_head -> loss boundary because each TP rank consumes its own
+vocab shard; the FusedLinearCE kernel accumulates the LSE locally
+and the loss is reduced inside the module wrapper.
+
+For tied embeddings, the FusedLinearCE's ``weight`` arg is a
+narrow view of the embed, and the resulting ``dw`` gradient is
+a fresh tensor that we add back to ``embed_tokens.weight.grad``
+in our custom autograd :class:`_TiedFusedLCEFunction`.
 """
 from __future__ import annotations
 
@@ -51,6 +59,10 @@ from .tp_layers import (
     get_tp_world_size,
 )
 from src.models.ops._vendored.fla.modules.fused_cross_entropy import FusedCrossEntropyLoss
+from src.models.ops._vendored.fla.modules.fused_linear_cross_entropy import (
+    fused_linear_cross_entropy_forward,
+    fused_linear_cross_entropy_backward,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -89,33 +101,165 @@ class TPSwiGLU(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# TP lm_head (column-parallel on vocab dim, tied to embed_tokens)              #
+# TP fused linear + cross-entropy (replaces TPLmHead + FusedCrossEntropyLoss)  #
 # --------------------------------------------------------------------------- #
-class TPLmHead(nn.Module):
-    """Column-parallel LM head whose weight is a narrow view of an
-    embedding matrix.
+class _TiedFusedLCEFunction(torch.autograd.Function):
+    """Custom autograd that wraps fla's FusedLinearCrossEntropy for
+    tied-embedding setups.
 
-    The head owns **no weight parameter of its own**: it holds a
-    reference to a parent :class:`nn.Embedding` (the model's
-    ``embed_tokens``) and slices its ``weight`` along the vocab
-    dimension in ``forward()``. The optimizer therefore sees only
-    the embedding's weight (deduplicated across the model and the
-    head), and the gradient that flows back through the narrow
-    view accumulates into the parent embedding's ``.grad`` via
-    PyTorch's standard view-graph — exactly the standard
-    ``tie_word_embeddings=True`` semantics, but sharded across
-    the TP group.
+    The fla FusedLinearCE is designed to take a weight tensor and
+    compute both the linear matmul ``hidden @ weight.T`` and the
+    cross-entropy loss, returning ``(loss, dx, dw, db)``. The
+    ``dw`` it returns is a **fresh** tensor (not a view of
+    ``weight``), so for tied embeddings we cannot rely on
+    PyTorch's autograd to scatter it back to
+    ``embed_tokens.weight.grad``.
 
-    The output is ``[B, T, vocab // world]`` (sharded vocab). The
-    full vocab logit is only ever constructed implicitly inside
-    :class:`FusedCrossEntropyLoss`, which all-reduces the LSE
-    across the TP group so the loss is exact without ever
-    materialising a per-rank ``[B, T, V]`` tensor.
+    This wrapper:
+      - forward: calls the raw ``fused_linear_cross_entropy_forward``
+        with the narrow view of the embed as the weight; saves
+        ``(dx, dw, embed_weight, start, vp)`` for backward.
+      - backward: scales ``dx`` and ``dw`` by ``do`` via the fla
+        backward kernel, then ``add_``'s ``dw`` into
+        ``embed_weight.grad[start:start+vp]`` and returns ``dx``
+        as the gradient w.r.t. the hidden state.
 
-    Storage: the head contributes zero weight bytes; the parent
-    embedding's ``[vocab, hidden]`` weight lives on each device
-    (replicated). Bias, if any, is sharded column-parallel as
-    ``[vocab // world]``.
+    The full ``[B, T, V // world]`` sharded logits tensor is
+    never materialised, and the per-chunk logits are written
+    in-place by the fla kernel (the dlogits overwrite the logits
+    buffer), so the per-chunk peak is just ``[C, V // world]``
+    where ``C`` is the chunk size (small, set by ``num_chunks``).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden: torch.Tensor,           # [..., H]
+        target: torch.Tensor,           # [...]
+        local_w: torch.Tensor,          # [V/world, H], view of embed
+        embed_weight: torch.Tensor,     # [V, H], parent embedding weight
+        start: int,                     # vocab slice start for this rank
+        vp: int,                        # vocab_per_partition = V / world
+        ignore_index: int,
+        num_chunks: int,
+    ) -> torch.Tensor:
+        # Flatten to [N, H] / [N] for the fla kernel.
+        N = hidden.shape[:-1].numel()
+        H = hidden.shape[-1]
+        flat_hidden = hidden.reshape(N, H)
+        flat_target = target.reshape(N)
+
+        loss, dx, dw, _ = fused_linear_cross_entropy_forward(
+            flat_hidden, flat_target, local_w, None,
+            ignore_index=ignore_index, num_chunks=num_chunks,
+            reduction="mean",
+        )
+
+        # ``dw`` comes out as FP32 from the kernel (accumulated in
+        # FP32 inside the chunked loop for precision); cast to the
+        # embed weight's dtype (FP16 in our setup) so the add into
+        # ``embed_weight.grad`` doesn't need a type-promoted copy.
+        if dw is not None and dw.dtype != embed_weight.dtype:
+            dw = dw.to(embed_weight.dtype)
+
+        # ``dx`` and ``dw`` stay 2D ``[N, H]`` / ``[V/world, H]``
+        # in the saved tensors because the fla
+        # ``fused_linear_cross_entropy_backward`` kernel does
+        # ``N, H = dx.shape`` and ``V, H = dw.shape`` — passing a
+        # 3D dx (e.g. ``[B, T, H]``) blows up with "too many
+        # values to unpack (expected 2)". We reshape dx back to
+        # ``hidden``'s original shape in :meth:`backward` after
+        # the do-scaling kernel is done with it.
+        ctx.save_for_backward(dx, dw, embed_weight)
+        ctx.start = start
+        ctx.vp = vp
+        ctx.hidden_shape = hidden.shape
+        return loss
+
+    @staticmethod
+    def backward(ctx, do):
+        dx, dw, embed_weight = ctx.saved_tensors
+
+        # Scale dx and dw by do via the fla backward kernel. Both
+        # must be 2D here (see comment in forward). The kernel
+        # skips the multiplication if do is exactly 1.0 (the
+        # common case for a scalar loss seed).
+        dx, dw, _ = fused_linear_cross_entropy_backward(do, dx, dw, None)
+
+        # Reshape dx back to ``hidden``'s original shape so the
+        # caller (autograd) sees the right gradient for the
+        # hidden state.
+        dx = dx.view(ctx.hidden_shape)
+
+        # Scatter the (now do-scaled) dw back into the parent
+        # embedding's gradient. ``embed_weight.grad`` may not
+        # exist yet (PyTorch lazily allocates it on first .grad
+        # access); standard pattern is to alloc and assign.
+        if dw is not None:
+            if embed_weight.grad is None:
+                embed_weight.grad = torch.zeros_like(embed_weight)
+            embed_weight.grad[ctx.start:ctx.start + ctx.vp].add_(dw)
+
+        return dx, None, None, None, None, None, None, None
+
+
+class TPFusedLceLoss(nn.Module):
+    """Fused lm_head + cross-entropy with TP sharding and online
+    chunked softmax.
+
+    Replaces the v0.0.0 ``TPLmHead`` + ``FusedCrossEntropyLoss`` pair.
+
+    Memory characteristics vs. the old path
+    ----------------------------------------
+
+    Old path peak (per rank, B=4, T=1024, V=248320, TP=1):
+
+      * ``sharded_logits`` = [B, T, V] FP16 = 1.99 GB
+      * ``shift_logits = sharded_logits[..., :-1, :].contiguous()``
+        = [B, T-1, V] FP16 = 1.94 GB (the .contiguous() is a fresh
+        copy because the time-slice is non-contiguous)
+      * lse / losses / z_losses intermediates of FusedCrossEntropyLoss
+        = [n_splits, N] FP32 ≈ 64 KB (small)
+
+    New path peak (per rank, same config, ``num_chunks=64``):
+
+      * Per-chunk ``[C, V // world]`` logits in registers inside
+        the fla kernel, where C = next_pow2(ceil(N / NC)) ≈ 64 →
+        chunk peak ≈ 32 MB. The dlogits overwrite the logits
+        buffer in-place inside the kernel, so backward does not
+        require the full logits to be saved.
+      * The full [B, T, V // world] tensor is never materialised.
+      * A small ``[N]`` lse buffer and a ``[N, H]`` dx accumulator
+        (= 8 MB at B=4, T=1024, H=1024).
+      * A ``[V // world, H]`` dw accumulator in the kernel
+        (FP32, cast to FP16 at the end), scattered into
+        ``embed_weight.grad[start:start+vp]`` in backward.
+
+    Net savings at TP=1: ~3.9 GB (the two sharded_logits
+    tensors disappear, replaced by ~40 MB of chunked workspace
+    + the dw scatter).
+
+    Online softmax
+    --------------
+
+    The fla FusedLinearCE does a 2-pass online softmax over the
+    vocab dim of each chunk: pass 1 (``logsumexp_fwd_kernel``)
+    computes a per-row ``(max, sum_exp)`` in one streaming
+    pass, pass 2 (``cross_entropy_kernel``) uses the precomputed
+    lse to compute the loss + dx in a second streaming pass.
+    No ``[n_splits, n_rows]`` intermediate lse / losses tensor
+    is ever allocated — the running stats are kept in registers
+    per thread block.
+
+    Configuration
+    -------------
+
+    ``num_chunks``: how many pieces to split the N (sequence)
+    dim into. The fla kernel chooses ``C = next_pow2(ceil(N/NC))``
+    tokens per chunk, so the per-chunk peak logits are
+    ``[C, V // world]``. The default is 8 (matches fla's
+    default), but we override to 64 to bound per-chunk peak to
+    ~32 MB at our config (vs. ~254 MB at the default).
     """
 
     def __init__(
@@ -124,6 +268,8 @@ class TPLmHead(nn.Module):
         hidden_size: int,
         vocab_size: int,
         bias: bool = False,
+        ignore_index: int = -100,
+        num_chunks: int = 8,
         device=None,
         dtype=None,
     ) -> None:
@@ -140,6 +286,79 @@ class TPLmHead(nn.Module):
         # Precompute the narrow slice indices so ``forward`` is a
         # single ``.narrow()`` call with no Python-side indexing.
         self._start = self.rank * self.vocab_per_partition
+        self.ignore_index = ignore_index
+        self.num_chunks = num_chunks
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(self.vocab_per_partition, device=device, dtype=dtype)
+            )
+            nn.init.zeros_(self.bias)
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, hidden: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Narrow view of the embed for this rank's vocab shard.
+        # The slice is a view, but FusedLinearCE doesn't write
+        # back into the weight (it allocates its own dw), so the
+        # view only serves as a read-only matmul operand.
+        local_w = self.embed_tokens.weight.narrow(0, self._start, self.vocab_per_partition)
+        return _TiedFusedLCEFunction.apply(
+            hidden, target, local_w, self.embed_tokens.weight,
+            self._start, self.vocab_per_partition,
+            self.ignore_index, self.num_chunks,
+        )
+
+    # Kept for backward-compat with any caller that introspects
+    # the module name. The old ``TPLmHead`` was registered under
+    # ``lm_head_per_device``; the new module plays the same role.
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.embed_tokens.weight
+
+    def extra_repr(self) -> str:
+        return (
+            f"hidden_size={self.hidden_size}, vocab_size={self.vocab_size}, "
+            f"vocab_per_partition={self.vocab_per_partition}, "
+            f"tp_world={self.world}, bias={self.bias is not None}, "
+            f"tied_to=embed_tokens, num_chunks={self.num_chunks}"
+        )
+
+
+# Backward-compat alias. The old ``TPLmHead`` is still referenced
+# by inference paths (e.g. model.generate); we keep a thin shim
+# that returns the sharded logits without going through CE.
+class TPLmHead(nn.Module):
+    """Thin shim kept for inference / generation paths that need
+    the full sharded logits tensor (e.g. ``model.generate``).
+
+    The training path uses :class:`TPFusedLceLoss` instead, which
+    fuses the matmul with the cross-entropy and never
+    materialises the sharded logits.
+
+    This shim is a no-op for parameter allocation: it holds no
+    parameters of its own and just exposes the same narrow-view
+    matmul the old TPLmHead did.
+    """
+
+    def __init__(
+        self,
+        embed_tokens: nn.Embedding,
+        hidden_size: int,
+        vocab_size: int,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        self.world = get_tp_world_size()
+        assert vocab_size % self.world == 0
+        self.vocab_per_partition = vocab_size // self.world
+        self.rank = get_tp_rank()
+        self._start = self.rank * self.vocab_per_partition
 
         if bias:
             self.bias = nn.Parameter(
@@ -150,11 +369,6 @@ class TPLmHead(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Slice the parent embedding's weight along the vocab dim
-        # for this rank. The slice is a view, so backward
-        # gradients accumulate into ``embed_tokens.weight.grad``
-        # on the corresponding slice — same memory as the
-        # embedding, same gradient destination.
         local_w = self.embed_tokens.weight.narrow(0, self._start, self.vocab_per_partition)
         return F.linear(x, local_w, self.bias)
 
@@ -163,7 +377,7 @@ class TPLmHead(nn.Module):
             f"hidden_size={self.hidden_size}, vocab_size={self.vocab_size}, "
             f"vocab_per_partition={self.vocab_per_partition}, "
             f"tp_world={self.world}, bias={self.bias is not None}, "
-            f"tied_to=embed_tokens"
+            f"tied_to=embed_tokens (inference-only shim)"
         )
 
 
@@ -525,6 +739,14 @@ class TPHippoModel(nn.Module):
         # is summed into ``embed_tokens.weight.grad`` via PyTorch's
         # standard view graph, which is exactly the
         # ``tie_word_embeddings=True`` semantics.
+        #
+        # The matmul ``hidden @ embed.T`` is fused inside the
+        # :class:`TPFusedLceLoss` below (chunks over the sequence
+        # dim, online softmax, no [B,T,V] tensor materialised),
+        # so the lm_head is no longer called separately on the
+        # training path. The :class:`TPLmHead` shim is still
+        # constructed here for inference / generation paths that
+        # need the full sharded logits (see ``model.generate``).
         self.lm_head_per_device: dict[int, TPLmHead] = {}
         for d in self.devices:
             head = TPLmHead(
@@ -534,27 +756,29 @@ class TPHippoModel(nn.Module):
             )
             self.lm_head_per_device[d] = head
 
-        # Fused, chunked, TP-aware cross-entropy. The Triton kernel
-        # from fla performs online softmax over a chunked vocab
-        # dim (controlled inside the kernel's BLOCK_SIZE) and a
-        # single all-reduce of the LSE across the TP group, so the
-        # full ``[B, T, V]`` logit tensor is never materialised on
-        # any rank. The kernel accepts any 3-D ``[..., V // world]``
-        # input — it views to ``[N, V // world]`` internally — so
-        # the standard ``shift_logits[..., :-1, :]`` indexing from
-        # the model forward can stay.
-        self.loss_fn_per_device: dict[int, FusedCrossEntropyLoss] = {
-            d: FusedCrossEntropyLoss(
+        # Fused lm_head + cross-entropy, TP-aware, online chunked
+        # softmax. Replaces the previous TPLmHead +
+        # FusedCrossEntropyLoss pair. The full [B, T, V // world]
+        # sharded logits tensor is never materialised: the matmul
+        # is done inside the fla kernel over chunks of the
+        # sequence dim, with per-chunk size set so peak logits
+        # ≈ 32 MB at our config (vs ~254 MB with the fla default
+        # of num_chunks=8). See :class:`TPFusedLceLoss` for the
+        # full memory analysis.
+        self.fused_lm_ce_per_device: dict[int, TPFusedLceLoss] = {}
+        for d in self.devices:
+            flce = TPFusedLceLoss(
+                self.replicated_per_device[d]["embed_tokens"],
+                config.hidden_size, config.vocab_size,
+                bias=config.use_bias,
                 ignore_index=-100,
-                reduction="mean",
-                # Reuse the logits buffer for dlogits in backward
-                # instead of allocating a fresh [B*T, V] tensor
-                # (~2.2 GB at seq=919, B=4, V=248320, FP16).
-                inplace_backward=True,
-                process_group=get_tp_group(),
+                # 64 chunks → C = next_pow2(ceil(4092/64)) = 64
+                # tokens per chunk → per-chunk peak logits
+                # 64 × 248320 × 2 B = ~32 MB at V=248k, H=1k.
+                num_chunks=64,
+                device=d, dtype=dtype,
             )
-            for d in self.devices
-        }
+            self.fused_lm_ce_per_device[d] = flce
 
         # Per-device trainable parameter list. Built lazily by
         # ``trainable_parameters(device)``.
@@ -732,32 +956,38 @@ class TPHippoModel(nn.Module):
             )
 
         hidden_states = self.replicated_per_device[device]["norm"](x)
-        sharded_logits = self.lm_head_per_device[device](hidden_states)
         out: dict[str, torch.Tensor] = {}
         if labels is not None:
-            # The training path only consumes ``out["loss"]``, so we
-            # avoid stashing the full ``[B, T, V // world]`` logit
-            # buffer (1.8 GB at B=4, T=919, V=248k) in the output
-            # dict. The CE kernel will write its dlogits back into
-            # ``shift_logits`` in-place (see ``inplace_backward``
-            # below), so the only live logit tensor during backward
-            # is the 1.8 GB ``shift_logits`` copy. The .contiguous()
-            # is required because the time-slice
-            # ``sharded_logits[..., :-1, :]`` is non-contiguous and
-            # cannot be viewed as ``[N, V // world]`` for the kernel.
-            shift_logits = sharded_logits[..., :-1, :].contiguous()
+            # Fused lm_head + CE. The kernel:
+            #   1. Slices hidden to drop the last time position
+            #      (no next-token target for it) and labels to
+            #      drop the first (the embedding at t=0 has no
+            #      preceding context to predict from — the standard
+            #      next-token-prediction shift).
+            #   2. Does hidden[..., :-1, :] @ local_embed.T inside
+            #      a Triton kernel that chunks over the sequence
+            #      dim, so the per-chunk peak logits are
+            #      ``[C, V // world]`` (≈32 MB at our config with
+            #      num_chunks=64) instead of the full
+            #      ``[B, T, V // world]`` (1.99 GB at TP=1).
+            #   3. Computes an online chunked softmax over the
+            #      vocab dim, accumulates the per-token loss, and
+            #      returns a scalar ``mean`` loss.
+            #   4. Pre-computes dx (grad w.r.t. hidden) and dw
+            #      (grad w.r.t. the embed slice) in forward, so
+            #      backward does not need to re-materialise the
+            #      per-chunk logits.
+            # The full [B, T, V // world] sharded logits tensor
+            # is therefore never materialised on the device.
+            shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Fused kernel only supports 2D ``[N, V // world]``
-            # logits, so collapse the B/T dims into one.
-            shift_logits_2d = shift_logits.view(-1, shift_logits.size(-1))
-            shift_labels_1d = shift_labels.view(-1)
-            # Fused kernel handles FP16/FP32 internally and
-            # performs the TP all-reduce of LSE; ``ignore_index``
-            # is masked inside the kernel with ``reduction='mean'``,
-            # so no post-hoc mask bookkeeping is required.
-            loss = self.loss_fn_per_device[device](shift_logits_2d, shift_labels_1d)
+            loss = self.fused_lm_ce_per_device[device](shift_hidden, shift_labels)
             out["loss"] = loss
         else:
-            # Inference / generation path: caller expects logits
+            # Inference / generation path: caller expects the
+            # sharded logits. The TPLmHead shim above does the
+            # narrow-view matmul; the caller (e.g. model.generate)
+            # is responsible for any all-gather / argmax.
+            sharded_logits = self.lm_head_per_device[device](hidden_states)
             out["logits"] = sharded_logits
         return out

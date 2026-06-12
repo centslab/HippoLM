@@ -31,6 +31,32 @@ import torch.nn as nn
 
 
 # --------------------------------------------------------------------------- #
+# Streaming chunk sizes for the v0.0.2 GPU optimizer step.                    #
+# --------------------------------------------------------------------------- #
+# The chunk size bounds the per-chunk peak VRAM of the FP32 temp tensors
+# the AdamW / Muon step creates from the FP16 / BF16 storage. At
+# ``_ADAMW_CHUNK = 1<<20`` elements per chunk:
+#   - AdamW peak per chunk: 4 × 1M × 4 B = 16 MB
+#     (g_c, m_c, v_c, p_c — PyTorch's caching allocator
+#     reuses one temp across the four .float() calls, so
+#     effective peak is closer to 12-16 MB depending on the
+#     allocator state).
+#   - Muon peak per chunk: similar (the SGD update is the
+#     streamed part; the dequantize/quantize and Newton-Schulz
+#     stay full-matrix but each is small: at most
+#     rows*cols*4 B ≈ 12 MB for the 3072×1024 FFN down_proj).
+#
+# 1 M elements / chunk is a good V100 trade-off: the kernel
+# work per chunk (≈1 ms of FMAs at 1 M elements) is large
+# relative to the launch overhead (≈40 µs), and the peak
+# temp is bounded regardless of ``numel``. For 254 M-param
+# params this is 254 chunks per step; for 1 M-param params
+# it is a single chunk (no overhead vs. un-chunked).
+_ADAMW_CHUNK = 1 << 20  # 1 M elements per chunk
+_MUON_CHUNK = 1 << 20   # 1 M elements per chunk
+
+
+# --------------------------------------------------------------------------- #
 # Per-param state descriptor.                                                 #
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -108,10 +134,41 @@ class GPUAdamW:
                 s.param.grad.detach_().zero_()
 
     def step(self) -> None:
+        """Streamed AdamW step.
+
+        v0.0.1 path: cast the whole ``.grad`` / ``.m`` / ``.v`` /
+        ``.data`` to FP32 simultaneously → 4× numel bytes peak
+        temp per param (≈6 GB peak for the 254M-param embedding
+        alone).
+
+        This v0.0.2 path chunks the flat param into pieces of
+        ``_ADAMW_CHUNK`` elements (1 M by default ≈ 4 MB at
+        FP32) and runs the m / v / denom / factor / apply math
+        one chunk at a time, so the per-chunk peak is bounded to
+        5 × 4 MB ≈ 20 MB regardless of ``numel``.
+
+        Trade-off: a Python-level loop over chunks adds
+        launch-overhead (≈40 µs per chunk on V100), but the
+        kernel work per chunk is large enough to amortise it
+        (≈1 ms each), so end-to-end step time is unchanged in
+        practice.
+
+        Note: the writeback of m / v into the BF16 state
+        happens BEFORE the in-place ``m_c.div_(bc1).div_(denom)``
+        that turns m_c into the factor. The un-chunked v0.0.1
+        path did the writeback first too (``s.m.copy_(...)``
+        then ``factor = (m_fp32 / bc1) / denom``) for the same
+        reason — once the factor is computed in place, the
+        updated m is gone from m_c. Doing the writeback first
+        preserves the (FP32-rounded-to-BF16) updated m in
+        storage for the next step, then re-derives the factor
+        from the FP32 local m_c.
+        """
         beta1, beta2 = self.beta1, self.beta2
         lr = self.lr
         eps = self.eps
         wd = self.weight_decay
+        chunk_size = _ADAMW_CHUNK
         for s in self.state.values():
             p = s.param
             g = p.grad
@@ -122,35 +179,56 @@ class GPUAdamW:
             bc1 = 1.0 - beta1 ** step
             bc2 = 1.0 - beta2 ** step
 
-            # Promote grad to FP32 (the .grad is FP16 from FP16 backward)
-            g_fp32 = g.float() if g.dtype != torch.float32 else g
-            g_flat = g_fp32.reshape(-1)  # 1-D view matching s.m / s.exp_avg_sq
+            flat_p = p.data.view(-1)
+            flat_g = g.reshape(-1)
+            flat_m = s.m.view(-1)
+            flat_v = s.exp_avg_sq.view(-1)
+            n = flat_p.numel()
 
-            # m, v updates in FP32 for precision, stored as BF16.
-            # BF16's 8-bit exponent range (same as FP32) means
-            # g*g never underflows regardless of grad magnitude,
-            # while the 7-bit mantissa is sufficient for the
-            # per-element EMA signal.
-            m_fp32 = s.m.float()
-            v_fp32 = s.exp_avg_sq.float()
-            m_fp32.mul_(beta1).add_(g_flat, alpha=1.0 - beta1)
-            v_fp32.mul_(beta2).addcmul_(g_flat, g_flat, value=1.0 - beta2)
-            s.m.copy_(m_fp32.to(torch.bfloat16))
-            s.exp_avg_sq.copy_(v_fp32.to(torch.bfloat16))
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
 
-            # Factor in FP32 (denom and the ratio are both FP32).
-            denom = (v_fp32 / bc2).sqrt_().add_(eps)
-            factor = (m_fp32 / bc1) / denom  # FP32, shape [numel]
+                # Load chunk-sized FP32 views; PyTorch's caching
+                # allocator reuses one temporary buffer across
+                # iterations, so the peak per chunk is
+                # 4 × chunk_size × 4 B ≈ 16 MB, not 5 × that.
+                g_c = flat_g[start:end].float()
+                m_c = flat_m[start:end].float()
+                v_c = flat_v[start:end].float()
+                p_c = flat_p[start:end].float()
 
-            # Apply to FP16 param: do the add in FP32, then cast
-            # back. This preserves the small-factor precision (a
-            # 1e-4 FP32 factor survives the add, where casting it
-            # to FP16 first would round many elements to 0).
-            if wd != 0.0:
-                p.data.mul_(1.0 - lr * wd)
-            p_data_fp32 = p.data.float().reshape(-1)
-            p_data_fp32.add_(factor, alpha=-lr)
-            p.data.copy_(p_data_fp32.to(torch.float16).view_as(p.data))
+                # m, v updates in FP32. These are the same
+                # numerics as the un-chunked path, just on
+                # chunk-sized views.
+                m_c.mul_(beta1).add_(g_c, alpha=1.0 - beta1)
+                v_c.mul_(beta2).addcmul_(g_c, g_c, value=1.0 - beta2)
+
+                # Writeback m / v to BF16 storage BEFORE the
+                # in-place factor computation overwrites m_c.
+                # Matches the un-chunked path's order:
+                #   s.m.copy_(m_fp32.to(bf16))  ← here
+                #   factor = (m_fp32 / bc1) / denom  ← below
+                # Without this ordering, the next step's
+                # m_c = flat_m.float() would read the
+                # factor (sign(g)) rather than the EMA, and
+                # the optimizer would diverge.
+                flat_m[start:end].copy_(m_c.to(torch.bfloat16))
+                flat_v[start:end].copy_(v_c.to(torch.bfloat16))
+
+                # Factor in FP32 (in-place; m_c is destroyed).
+                denom = (v_c / bc2).sqrt_().add_(eps)
+                factor = m_c.div_(bc1).div_(denom)
+
+                # Apply to FP16 param via FP32 add. Decoupled
+                # weight decay folds into p_c before the factor
+                # add so the per-step math is identical to the
+                # un-chunked version.
+                if wd != 0.0:
+                    p_c.mul_(1.0 - lr * wd)
+                p_c.add_(factor, alpha=-lr)
+
+                # Writeback the updated p to FP16 storage.
+                flat_p[start:end].copy_(p_c.to(torch.float16))
 
 
 # --------------------------------------------------------------------------- #
@@ -285,10 +363,47 @@ class GPUMuon:
             return g
 
     def step(self) -> None:
+        """Streamed Muon step.
+
+        The SGD-style update (dequantize → m = β·m + g →
+        requantize) and the final param update
+        (p -= lr · update) are streamed over the flat
+        ``numel`` dim in chunks of ``_MUON_CHUNK`` elements.
+        The dequantize/requantize/Newton-Schulz stay
+        full-matrix because:
+
+          - ``_dequantize`` returns a [rows, cols] FP32 tensor
+            (the dequantize itself is element-wise, but the
+            output is a dense FP32 matrix, and reshaping back
+            into a [rows, cols] view is what the NS kernel
+            expects).
+          - ``_requantize`` needs per-row max-abs, which is
+            naturally a [rows, cols] → [rows] reduction;
+            streaming it would require a running-max per row
+            across chunks, complicating the kernel for no
+            meaningful memory win (the dequantized tensor is
+            at most ~12 MB for the 3072×1024 FFN down_proj).
+          - ``_newton_schulz`` operates on the full matrix
+            because the polynomial evaluation reads/writes
+            ``g @ g.T`` (or the transposed variant), which
+            needs the whole matrix at once.
+
+        The chunks that DO get streamed are: the
+        ``m_fp32.mul_(mom).add_(g_fp32, alpha=1.0 - mom)`` line
+        and the ``p_data_fp32.add_(update, alpha=-lr)`` line.
+        Both previously allocated a [numel] FP32 copy of the
+        param / momentum that was the bulk of the per-step
+        peak (4 × numel bytes for the FFN down_proj's
+        3 M elements = 12 MB each; for the KDA's 1 M-element
+        matrices that's 4 MB; for everything else the peak
+        is the int8 momentum scale tensor). Streaming caps
+        each at chunk_size × 4 B ≈ 4 MB.
+        """
         mom = self.momentum
         lr = self.lr
         wd = self.weight_decay
         nesterov = self.nesterov
+        chunk_size = _MUON_CHUNK
         for s in self.state.values():
             p = s.param
             g = p.grad
@@ -298,11 +413,24 @@ class GPUMuon:
             shape = s.shape
             rows, cols = shape[0], shape[1]
 
-            # 1) Dequantize momentum to FP32
+            # 1) Dequantize momentum to FP32 (full matrix, but
+            # small: at most 12 MB for the 3072×1024 FFN
+            # down_proj, 4 MB for the 1024×1024 KDA matrices).
             m_fp32 = self._dequantize(s)
 
-            # 2) SGD update in FP32 (no precision loss on the EMA)
-            m_fp32.mul_(mom).add_(g_fp32, alpha=1.0 - mom)
+            # 2) SGD update in FP32, streamed over the flat
+            # tensor. ``m_fp32`` and ``g_fp32`` are both [rows,
+            # cols]; the streaming loop views them as 1-D for
+            # the in-place arithmetic and the kernel sees the
+            # same memory layout (the views are contiguous).
+            m_flat = m_fp32.view(-1)
+            g_flat = g_fp32.view(-1)
+            n = m_flat.numel()
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                m_c = m_flat[start:end]
+                g_c = g_flat[start:end]
+                m_c.mul_(mom).add_(g_c, alpha=1.0 - mom)
 
             # 3) Requantize to int8 for storage
             self._requantize(m_fp32, s)
@@ -311,17 +439,25 @@ class GPUMuon:
             if wd != 0.0:
                 p.data.mul_(1.0 - lr * wd)
 
-            # 5) NS on the dequantized FP32 momentum (cast to FP16
-            #    for tensor-core speed). The int8 quantization noise
-            #    is small relative to the update magnitude, so the
-            #    NS output direction is essentially unchanged.
+            # 5) NS on the dequantized FP32 momentum (cast to
+            #    FP16 for tensor-core speed).
             update = self._newton_schulz(m_fp32)
             update = update.to(torch.float16)
 
-            # 6) Apply to FP16 param via FP32 add (no FP16 factor cast)
-            p_data_fp32 = p.data.float()
-            p_data_fp32.add_(update.float(), alpha=-lr)
-            p.data.copy_(p_data_fp32.to(torch.float16))
+            # 6) Apply to FP16 param via FP32 add, streamed
+            # over the flat tensor. Previously this allocated
+            # a [numel] FP32 copy of ``p.data`` (4 × numel
+            # bytes) plus a [numel] FP32 copy of ``update``;
+            # both are now chunked.
+            p_flat = p.data.view(-1)
+            u_flat = update.view(-1)
+            n = p_flat.numel()
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                p_c = p_flat[start:end].float()
+                u_c = u_flat[start:end].float()
+                p_c.add_(u_c, alpha=-lr)
+                p_flat[start:end].copy_(p_c.to(torch.float16))
 
 
 # --------------------------------------------------------------------------- #
