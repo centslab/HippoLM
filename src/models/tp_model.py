@@ -1148,8 +1148,8 @@ class TPHippoModel(nn.Module):
         blocks: list[torch.Tensor] = [embeds]  # b_0 = embedding
         x = embeds  # Block 0's input is the embedding.
 
-        # Block-level checkpointing
-        # ------------------------
+        # Block-level checkpointing + KDA cache in the last block
+        # --------------------------------------------------------
         # The model has ``num_blocks`` blocks of ``block_size``
         # layers each. For every block except the last, we wrap
         # the entire 4-layer forward in a single
@@ -1157,15 +1157,21 @@ class TPHippoModel(nn.Module):
         # backward recomputes the per-layer activations from the
         # block output b_n. Only the per-block output is held in
         # memory, which is roughly ``block_size``× cheaper than
-        # the per-layer checkpointing we used to do.
+        # the per-layer checkpointing we used to do. Inside the
+        # checkpoint wrapper the KDA Triton kernels' intermediate
+        # state (g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h) is
+        # *not* retained — backward re-runs the chunked KDA
+        # forward inside the checkpoint.
         #
-        # The *last* block is kept on the per-layer checkpoint
-        # path because its residual is what feeds the final norm
-        # + lm_head — we want the per-layer activations to be
-        # replayable for backward without redoing the entire
-        # block. (We could equivalently checkpoint the last block
-        # too, but the per-layer path is empirically a good
-        # balance of memory vs. recompute.)
+        # The *last* block is intentionally NOT wrapped in
+        # ``torch.utils.checkpoint.checkpoint``. KDA's autograd
+        # graph benefits from not being checkpointed: the Triton
+        # kernels cache their forward intermediates and the KDA
+        # backward is strictly more expensive than re-doing the
+        # chunked forward would be. So the last block pays the
+        # activation memory (per-layer inputs to the residual)
+        # in exchange for a fast backward — the KDA cache is
+        # retained.
         #
         # AttnRes is invoked at every non-first block boundary,
         # *outside* the checkpoint wrapper, so the per-block

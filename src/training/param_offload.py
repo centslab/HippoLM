@@ -2,27 +2,35 @@
 
 Implements two optimizer variants used together via param groups:
 
-  - :class:`CPUAdamW`     — AdamW with FP16 m and FP32 v state on
+  - :class:`CPUAdamW`     — AdamW with BF16 m and FP32 v state on
     CPU pinned memory. The forward / backward happen on the GPU
     in the param's training dtype (FP16 in this project). After
     each micro-batch's backward, :func:`accumulate_grads_to_cpu`
     copies the GPU ``.grad`` to a per-param CPU accumulator
-    (FP16, pinned) and frees the GPU copy. On ``step()`` the
+    (BF16, pinned) and frees the GPU copy. On ``step()`` the
     accumulator is consumed: m, v are updated in place on the
     CPU; the per-element update factor is computed in FP32 (to
-    avoid FP16 underflow on the divisor), then cast to FP16 and
+    avoid any underflow on the divisor), then cast to FP16 and
     streamed chunk-wise to the GPU param and applied in place.
-    This is the DeepSpeed ZeRO-Offload pattern with FP16 state.
+    This is the DeepSpeed ZeRO-Offload pattern with BF16 state.
+    Grad dtype is BF16 throughout (matches the new 5060Ti
+    hardware; BF16 has FP32-like dynamic range, so no overflow
+    on the grad transfer or the m update).
 
   - :class:`CPUMuon`      — Muon (Newton-Schulz orthogonalization
-    of the momentum matrix) with FP16 momentum on CPU pinned
-    memory. The NS iteration is a sequence of matrix multiplies,
-    which is *much* faster on the GPU than on the CPU, so each
-    step streams the chunked momentum to the GPU, runs 5 NS
-    iterations in FP16 (tensor cores), and applies the resulting
-    update to the GPU param directly. The CPU-side momentum
-    state is only updated by accumulating the grad, which is
-    cheap.
+    of the momentum matrix) with **int8-quantized momentum +
+    BF16 per-row scale** on CPU pinned memory. The int8 storage
+    halves the Muon CPU RAM vs FP16 (1 byte/elt + a tiny
+    ``rows``-sized BF16 scale tensor). The BF16 scale (vs FP16
+    in the v0.0.2 design) is the key numerical choice for the
+    new hardware: BF16's FP32-mantissa dynamic range keeps the
+    per-row scale well above underflow even for tiny per-row
+    momentum magnitudes, and on a 5060Ti there is no compute
+    cost difference between FP16 and BF16 scales (both are
+    2 bytes). The dequantize + SGD update + requantize cycle
+    happens on the CPU (one full pass per param per step; the
+    NS iteration is the only GPU step and is streamed over
+    rows in 4096-row chunks).
 
 Both optimizers follow the same API surface as ``torch.optim.Optimizer``
 minimally — ``step()`` consumes whatever gradients are present on
@@ -41,14 +49,12 @@ Conventions
   :func:`accumulate_grads_to_cpu` which copies ``.grad`` to the
   per-param CPU accumulator and frees the GPU copy. So between
   micro-batches the GPU holds zero gradient memory.
-- Optimizer state (m, v for AdamW; momentum for Muon) is FP16
-  (and FP32 v for AdamW) on CPU pinned memory. For ~624 M params
-  this is roughly 2 × 2 × 624 M bytes = 2.5 GB CPU RAM (AdamW)
-  or 1 × 2 × 624 M = 1.25 GB (Muon). The FP16 trade is a
-  deliberate design choice for CPU RAM and DMA bandwidth; the
-  FP32 divisor math in AdamW preserves precision where it matters
-  (preventing the FP16 v underflow that would otherwise blow up
-  the per-element factor).
+- Optimizer state on CPU pinned memory:
+    AdamW: m (BF16, numel) + v (FP32, numel) + accum (BF16, numel)
+    Muon:  int8_q (int8, numel) + int8_scale (BF16, rows) + accum (BF16, numel)
+- For ~624 M params: AdamW ≈ 2 × 2 × 624 M = 2.5 GB CPU RAM
+  (v FP32 + m BF16 + accum BF16) or 2.0 GB (m+accum BF16).
+  Muon ≈ 1 × 624 M bytes (int8) + negligible scale = 0.6 GB.
 """
 from __future__ import annotations
 
@@ -67,22 +73,29 @@ class _ParamState:
     """Per-parameter CPU-side state for either AdamW or Muon."""
 
     param: nn.Parameter
-    # The CPU accumulator. For both AdamW and Muon this is the
-    # destination of :func:`accumulate_grads_to_cpu`: each
-    # micro-batch's ``.grad`` is added in here on the CPU, and
-    # the training loop's :func:`zero_cpu_grad_accum` zeros it
-    # out at the end of the accumulation cycle.
+    # The CPU accumulator (BF16). For both AdamW and Muon this is
+    # the destination of :func:`accumulate_grads_to_cpu`: each
+    # micro-batch's ``.grad`` (cast to BF16 before the DMA) is
+    # added in here on the CPU, and the training loop's
+    # :func:`zero_cpu_grad_accum` zeros it out at the end of the
+    # accumulation cycle.
     accum: torch.Tensor
     # AdamW-specific state (set when ``kind == 'adamw'``).
-    # m is FP16 (magnitude stays bounded by the grad scale, and
-    # FP16 is sufficient for the per-element update).
-    # v is FP32 (an FP16 v underflows to 0 for typical grad
+    # m is BF16 (magnitude stays bounded by the grad scale, and
+    # BF16 is sufficient for the per-element update; on the new
+    # 5060Ti hardware BF16 has the same throughput as FP16).
+    # v is FP32 (a BF16 v underflows to 0 for typical grad
     # magnitudes 1e-4 to 1e-3, which makes ``1/sqrt(v)`` blow
     # up to ~1e9 * m and overflow the FP16 cast on the
     # per-element factor). FP32 v has ~28 bits of dynamic range
-    # — way more than the ~12 bits of FP16.
+    # — way more than the ~8 bits of BF16's mantissa.
     m: torch.Tensor | None = None
     exp_avg_sq: torch.Tensor | None = None
+    # Muon-specific state (set when ``kind == 'muon'``). The
+    # momentum matrix ``m`` is stored as int8 (quantized) plus a
+    # BF16 per-row scale factor.
+    int8_q: torch.Tensor | None = None
+    int8_scale: torch.Tensor | None = None
     # Cached for Muon: original param shape for reshape on GPU.
     shape: tuple = field(default_factory=tuple)
     # Step counter (per param; cheap).
@@ -95,15 +108,16 @@ class _ParamState:
 # CPU AdamW                                                                   #
 # --------------------------------------------------------------------------- #
 class CPUAdamW:
-    """AdamW with CPU-side m, v state, GPU-side params.
+    """AdamW with CPU-side m (BF16) and v (FP32) state, GPU-side
+    params.
 
     Memory layout per trainable param:
-        CPU pinned: m (FP16, numel), v (FP32, numel), accum (FP16, numel)
+        CPU pinned: m (BF16, numel), v (FP32, numel), accum (BF16, numel)
         GPU:         param (training dtype, e.g. FP16), .grad (transient)
 
     On :meth:`step`:
-        1. Read the latest accumulated grad (CPU pinned, FP16).
-        2. Update m, v in place (FP16 / FP32 respectively).
+        1. Read the latest accumulated grad (CPU pinned, BF16).
+        2. Update m, v in place (BF16 / FP32 respectively).
         3. Compute the update factor in FP32 then cast to FP16
            (chunked, streamed to the GPU).
         4. Apply ``p -= lr * factor`` in place on the GPU.
@@ -138,12 +152,15 @@ class CPUAdamW:
             n = p.numel()
             self.state[id(p)] = _ParamState(
                 param=p,
-                accum=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
+                # BF16 accum: matches the new grad-transfer dtype.
+                accum=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
                 # v is FP32 to prevent underflow (see dataclass
                 # docstring above).
                 exp_avg_sq=torch.zeros(n, dtype=torch.float32, device="cpu").pin_memory(),
-                # m is FP16 (magnitude bounded; safe precision-wise).
-                m=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
+                # m is BF16: magnitude bounded, native dtype on
+                # the new 5060Ti hardware, no overflow concern
+                # thanks to BF16's FP32-exponent range.
+                m=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
                 kind="adamw",
                 shape=p.shape,
             )
@@ -158,9 +175,10 @@ class CPUAdamW:
             # :func:`zero_cpu_grad_accum`).
 
     # Per-chunk size for the streaming factor / update path.
-    # 4 M elements is the sweet spot on V100 PCIe: 8 MB FP16 per
-    # chunk keeps the GPU transient well under the 16 GB ceiling
-    # and overlaps the H2D copy with the next chunk's compute.
+    # 4 M elements is the sweet spot on V100 / 5060Ti PCIe: 8 MB
+    # FP16 per chunk keeps the GPU transient well under the 16 GB
+    # ceiling and overlaps the H2D copy with the next chunk's
+    # compute.
     _STREAM_CHUNK_NUMEL = 4 * 1024 * 1024
 
     def step(self) -> None:
@@ -182,7 +200,7 @@ class CPUAdamW:
             g = s.accum
             m = s.m
             v = s.exp_avg_sq
-            # Update m (FP16, in place) and v (FP32, in place).
+            # Update m (BF16, in place) and v (FP32, in place).
             # The dedicated ``m`` buffer keeps ``m`` and ``g``
             # (which is ``s.accum``) aliased-free: the chained
             # ``m.mul_(beta1).add_(g, ...)`` would otherwise
@@ -203,11 +221,14 @@ class CPUAdamW:
             # the un-chunked path because the operations are
             # element-wise.
             #
-            # FP16 SAFETY: do the divisor math in FP32. Pure
-            # FP16 ``1/sqrt(v)`` would underflow when v ≈ 0
-            # (FP16 smallest normal is ~6e-8; reciprocals of
-            # small v round to 0). The up-cast is a ``numel``
-            # op — cheap relative to the GPU transfer.
+            # Numerics: do the divisor math in FP32 even though
+            # ``g`` and ``m`` are now BF16. BF16 v on the CPU is
+            # fine (we promote to FP32 for the v buffer, so v
+            # never underflows). The factor cast back to FP16
+            # for the GPU apply is the same as before — BF16
+            # m has more mantissa precision than the FP16
+            # factor cast discards, so no precision is lost in
+            # the move from FP32-divisor to FP16-apply.
             p_flat = s.param.data.view(-1)
             n = p_flat.numel()
             for start in range(0, n, CHUNK):
@@ -232,17 +253,38 @@ class CPUAdamW:
 # CPU Muon                                                                    #
 # --------------------------------------------------------------------------- #
 class CPUMuon:
-    """Muon with CPU momentum, GPU Newton-Schulz.
+    """Muon with int8-quantized momentum + BF16 per-row scale on CPU
+    pinned memory.
 
     State per param:
-        CPU pinned: accum (FP16, numel), momentum (FP16, numel)
+        CPU pinned: int8_q (int8, numel), int8_scale (BF16, rows),
+                    accum (BF16, numel)
         GPU:         param (FP16), .grad (transient)
 
+    The 2-D momentum matrix ``m`` is stored as a flat int8 buffer
+    reshaped to ``[rows, cols]`` plus a per-row BF16 scale factor
+    (symmetric quantization::
+
+        scale[i] = max(|m[i, :]|) / 127
+        q[i, j] = round(m[i, j] / scale[i]).clip(-128, 127)
+
+    ). The BF16 scale (vs FP16 in the v0.0.2 design) is the
+    key numerical choice for the new 5060Ti hardware: BF16's
+    8-bit exponent matches FP32, so the per-row scale never
+    overflows even for very small per-row maxes. FP16's 5-bit
+    exponent could underflow ``scale`` to 0 for very quiet
+    rows, which would then divide-by-zero on dequant. BF16
+    has the same 2-byte footprint as FP16.
+
     The training loop's :func:`accumulate_grads_to_cpu` adds the
-    GPU ``.grad`` to ``accum`` (CPU, FP16). On :meth:`step` we
-    update momentum on the CPU, then stream each chunk to the
-    GPU, run Newton-Schulz (FP16 tensor cores), and apply the
-    resulting update to the GPU param.
+    GPU ``.grad`` to ``accum`` (CPU, BF16). On :meth:`step` we:
+        1. Dequantize the int8 momentum to FP32 on the CPU
+           (one full pass per param; rows * cols multiplies).
+        2. SGD update in FP32: m = beta*m + (1-beta)*g.
+        3. Requantize to int8 + BF16 scale for storage.
+        4. Stream each row-chunk to the GPU, run 5 NS
+           iterations in FP16 (tensor cores), and apply the
+           update to the GPU param.
     """
 
     _NS_COEFFS = (3.4445, -4.7750, 2.0315)
@@ -276,20 +318,69 @@ class CPUMuon:
                     f"use CPUAdamW for 1D params."
                 )
             n = p.numel()
+            shape = tuple(p.shape)
             st = _ParamState(
                 param=p,
-                accum=torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory(),
+                # BF16 accum: matches the new grad-transfer dtype.
+                accum=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
+                # int8 quantized momentum (1 byte/elt vs 2 for
+                # FP16, halves Muon's CPU RAM cost).
+                int8_q=torch.zeros(n, dtype=torch.int8, device="cpu").pin_memory(),
+                # BF16 per-row scale (FP32-like dynamic range; no
+                # underflow risk on quiet rows). For a 2-D
+                # ``[rows, cols]`` matrix, ``scale`` is
+                # ``[rows]`` — tiny relative to the int8 buffer.
+                int8_scale=torch.zeros(shape[0], dtype=torch.bfloat16, device="cpu").pin_memory(),
                 kind="muon",
-                shape=p.shape,
+                shape=shape,
             )
-            # Momentum buffer in FP16 (magnitude stays bounded by
-            # the grad scale; safe precision-wise).
-            st.exp_avg_sq = torch.zeros(n, dtype=torch.float16, device="cpu").pin_memory()
             self.state[id(p)] = st
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for s in self.state.values():
             s.param.grad = None
+
+    def _dequantize(self, s: _ParamState) -> torch.Tensor:
+        """Return dequantized FP32 momentum, shape ``s.shape``.
+
+        Runs on the CPU. Reads ``s.int8_q`` (int8) and
+        ``s.int8_scale`` (BF16); returns ``[rows, cols]`` in FP32.
+        The FP32 cast of the BF16 scale is free (BF16→FP32 is
+        lossless), and the per-row scale is then broadcast across
+        the cols dimension.
+        """
+        rows, cols = s.shape[0], s.shape[1]
+        q_2d = s.int8_q.view(rows, cols).float()
+        scale_2d = s.int8_scale.float().unsqueeze(1)  # [rows, 1], FP32
+        return q_2d * scale_2d  # FP32, [rows, cols]
+
+    def _requantize(self, m_fp32: torch.Tensor, s: _ParamState) -> None:
+        """Per-row symmetric int8 quantize ``m_fp32`` into
+        ``s.int8_q`` / ``s.int8_scale`` (BF16).
+
+        ``m_fp32`` is the SGD-updated momentum in FP32, shape
+        ``s.shape``. The scale is BF16 in storage but computed
+        in FP32 here for the divide (so the scale's dynamic
+        range is FP32-quality, not BF16-quality, and any tiny
+        mantissa loss is acceptable on the way to a 2-byte
+        scale).
+        """
+        rows, cols = s.shape[0], s.shape[1]
+        m_2d = m_fp32.view(rows, cols)
+        # Per-row max abs. Clamp to 1e-8 so the scale never
+        # collapses to 0 (a row of exact zeros would otherwise
+        # divide-by-zero in the quantize step).
+        row_max = m_2d.abs().amax(dim=1).clamp(min=1e-8)
+        new_scale_fp32 = (row_max / 127.0)
+        # Cast to BF16 for storage; the per-row divide in the
+        # dequant path promotes BF16→FP32 losslessly.
+        new_scale_bf16 = new_scale_fp32.to(torch.bfloat16)
+        # Quantize in FP32 for the divide (lossless); then
+        # cast the int8 to int8 storage.
+        scale_2d = new_scale_bf16.float().unsqueeze(1)  # [rows, 1], FP32
+        q_int8 = (m_2d / scale_2d).round().clamp(-128, 127).to(torch.int8)
+        s.int8_q.copy_(q_int8.view(-1))
+        s.int8_scale.copy_(new_scale_bf16)
 
     def _newton_schulz(self, x: torch.Tensor) -> torch.Tensor:
         a, b, c = self._NS_COEFFS
@@ -335,39 +426,50 @@ class CPUMuon:
         for s in self.state.values():
             if s.accum.abs().sum().item() == 0:
                 continue
-            # Update momentum on the CPU: m = beta*m + grad.
-            m = s.exp_avg_sq
-            m.mul_(mom).add_(s.accum, alpha=1.0 - mom)
             shape = s.shape
             rows, cols = shape[0], shape[1]
-            # Decoupled weight decay (applied once to the full param
-            # rather than per-chunk to keep semantics identical to
-            # the non-streaming path).
+            # 1) Dequantize momentum to FP32 on the CPU.
+            # Full-matrix operation: the dequant is
+            # ``rows * cols`` element-wise multiplies, which is
+            # cheap on the CPU relative to the GPU NS iterations
+            # downstream. At most 12 MB for the 3072×1024 FFN
+            # down_proj, 4 MB for the 1024×1024 KDA matrices.
+            m_fp32 = self._dequantize(s)
+            # 2) SGD update on the CPU: m = beta*m + grad.
+            # The accum is BF16; cast to FP32 for the add (BF16
+            # add would lose precision on the EMA; the v0.0.2
+            # path did the same cast for the same reason).
+            g_fp32 = s.accum.float().view(rows, cols)
+            m_fp32.mul_(mom).add_(g_fp32, alpha=1.0 - mom)
+            # 3) Requantize to int8 + BF16 scale for storage.
+            self._requantize(m_fp32, s)
+            # 4) Decoupled weight decay: applied once to the
+            # full GPU param (in place), before the streaming
+            # NS apply loop.
             if wd != 0.0:
                 s.param.data.mul_(1.0 - lr * wd)
-            if rows * cols <= CHUNK_ROWS * cols:
-                # Small param: single chunk.
-                g = m.view(shape).to(s.param.device, non_blocking=True)
+            # 5) Stream NS over rows: for each row chunk,
+            # dequantize (already done above, but the FP32
+            # buffer is the full matrix), slice, send to GPU,
+            # NS in FP16, apply.
+            #
+            # NOTE: the dequantize in (1) produced the full
+            # ``[rows, cols]`` FP32 m_fp32, and (2)-(3) modified
+            # it in place. So the same buffer we just requantized
+            # is also what we feed to the NS — no double work.
+            for r_start in range(0, rows, CHUNK_ROWS):
+                r_end = min(r_start + CHUNK_ROWS, rows)
+                m_chunk_fp32 = m_fp32[r_start:r_end]
+                # Cast to FP16 for tensor-core NS. The FP32→FP16
+                # cast is the precision boundary (m is now in
+                # ~FP16 precision after the NS quantize, so no
+                # information is lost).
+                g = m_chunk_fp32.to(torch.float16).to(
+                    s.param.device, non_blocking=True,
+                )
                 update = self._newton_schulz(g)
                 update = update.to(s.param.dtype)
-                s.param.data.add_(update, alpha=-lr)
-            else:
-                # Streaming path: chunk along the row dim so each
-                # NS iteration is on a 2-D slice well under the
-                # V100's 16 GB ceiling. The flat momentum
-                # ``m`` (1-D, ``numel``) is sliced in strides of
-                # ``CHUNK_ROWS * cols`` and reshaped per chunk.
-                for r_start in range(0, rows, CHUNK_ROWS):
-                    r_end = min(r_start + CHUNK_ROWS, rows)
-                    flat_start = r_start * cols
-                    flat_end = r_end * cols
-                    m_chunk_flat = m[flat_start:flat_end]
-                    g = m_chunk_flat.view(r_end - r_start, cols).to(
-                        s.param.device, non_blocking=True,
-                    )
-                    update = self._newton_schulz(g)
-                    update = update.to(s.param.dtype)
-                    s.param.data[r_start:r_end].add_(update, alpha=-lr)
+                s.param.data[r_start:r_end].add_(update, alpha=-lr)
             # Reset grad accumulator for next accumulation cycle.
             s.accum.zero_()
 
@@ -392,12 +494,13 @@ def accumulate_grads_to_cpu(
     CPU add. This avoids the race where ``s.accum.add_(src)`` runs
     on the CPU before the DMA copy populates ``src``.
 
-    The cast to FP16 happens BEFORE the DMA so the transfer
-    itself is FP16 → halves the PCIe bandwidth vs FP32 and
-    matches the destination buffer dtype. The src grad is the
-    training dtype (FP16 in v0.0.2), so the cast is a no-op
-    when it is already FP16 and a down-cast when AMP promoted
-    it to FP32.
+    The cast to BF16 happens BEFORE the DMA so the transfer
+    itself is BF16 (2 bytes/elt, same as FP16 but with FP32-like
+    dynamic range, so no overflow on the grad copy or the m
+    update downstream). The src grad is the training dtype
+    (FP16 in this project), so the cast is a down-cast on the
+    GPU. We do the cast on the GPU first, then the DMA, so the
+    PCIe transfer is already in BF16.
     """
     pending: list[tuple[torch.Tensor, torch.Tensor]] = []
     for opt in optimizers:
@@ -405,16 +508,14 @@ def accumulate_grads_to_cpu(
             g = s.param.grad
             if g is None:
                 continue
-            # Issue the async copy; flatten so the destination
-            # ``accum`` (1-D, ``numel``, FP16) and the source have
-            # the same shape. Cast to FP16 BEFORE the DMA so the
-            # transfer itself is FP16 → halves the PCIe bandwidth
-            # vs FP32 and matches the destination buffer dtype.
+            # Issue the async copy: cast to BF16 on the GPU
+            # first (matches the new accum dtype; no FP16
+            # overflow on the DMA), then flatten, then DMA.
             src_cpu = (
                 g.detach()
+                .to(torch.bfloat16)
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
-                .to(torch.float16)
             )
             pending.append((s.accum, src_cpu))
             # Free GPU grad immediately so the GPU memory is
