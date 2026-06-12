@@ -1212,19 +1212,19 @@ def _train_worker(
     # Optimizer state (CPU pinned):
     #   Muon: int8 momentum (1 byte/elt) + BF16 per-row scale
     #         (tiny, ``rows`` floats per param) + BF16 accum (2 byte/elt).
-    #   AdamW: BF16 m + FP32 v + BF16 accum = 2 + 4 + 2 = 8 byte/elt.
+    #   AdamW: BF16 m + BF16 v + BF16 accum = 6 byte/elt.
     n_muon_rows = sum(s.shape[0] for s in muon_opt.state.values())
     muon_bytes = (
         n_muon * 1             # int8 momentum
         + n_muon_rows * 2      # BF16 per-row scale
         + n_muon * 2           # BF16 accum
     )
-    adamw_bytes = n_adamw * (2 + 4 + 2)  # BF16 m + FP32 v + BF16 accum
+    adamw_bytes = n_adamw * 6  # BF16 m + BF16 v + BF16 accum
     logger.info(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
         f" ({muon_bytes / 1024**3:.2f} GB int8 momentum + BF16 scale on CPU),"
         f" AdamW params={n_adamw:,}"
-        f" ({adamw_bytes / 1024**3:.2f} GB BF16 m + FP32 v on CPU)."
+        f" ({adamw_bytes / 1024**3:.2f} GB BF16 m+v on CPU)."
     )
 
     # ---- Training loop ----

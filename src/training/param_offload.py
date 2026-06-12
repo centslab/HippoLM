@@ -2,20 +2,25 @@
 
 Implements two optimizer variants used together via param groups:
 
-  - :class:`CPUAdamW`     — AdamW with BF16 m and FP32 v state on
+  - :class:`CPUAdamW`     — AdamW with BF16 m and BF16 v state on
     CPU pinned memory. The forward / backward happen on the GPU
     in the param's training dtype (FP16 in this project). After
     each micro-batch's backward, :func:`accumulate_grads_to_cpu`
     copies the GPU ``.grad`` to a per-param CPU accumulator
     (BF16, pinned) and frees the GPU copy. On ``step()`` the
     accumulator is consumed: m, v are updated in place on the
-    CPU; the per-element update factor is computed in FP32 (to
-    avoid any underflow on the divisor), then cast to FP16 and
-    streamed chunk-wise to the GPU param and applied in place.
-    This is the DeepSpeed ZeRO-Offload pattern with BF16 state.
+    CPU (BF16); the per-element update factor is computed in
+    FP32 (to recover precision after the BF16 v sqrt), then
+    cast to FP16 and streamed chunk-wise to the GPU param and
+    applied in place. This is the DeepSpeed ZeRO-Offload
+    pattern with BF16 state.
     Grad dtype is BF16 throughout (matches the new 5060Ti
     hardware; BF16 has FP32-like dynamic range, so no overflow
-    on the grad transfer or the m update).
+    on the grad transfer or the m update, and v can stay BF16
+    because BF16's 8-bit exponent is wide enough to keep
+    ``v = g²`` from underflowing at typical grad magnitudes
+    1e-4 to 1e-3 — 1e-8 is well above BF16's smallest normal
+    of ~1.18e-38).
 
   - :class:`CPUMuon`      — Muon (Newton-Schulz orthogonalization
     of the momentum matrix) with **int8-quantized momentum +
@@ -50,10 +55,10 @@ Conventions
   per-param CPU accumulator and frees the GPU copy. So between
   micro-batches the GPU holds zero gradient memory.
 - Optimizer state on CPU pinned memory:
-    AdamW: m (BF16, numel) + v (FP32, numel) + accum (BF16, numel)
+    AdamW: m (BF16, numel) + v (BF16, numel) + accum (BF16, numel)
     Muon:  int8_q (int8, numel) + int8_scale (BF16, rows) + accum (BF16, numel)
-- For ~624 M params: AdamW ≈ 2 × 2 × 624 M = 2.5 GB CPU RAM
-  (v FP32 + m BF16 + accum BF16) or 2.0 GB (m+accum BF16).
+- For ~624 M params: AdamW ≈ 6 × 624 M = 3.7 GB CPU RAM
+  (m BF16 + v BF16 + accum BF16, all 2 bytes/elt).
   Muon ≈ 1 × 624 M bytes (int8) + negligible scale = 0.6 GB.
 """
 from __future__ import annotations
@@ -81,14 +86,13 @@ class _ParamState:
     # accumulation cycle.
     accum: torch.Tensor
     # AdamW-specific state (set when ``kind == 'adamw'``).
-    # m is BF16 (magnitude stays bounded by the grad scale, and
-    # BF16 is sufficient for the per-element update; on the new
-    # 5060Ti hardware BF16 has the same throughput as FP16).
-    # v is FP32 (a BF16 v underflows to 0 for typical grad
-    # magnitudes 1e-4 to 1e-3, which makes ``1/sqrt(v)`` blow
-    # up to ~1e9 * m and overflow the FP16 cast on the
-    # per-element factor). FP32 v has ~28 bits of dynamic range
-    # — way more than the ~8 bits of BF16's mantissa.
+    # m and v are both BF16: the new 5060Ti hardware supports
+    # BF16 natively and BF16's 8-bit exponent keeps ``v = g²``
+    # from underflowing for typical grad magnitudes. (The
+    # previous FP32 v was a holdover from the FP16 era, where
+    # FP16's 5-bit exponent would underflow ``g²`` to 0 for
+    # grad magnitudes ~1e-4 to 1e-3 — that was the original
+    # justification. BF16 doesn't have this problem.)
     m: torch.Tensor | None = None
     exp_avg_sq: torch.Tensor | None = None
     # Muon-specific state (set when ``kind == 'muon'``). The
@@ -108,18 +112,19 @@ class _ParamState:
 # CPU AdamW                                                                   #
 # --------------------------------------------------------------------------- #
 class CPUAdamW:
-    """AdamW with CPU-side m (BF16) and v (FP32) state, GPU-side
+    """AdamW with CPU-side m (BF16) and v (BF16) state, GPU-side
     params.
 
     Memory layout per trainable param:
-        CPU pinned: m (BF16, numel), v (FP32, numel), accum (BF16, numel)
+        CPU pinned: m (BF16, numel), v (BF16, numel), accum (BF16, numel)
         GPU:         param (training dtype, e.g. FP16), .grad (transient)
 
     On :meth:`step`:
         1. Read the latest accumulated grad (CPU pinned, BF16).
-        2. Update m, v in place (BF16 / FP32 respectively).
-        3. Compute the update factor in FP32 then cast to FP16
-           (chunked, streamed to the GPU).
+        2. Update m, v in place (BF16 / BF16).
+        3. Compute the update factor in FP32 (to recover the
+           mantissa precision lost to the BF16 v sqrt), then
+           cast to FP16 (chunked, streamed to the GPU).
         4. Apply ``p -= lr * factor`` in place on the GPU.
 
     The training loop is expected to call
@@ -154,12 +159,12 @@ class CPUAdamW:
                 param=p,
                 # BF16 accum: matches the new grad-transfer dtype.
                 accum=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
-                # v is FP32 to prevent underflow (see dataclass
-                # docstring above).
-                exp_avg_sq=torch.zeros(n, dtype=torch.float32, device="cpu").pin_memory(),
+                # v is BF16 (was FP32 in the FP16 era; BF16 has
+                # enough exponent range that ``g²`` doesn't
+                # underflow). See dataclass docstring above.
+                exp_avg_sq=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
                 # m is BF16: magnitude bounded, native dtype on
-                # the new 5060Ti hardware, no overflow concern
-                # thanks to BF16's FP32-exponent range.
+                # the new 5060Ti hardware.
                 m=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
                 kind="adamw",
                 shape=p.shape,
@@ -200,12 +205,19 @@ class CPUAdamW:
             g = s.accum
             m = s.m
             v = s.exp_avg_sq
-            # Update m (BF16, in place) and v (FP32, in place).
+            # Update m (BF16, in place) and v (BF16, in place).
             # The dedicated ``m`` buffer keeps ``m`` and ``g``
             # (which is ``s.accum``) aliased-free: the chained
             # ``m.mul_(beta1).add_(g, ...)`` would otherwise
             # mutate ``g`` mid-chain and produce the wrong
             # update on every step.
+            #
+            # ``addcmul_`` on BF16: BF16 has FP32 exponent range
+            # so ``g*g`` (for g ~ 1e-3) is ~1e-6, well above the
+            # BF16 smallest normal. The mantissa is 7 bits which
+            # is the precision bottleneck — but we recover
+            # precision in the per-element factor by promoting
+            # to FP32 below before the sqrt.
             m.mul_(beta1).add_(g, alpha=1.0 - beta1)
             v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
             # Decoupled weight decay: applied in place on the GPU
@@ -222,20 +234,22 @@ class CPUAdamW:
             # element-wise.
             #
             # Numerics: do the divisor math in FP32 even though
-            # ``g`` and ``m`` are now BF16. BF16 v on the CPU is
-            # fine (we promote to FP32 for the v buffer, so v
-            # never underflows). The factor cast back to FP16
-            # for the GPU apply is the same as before — BF16
-            # m has more mantissa precision than the FP16
-            # factor cast discards, so no precision is lost in
-            # the move from FP32-divisor to FP16-apply.
+            # ``g``, ``m``, and ``v`` are all BF16. Promoting
+            # v_chunk to FP32 before the sqrt recovers the
+            # 7-bit BF16 mantissa precision for the divisor,
+            # which is what ``1/sqrt(v/bc2)`` is most sensitive
+            # to (a small relative error in v becomes a large
+            # relative error in 1/sqrt(v)). The factor is then
+            # cast back to FP16 for the GPU apply — that
+            # final cast is the precision bottleneck, not the
+            # v promotion.
             p_flat = s.param.data.view(-1)
             n = p_flat.numel()
             for start in range(0, n, CHUNK):
                 end = min(start + CHUNK, n)
-                v_chunk = v[start:end]
-                denom = (v_chunk / bc2).sqrt_().add_(eps)    # FP32, chunk
-                factor = (m[start:end].float() / bc1) / denom  # FP32, chunk
+                v_chunk_fp32 = v[start:end].float()
+                denom = (v_chunk_fp32 / bc2).sqrt_().add_(eps)  # FP32, chunk
+                factor = (m[start:end].float() / bc1) / denom   # FP32, chunk
                 # Stream the FP32 factor to the GPU as the param
                 # dtype (FP16) and apply in place.
                 p_flat[start:end].add_(
