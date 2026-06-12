@@ -64,7 +64,7 @@ Conventions
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Protocol, Tuple
 
 import torch
 import torch.nn as nn
@@ -106,6 +106,61 @@ class _ParamState:
     step: int = 0
     # "adamw" or "muon".
     kind: str = "adamw"
+
+
+# --------------------------------------------------------------------------- #
+# Public protocol for per-param state.                                        #
+# --------------------------------------------------------------------------- #
+class OptimizerState(Protocol):
+    """Structural view of a per-param optimizer state entry.
+
+    The training diagnostics (see :mod:`src.training.diagnostics`)
+    only need to read a handful of fields off each per-param
+    state, but they need to do so uniformly across the two
+    optimizers (AdamW and Muon) that the training loop
+    instantiates. This :class:`Protocol` declares the minimum
+    shape any optimizer state entry must expose to be
+    diagnosable.
+
+    Implementations: :class:`_ParamState` (the only concrete
+    state in this module, used by both :class:`CPUAdamW` and
+    :class:`CPUMuon`). ``CPUAdamW.state`` and ``CPUMuon.state``
+    are ``Dict[int, _ParamState]`` and therefore structurally
+    satisfy this protocol.
+
+    Field semantics:
+
+    - ``param`` is the GPU-side trainable parameter the entry
+      belongs to. Used to read ``.data`` (post-step) for the
+      "is the param finite" check.
+    - ``accum`` is the CPU pinned BF16 grad accumulator
+      (destination of :func:`accumulate_grads_to_cpu`).
+    - ``kind`` is ``"adamw"`` or ``"muon"``; diagnostics branch
+      on it to pick which state tensors to read.
+    - ``m`` / ``exp_avg_sq`` are AdamW's first / second moment
+      (both BF16 CPU pinned). For Muon both are ``None`` —
+      Muon stores the quantized momentum in ``int8_q`` /
+      ``int8_scale`` instead, and the diagnostics use a
+      separate "look at the state field for this kind" branch.
+    - ``int8_q`` / ``int8_scale`` are Muon's int8-quantized
+      momentum and per-row BF16 scale. For AdamW both are
+      ``None``.
+    - ``shape`` is cached for Muon (the original param shape
+      before flatten) so diagnostics can report the failing
+      param's full shape on NaN/Inf.
+    - ``step`` is the per-param step counter; primarily for
+      warmup-aware step reporting.
+    """
+
+    param: nn.Parameter
+    accum: torch.Tensor
+    kind: str
+    m: Optional[torch.Tensor]
+    exp_avg_sq: Optional[torch.Tensor]
+    int8_q: Optional[torch.Tensor]
+    int8_scale: Optional[torch.Tensor]
+    shape: tuple
+    step: int
 
 
 # --------------------------------------------------------------------------- #

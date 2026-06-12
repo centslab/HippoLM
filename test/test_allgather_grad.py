@@ -24,7 +24,7 @@ import torch.nn as nn
 
 sys.path.insert(0, "/home/wlx/HippoLM")
 
-from configs.base_config import HippoConfig
+from src.models import HippoConfig
 from src.models.ops.attn_res import BlockAttnRes
 
 

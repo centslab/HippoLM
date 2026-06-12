@@ -36,7 +36,28 @@ seq_len: 1024
 learning_rate: 0.03
 weight_decay: 0.01
 gradient_accumulation_steps: 64
-fp16: true
+
+# Optimizer
+muon_lr: 0.02            # Muon (2D matrices) learning rate
+muon_momentum: 0.95      # SGD momentum for the Muon path
+max_grad_norm: 1.0       # Pre-clip L2 norm (TP-reduced). <=0 disables clipping.
+seed: 42                 # RNG seed for replicated-param init on each device.
+
+# Precision
+# Each entry sets the storage dtype for a tensor class. Supported dtypes:
+#   fp32, fp16, bf16   - floating point; no scaling needed
+#   int8, int4         - integer; require a scale mode
+# Scale modes (int8/int4 only; ignored for fp*):
+#   no                 - no scaling (raw integer values)
+#   tensor             - one scale per tensor
+#   per-channel        - one scale per output channel (per-row for 2D weights)
+#   block              - one scale per block of `block_size` consecutive elements
+precision:
+  model_weights: { dtype: fp16 }
+  gradients:     { dtype: bf16 }
+  muon_momentum: { dtype: int8,  scale: per-channel }
+  adamw_m:       { dtype: bf16 }
+  adamw_v:       { dtype: bf16 }
 
 # Stage: pretrain or sft
 stage: pretrain
@@ -58,6 +79,9 @@ tokenizer_path: src/tokenizer
 # take minutes on either CDN. Sequential streaming is fine for the
 # v0.0.0 validation run (1000 steps).
 shuffle: false
+# Skip streaming + tokenize; use random tokens. Cheap smoke test for the
+# model + optimizer + TP code path.
+use_dummy_data: false
 
 # Output
 output_dir: output
@@ -66,4 +90,9 @@ checkpoint_interval: 100
 
 # GPU
 min_gpu_memory_mb: 10240
-num_workers: 2
+
+# TP simulation (single-GPU dev box): spawn N processes all bound to
+# cuda:0, transport collectives via gloo. Verifies the sharding code
+# paths without owning N physical GPUs. Much slower than NVLink NCCL.
+tp_sim: false
+tp_size: 2

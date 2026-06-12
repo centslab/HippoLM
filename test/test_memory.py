@@ -91,7 +91,7 @@ def test_memory_efficient_training(
     monitor = MemoryMonitor(device)
 
     from src.models.model import HippoModel
-    from src.training.cpu_adamw import create_cpu_adamw_optimizer
+    from src.training._legacy.cpu_adamw import create_cpu_adamw_optimizer
 
     results = {
         'passed': False,
@@ -284,7 +284,7 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, "/home/wlx/HippoLM")
 
-    from configs.base_config import HippoConfig
+    from src.models import HippoConfig
 
     config = HippoConfig()
 

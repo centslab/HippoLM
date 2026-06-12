@@ -1,4 +1,11 @@
-"""Base configuration for HippoLM."""
+"""HippoLM model configuration.
+
+Originally lived in :mod:`configs.base_config`; moved to
+:mod:`src.models.config` in PR-7 (the model code lives under
+:mod:`src.models`, so the config belongs with the model — not
+in the YAML config directory which is reserved for the YAML
+files driving a run).
+"""
 from dataclasses import dataclass
 from typing import Optional
 

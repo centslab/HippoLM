@@ -11,7 +11,7 @@ import torch
 
 sys.path.insert(0, "/home/wlx/HippoLM")
 
-from configs.base_config import HippoConfig
+from src.models import HippoConfig
 from src.models.model import HippoModel
 
 
