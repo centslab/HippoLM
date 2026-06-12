@@ -4,11 +4,20 @@ TP design (assumes a single process spanning N GPUs):
 
   Replicated on every rank
   ------------------------
-  - embed_tokens (full vocab x hidden; the fused lm_head+CE
-    shares this storage via a narrow view along the vocab dim —
-    see :class:`TPFusedLceLoss`).
   - RMSNorm (full hidden)
   - BlockAttnRes (full hidden pseudo-query and norm)
+
+  Vocab-sharded (one rank holds [vocab // world, hidden])
+  --------------------------------------------------------
+  - embed_tokens: column-parallel on the vocab dim. Forward
+    does a masked lookup + all-reduce to produce the full
+    [B, T, H] hidden on every rank (see :class:`TPShardedEmbed`).
+    The lm_head matmul is naturally the column-parallel
+    ``hidden @ local_embed.T`` → [N, vp] sharded logits, which
+    is exactly what the FusedLinearCE consumes. Memory savings
+    at TP=8: ~7 * 508 MB of duplicate embed params and ~7 *
+    2032 MB of duplicate AdamW state = ~17.7 GB across the
+    node (vs the v0.0.0 replicated path).
 
   Column-parallel (output sharded, no all-reduce)
   -----------------------------------------------
@@ -27,21 +36,26 @@ TP design (assumes a single process spanning N GPUs):
     all-reduced to full hidden)
   - KDA o_proj (input = value_dim sharded, output all-reduced)
 
-The forward pass is: embed (replicated) -> 32 layers (attn_norm
--> KDA -> mlp_norm -> SwiGLU -> all-reduce inside down_proj and
-inside o_proj) -> final norm -> fused lm_head+CE (sharded matmul
-+ online chunked softmax) -> scalar loss.
+The forward pass is: sharded embed (masked lookup + all-reduce
+on the partial embeddings) -> 32 layers (attn_norm -> KDA ->
+mlp_norm -> SwiGLU -> all-reduce inside down_proj and inside
+o_proj) -> final norm -> fused lm_head+CE (sharded matmul +
+online chunked softmax) -> scalar loss.
 
-All-reduce happens once per layer (inside the FFN's down_proj,
-once inside KDA's o_proj). No communication is needed at the
-lm_head -> loss boundary because each TP rank consumes its own
-vocab shard; the FusedLinearCE kernel accumulates the LSE locally
-and the loss is reduced inside the module wrapper.
+Inter-rank comm per forward:
+  - Embed lookup: one all-reduce of [B, T, H] = 8 MB.
+  - Per layer: one all-reduce in down_proj and one in o_proj.
+  - lm_head: no inter-rank comm (each rank consumes its own
+    vocab shard; FusedLinearCE accumulates the LSE locally
+    and the loss is reduced inside the module wrapper).
 
-For tied embeddings, the FusedLinearCE's ``weight`` arg is a
-narrow view of the embed, and the resulting ``dw`` gradient is
+For tied embeddings, the FusedLinearCE's ``weight`` arg is the
+local [vp, H] embed shard, and the resulting ``dw`` gradient is
 a fresh tensor that we add back to ``embed_tokens.weight.grad``
-in our custom autograd :class:`_TiedFusedLCEFunction`.
+in our custom autograd :class:`_TiedFusedLCEFunction`. The
+sharded embed lookup's backward computes the dw for the embed
+via ``index_add_`` (no inter-rank comm); PyTorch's autograd
+sums the two dw contributions into ``embed_tokens.weight.grad``.
 """
 from __future__ import annotations
 
@@ -57,12 +71,165 @@ from .tp_layers import (
     get_tp_group,
     get_tp_rank,
     get_tp_world_size,
+    tp_all_reduce_sum,
 )
 from src.models.ops._vendored.fla.modules.fused_cross_entropy import FusedCrossEntropyLoss
 from src.models.ops._vendored.fla.modules.fused_linear_cross_entropy import (
     fused_linear_cross_entropy_forward,
     fused_linear_cross_entropy_backward,
 )
+
+
+# --------------------------------------------------------------------------- #
+# TP sharded embedding (vocab-parallel nn.Embedding)                           #
+# --------------------------------------------------------------------------- #
+class _ShardedEmbedLookup(torch.autograd.Function):
+    """Custom autograd for vocab-sharded embedding lookup.
+
+    Forward (per rank):
+      - weight:           [vp, H]  (the local vocab shard)
+      - input_ids:        [B, T]   (replicated, full vocab indices)
+      - Returns hidden:   [B, T, H] (replicated via all-reduce)
+
+    The forward does a masked lookup ``weight[clamp(input_ids -
+    start, 0, vp - 1)]`` and multiplies by a ``[B, T]`` mask that is
+    True only for tokens belonging to this rank's vocab shard, then
+    all-reduces the result across the TP group. The all-reduce
+    sums the per-rank partial embeddings into the full ``[B, T, H]``
+    hidden on every rank.
+
+    Backward:
+      - dhidden:  [B, T, H] (replicated, flowing in from the layers)
+      - Returns dw: [vp, H] (gradient for the local weight shard)
+
+    The backward does NOT need any inter-rank comm. Each rank
+    receives the full dhidden; it scatters dhidden into the local
+    weight shard using ``index_add_`` (the per-row mask is already
+    zero for off-rank rows, so the scatter is a no-op for them).
+    """
+
+    @staticmethod
+    def forward(ctx, weight, input_ids, start, vp):
+        # ``input_ids`` lives on this rank's device; ``weight`` is
+        # the local [vp, H] shard. Both are on the same device (we
+        # constructed the embed with .to(device=d)).
+        local_ids = input_ids - start                       # [B, T]
+        mask = (local_ids >= 0) & (local_ids < vp)          # [B, T] bool
+        local_ids_safe = local_ids.clamp(0, vp - 1)
+        local_emb = weight[local_ids_safe]                  # [B, T, H]
+        # Zero out off-rank rows so the all-reduce sums to the
+        # correct value (only the owning rank contributes
+        # non-zero to each row of the sum).
+        local_emb = local_emb * mask.unsqueeze(-1).to(local_emb.dtype)
+        hidden = tp_all_reduce_sum(local_emb)               # [B, T, H]
+        ctx.save_for_backward(input_ids, local_ids_safe, mask)
+        ctx.start = start
+        ctx.vp = vp
+        return hidden
+
+    @staticmethod
+    def backward(ctx, dhidden):
+        input_ids, local_ids_safe, mask = ctx.saved_tensors
+        # dhidden: [B, T, H] on every rank (it flows backward from
+        # the layers, which see the replicated full hidden).
+        B, T, H = dhidden.shape
+        flat_dh = dhidden.reshape(B * T, H)                 # [B*T, H]
+        flat_mask = mask.reshape(B * T)                     # [B*T]
+        flat_ids = local_ids_safe.reshape(B * T)            # [B*T]
+        # Zero out dhidden for off-rank rows. The index_add_ would
+        # otherwise write those rows to the clamped index (0 or
+        # vp-1), corrupting the local weight gradient.
+        masked = flat_dh * flat_mask.unsqueeze(-1).to(flat_dh.dtype)
+        dw = masked.new_zeros(ctx.vp, H)                    # [vp, H]
+        # index_add_ accumulates: dw[flat_ids[i], :] += masked[i, :]
+        # for each i. Multiple (b, t) pairs with the same token
+        # naturally sum (correct gradient for a token that appears
+        # multiple times in the sequence).
+        dw.index_add_(0, flat_ids, masked)
+        return dw, None, None, None
+
+
+class TPShardedEmbed(nn.Embedding):
+    """``nn.Embedding`` with the vocab dim sharded across the TP group.
+
+    Memory characteristics (vs. the replicated v0.0.0 embed)
+    --------------------------------------------------------
+
+    Replicated (V=248320, H=1024, FP16):
+      * embed param:  V * H * 2 B = 508 MB per device, duplicated
+        across world devices (waste = (world - 1) * 508 MB).
+      * AdamW state:  V * H * 2 * 2 B = 2032 MB per device
+        (BF16 m + BF16 v on the embed's optimizer group).
+
+    Sharded (world=8, vp = V / 8 = 31040):
+      * embed param:  vp * H * 2 B = 64 MB per device (no
+        duplication).
+      * AdamW state:  vp * H * 2 * 2 B = 256 MB per device.
+      * Per-forward comm: one all-reduce of [B, T, H] = 8 MB
+        (the masked partial embeddings are summed to the full
+        hidden).
+
+    Net saving at TP=8: 7 * 508 + 7 * 256 = 5352 MB across the
+    node, or 669 MB per device.
+
+    Forward (per rank)
+    ------------------
+    1. Masked lookup: ``weight[clamp(input_ids - start, 0, vp-1)]``
+       multiplied by a [B, T] bool mask (True only for tokens in
+       this rank's vocab shard).
+    2. ``tp_all_reduce_sum`` of the masked [B, T, H] partial
+       embeddings. The result is the full [B, T, H] hidden, on
+       every rank.
+
+    Backward
+    --------
+    No inter-rank comm. Each rank scatters dhidden into the local
+    weight shard via ``index_add_``; off-rank rows have mask=False
+    so they contribute zero.
+
+    Interaction with tied lm_head
+    -----------------------------
+    The matmul ``hidden @ weight.T`` is naturally a column-parallel
+    matmul on the local [vp, H] shard: the result is [N, vp]
+    sharded logits, which is exactly what :class:`TPFusedLceLoss`
+    expects. The FusedLinearCE's ``dw`` is a [vp, H] gradient that
+    goes into ``weight.grad`` (the local shard's grad) via the
+    custom autograd in :class:`_TiedFusedLCEFunction`. PyTorch's
+    autograd sums the FusedLinearCE dw and the lookup backward dw
+    (both are gradients for the same parameter from different
+    paths) into ``weight.grad`` at the end of backward.
+    """
+
+    def __init__(self, vocab_size: int, hidden_size: int, *args, **kwargs) -> None:
+        # Save the LOGICAL vocab size for ``forward`` to compute
+        # the per-token rank routing. The parent's
+        # ``num_embeddings`` is the local shard size.
+        self.logical_vocab_size = vocab_size
+        self.world = get_tp_world_size()
+        assert vocab_size % self.world == 0, (
+            f"vocab_size={vocab_size} not divisible by tp_world={self.world}"
+        )
+        self.vocab_per_partition = vocab_size // self.world
+        self.rank = get_tp_rank()
+        self._start = self.rank * self.vocab_per_partition
+        # Initialize the parent ``nn.Embedding`` with the LOCAL
+        # shard size. The weight has shape [vp, H] and lives on
+        # this rank's device.
+        super().__init__(self.vocab_per_partition, hidden_size, *args, **kwargs)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return _ShardedEmbedLookup.apply(
+            self.weight, input_ids, self._start, self.vocab_per_partition
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"logical_vocab_size={self.logical_vocab_size}, "
+            f"vocab_per_partition={self.vocab_per_partition}, "
+            f"hidden_size={self.embedding_dim}, "
+            f"tp_world={self.world}, tp_rank={self.rank}, "
+            f"shard_start={self._start}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -272,6 +439,16 @@ class TPFusedLceLoss(nn.Module):
         num_chunks: int = 8,
         device=None,
         dtype=None,
+        # When the embed is already sharded (see :class:`TPShardedEmbed`),
+        # ``embed_tokens.weight`` is the local [vp, H] shard and
+        # ``start_offset`` is 0 (no logical-vocab offset within the
+        # local weight). When the embed is replicated (legacy v0.0.0
+        # path), ``start_offset = rank * vocab_per_partition`` so
+        # the FusedLinearCE matmul sees the right slice of the full
+        # [V, H] weight. The default below is the legacy behavior;
+        # the sharded path overrides both.
+        start_offset: int | None = None,
+        local_vocab_size: int | None = None,
     ) -> None:
         super().__init__()
         self.embed_tokens = embed_tokens
@@ -283,15 +460,35 @@ class TPFusedLceLoss(nn.Module):
         )
         self.vocab_per_partition = vocab_size // self.world
         self.rank = get_tp_rank()
-        # Precompute the narrow slice indices so ``forward`` is a
-        # single ``.narrow()`` call with no Python-side indexing.
-        self._start = self.rank * self.vocab_per_partition
+        # ``_start`` is the offset into the LOGICAL vocab space for
+        # this rank's slice. It is used in two places:
+        #   1. The narrow of ``embed_tokens.weight`` for the matmul
+        #      (in the replicated case, this is a real slice; in
+        #      the sharded case, the narrow is identity and the
+        #      offset is 0).
+        #   2. The ``ctx.start`` passed to the custom autograd, so
+        #      the FusedLinearCE dw is added to the correct slice
+        #      of ``embed_tokens.weight.grad``.
+        if start_offset is None:
+            # Legacy replicated-embed path: this rank's slice
+            # starts at ``rank * vp`` in the full [V, H] weight.
+            self._start = self.rank * self.vocab_per_partition
+        else:
+            self._start = start_offset
+        # ``_local_vocab_size`` is the size of this rank's slice
+        # of the weight. In the sharded case, the local weight
+        # already has shape [vp, H] so this is just ``vp``. In
+        # the replicated case, it's also ``vp`` (the slice length).
+        if local_vocab_size is None:
+            self._local_vocab_size = self.vocab_per_partition
+        else:
+            self._local_vocab_size = local_vocab_size
         self.ignore_index = ignore_index
         self.num_chunks = num_chunks
 
         if bias:
             self.bias = nn.Parameter(
-                torch.empty(self.vocab_per_partition, device=device, dtype=dtype)
+                torch.empty(self._local_vocab_size, device=device, dtype=dtype)
             )
             nn.init.zeros_(self.bias)
         else:
@@ -302,10 +499,14 @@ class TPFusedLceLoss(nn.Module):
         # The slice is a view, but FusedLinearCE doesn't write
         # back into the weight (it allocates its own dw), so the
         # view only serves as a read-only matmul operand.
-        local_w = self.embed_tokens.weight.narrow(0, self._start, self.vocab_per_partition)
+        #
+        # In the sharded case (``embed_tokens`` is a
+        # :class:`TPShardedEmbed`), the weight is already the
+        # local [vp, H] shard and the narrow is identity.
+        local_w = self.embed_tokens.weight.narrow(0, self._start, self._local_vocab_size)
         return _TiedFusedLCEFunction.apply(
             hidden, target, local_w, self.embed_tokens.weight,
-            self._start, self.vocab_per_partition,
+            self._start, self._local_vocab_size,
             self.ignore_index, self.num_chunks,
         )
 
@@ -703,8 +904,18 @@ class TPHippoModel(nn.Module):
             # Cast the embedding to the training dtype at construction
             # time. Otherwise ``.to(device=...)`` only moves and
             # leaves the weight at FP32, defeating the FP16 path.
+            #
+            # The embed is **vocab-sharded** across the TP group:
+            # each rank holds ``[vocab_size // world, hidden_size]``
+            # rows of the logical embed. The forward does a masked
+            # lookup + all-reduce to produce the full [B, T, H]
+            # hidden on every rank (see :class:`TPShardedEmbed`).
+            # Memory savings at TP=8, V=248320, H=1024, FP16:
+            # 7 * 508 MB of duplicate embed params + 7 * 2032 MB
+            # of duplicate AdamW state = ~17.7 GB saved across the
+            # node.
             device_mods = {
-                "embed_tokens": nn.Embedding(
+                "embed_tokens": TPShardedEmbed(
                     config.vocab_size, config.hidden_size,
                 ).to(device=d, dtype=dtype),
                 "norm": RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -765,10 +976,22 @@ class TPHippoModel(nn.Module):
         # ≈ 32 MB at our config (vs ~254 MB with the fla default
         # of num_chunks=8). See :class:`TPFusedLceLoss` for the
         # full memory analysis.
+        #
+        # With the vocab-sharded embed (see :class:`TPShardedEmbed`),
+        # the FusedLinearCE matmul is naturally column-parallel:
+        # ``hidden @ local_embed.T`` produces [N, vp] sharded
+        # logits, and the FusedLinearCE's dw is the gradient for
+        # the local [vp, H] weight shard. We pass ``start_offset=0``
+        # and ``local_vocab_size=vp`` so the custom autograd adds
+        # the dw to the full local grad (not a slice of a
+        # replicated full [V, H] grad, which would be the legacy
+        # behavior).
         self.fused_lm_ce_per_device: dict[int, TPFusedLceLoss] = {}
         for d in self.devices:
+            local_embed = self.replicated_per_device[d]["embed_tokens"]
+            local_vp = local_embed.weight.size(0)
             flce = TPFusedLceLoss(
-                self.replicated_per_device[d]["embed_tokens"],
+                local_embed,
                 config.hidden_size, config.vocab_size,
                 bias=config.use_bias,
                 ignore_index=-100,
@@ -777,6 +1000,12 @@ class TPHippoModel(nn.Module):
                 # 64 × 248320 × 2 B = ~32 MB at V=248k, H=1k.
                 num_chunks=64,
                 device=d, dtype=dtype,
+                # Vocab-sharded embed: the local weight is the
+                # full [vp, H] shard, no narrow needed for the
+                # matmul, and the FusedLinearCE dw goes into the
+                # full local grad.
+                start_offset=0,
+                local_vocab_size=local_vp,
             )
             self.fused_lm_ce_per_device[d] = flce
 
@@ -842,11 +1071,27 @@ class TPHippoModel(nn.Module):
         same random init (otherwise each device's independent
         ``xavier_uniform_`` would diverge, which doesn't matter
         for OOM testing but does matter for correctness).
+
+        The vocab-sharded :class:`TPShardedEmbed` is explicitly
+        skipped: each rank holds a different vocab shard, and
+        broadcasting ``src_device``'s shard to every other rank
+        would corrupt the per-rank shards (every rank would end
+        up with the same vocab rows). The sharded embed is
+        intentionally initialised independently on each device
+        (each rank gets a different slice of the random init).
         """
-        # 1) Top-level replicated modules (embed_tokens, norm,
-        # attn_res). AttnRes is shared across all boundaries so
-        # the single module is replicated exactly once per device.
+        # 1) Top-level replicated modules (norm, attn_res, and
+        # embed_tokens if it happens to be a plain nn.Embedding
+        # rather than a TPShardedEmbed). AttnRes is shared across
+        # all boundaries so the single module is replicated
+        # exactly once per device.
         for mname, src_mod in self.replicated_per_device[src_device].items():
+            # Skip the sharded embed: each rank holds its own
+            # [vp, H] shard and a broadcast from src_device would
+            # collapse the shards together (every rank would
+            # receive the same vocab rows).
+            if isinstance(src_mod, TPShardedEmbed):
+                continue
             src_params = dict(src_mod.named_parameters(recurse=True))
             for dst_device, dst_mods in self.replicated_per_device.items():
                 if dst_device == src_device:
