@@ -6,6 +6,7 @@ the scale mode. The yml schema in :file:`configs/base.yml` is::
     precision:
       model_weights: { dtype: fp16 }
       gradients:     { dtype: bf16 }
+      activations:   { dtype: fp16 }
       muon_momentum: { dtype: int8, scale: per-channel }
       adamw_m:       { dtype: bf16 }
       adamw_v:       { dtype: bf16 }
@@ -13,13 +14,17 @@ the scale mode. The yml schema in :file:`configs/base.yml` is::
 The keys under each entry:
 
   - ``dtype``: one of ``fp32``, ``fp16``, ``bf16``, ``int8``, ``int4``.
+    For ``activations``, only ``fp32``, ``fp16``, ``bf16`` are
+    accepted — integer dtypes are rejected because activations
+    are continuous-valued and autocast does not consume an
+    int dtype anyway.
   - ``scale``: required for ``int8`` / ``int4``; one of ``no``,
     ``tensor``, ``per-channel``, ``block``. Ignored for floating
     dtypes (always stored as ``None``).
   - ``block_size``: required when ``scale == 'block'``; ignored
     otherwise.
 
-The five tensor classes (one :class:`TensorPrecision` each):
+The six tensor classes (one :class:`TensorPrecision` each):
 
   - ``model_weights``  — the GPU-side trainable params (FFN,
     KDA, AttnRes, embed, lm_head, RMSNorm). FP16 is the
@@ -29,6 +34,13 @@ The five tensor classes (one :class:`TensorPrecision` each):
     (``s.accum``) into which the GPU ``.grad`` is DMA'd. BF16
     is the default (FP32-like exponent range, no overflow on
     the transfer).
+  - ``activations``    — the dtype used for the per-layer
+    forward activations under ``torch.amp.autocast``. FP16 is
+    the default (matches the canonical model_weights setting;
+    the autocast layer internally promotes matmul/conv to the
+    activation dtype on tensor cores). Allowed values: ``fp32``
+    (autocast is disabled — pure FP32 forward), ``fp16``,
+    ``bf16``. Integer dtypes are rejected.
   - ``muon_momentum``  — Muon's SGD momentum (the buffer that
     feeds Newton-Schulz). int8 + per-channel is the default
     (halves CPU RAM vs FP16). int4 further halves but loses
@@ -41,7 +53,7 @@ The five tensor classes (one :class:`TensorPrecision` each):
     exponent would not).
 
 Construction: prefer :meth:`PrecisionConfig.from_dict` for yml
-loading. Direct dataclass construction with all 5 fields is
+loading. Direct dataclass construction with all 6 fields is
 also valid (used by tests and by the CLI default path).
 """
 from __future__ import annotations
@@ -175,8 +187,8 @@ class PrecisionConfig:
     """Per-tensor-class precision for the whole training run.
 
     Defaults match the canonical yml in :file:`configs/base.yml`:
-    FP16 weights, BF16 gradients, int8 + per-channel Muon
-    momentum, BF16 AdamW m / v.
+    FP16 weights, BF16 gradients, FP16 activations (autocast),
+    int8 + per-channel Muon momentum, BF16 AdamW m / v.
 
     Use :meth:`from_dict` to construct from a yml payload
     (e.g. the value of the ``precision:`` key). Direct
@@ -190,6 +202,9 @@ class PrecisionConfig:
     gradients: TensorPrecision = field(
         default_factory=lambda: TensorPrecision(dtype=DType.BF16)
     )
+    activations: TensorPrecision = field(
+        default_factory=lambda: TensorPrecision(dtype=DType.FP16)
+    )
     muon_momentum: TensorPrecision = field(
         default_factory=lambda: TensorPrecision(
             dtype=DType.INT8, scale=ScaleMode.PER_CHANNEL,
@@ -201,6 +216,43 @@ class PrecisionConfig:
     adamw_v: TensorPrecision = field(
         default_factory=lambda: TensorPrecision(dtype=DType.BF16)
     )
+
+    def __post_init__(self) -> None:
+        # Activations are continuous-valued and consumed by
+        # ``torch.amp.autocast``, which only accepts fp16 / bf16
+        # (fp32 is implemented by *disabling* autocast). Reject
+        # integer dtypes here so a misconfigured yml fails at
+        # config-parse time rather than at the first forward
+        # pass.
+        if self.activations.dtype.is_integer:
+            raise ValueError(
+                f"precision.activations: dtype={self.activations.dtype.value}"
+                f" is not allowed (activations must be a floating dtype;"
+                f" use one of fp32, fp16, bf16)."
+            )
+
+    @property
+    def autocast_enabled(self) -> bool:
+        """Whether autocast should be enabled for this config.
+
+        FP16 / BF16 activations: autocast on (tensor-core matmul).
+        FP32 activations: autocast off (pure FP32 forward; enabling
+        autocast with ``dtype=torch.float32`` is a no-op, so we
+        skip the autocast context entirely).
+        """
+        return self.activations.dtype != DType.FP32
+
+    @property
+    def autocast_dtype(self) -> "torch.dtype":
+        """The ``dtype`` kwarg to pass to ``torch.amp.autocast``.
+
+        Returns the float16/bfloat16 torch dtype derived from
+        :attr:`activations`. For FP32 activations the returned
+        dtype is unused (autocast is disabled); we still return
+        a sensible value (``torch.float32``) so a caller that
+        ignores :attr:`autocast_enabled` does not crash.
+        """
+        return self.activations.dtype.to_torch()
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "PrecisionConfig":
@@ -216,8 +268,8 @@ class PrecisionConfig:
             return cls()
         kwargs: Dict[str, Any] = {}
         for field_name in (
-            "model_weights", "gradients", "muon_momentum",
-            "adamw_m", "adamw_v",
+            "model_weights", "gradients", "activations",
+            "muon_momentum", "adamw_m", "adamw_v",
         ):
             if field_name in d and isinstance(d[field_name], dict):
                 tp_dict = d[field_name]
@@ -234,6 +286,7 @@ class PrecisionConfig:
         return {
             "model_weights": self.model_weights.to_dict(),
             "gradients": self.gradients.to_dict(),
+            "activations": self.activations.to_dict(),
             "muon_momentum": self.muon_momentum.to_dict(),
             "adamw_m": self.adamw_m.to_dict(),
             "adamw_v": self.adamw_v.to_dict(),

@@ -32,7 +32,7 @@ rms_norm_eps: 0.000001
 epochs: 1
 max_steps: 1000
 batch_size: 4
-seq_len: 1024
+seq_len: 4096
 learning_rate: 0.03
 weight_decay: 0.01
 gradient_accumulation_steps: 64
@@ -52,9 +52,13 @@ seed: 42                 # RNG seed for replicated-param init on each device.
 #   tensor             - one scale per tensor
 #   per-channel        - one scale per output channel (per-row for 2D weights)
 #   block              - one scale per block of `block_size` consecutive elements
+# ``activations`` only accepts the floating dtypes (fp32/fp16/bf16).
+# fp16 / bf16 enable ``torch.amp.autocast`` with that dtype; fp32
+# disables autocast and runs a pure FP32 forward.
 precision:
   model_weights: { dtype: fp16 }
   gradients:     { dtype: bf16 }
+  activations:   { dtype: fp16 }
   muon_momentum: { dtype: int8,  scale: per-channel }
   adamw_m:       { dtype: bf16 }
   adamw_v:       { dtype: bf16 }

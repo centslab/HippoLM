@@ -176,9 +176,15 @@ def build_parser() -> argparse.ArgumentParser:
     #     precision:
     #       model_weights: { dtype: fp16 }
     #       gradients:     { dtype: bf16 }
+    #       activations:   { dtype: fp16 }    # fp32/fp16/bf16 only
     #       muon_momentum: { dtype: int8, scale: per-channel }
     #       adamw_m:       { dtype: bf16 }
     #       adamw_v:       { dtype: bf16 }
+    #
+    # ``activations`` controls ``torch.amp.autocast``: fp16 / bf16
+    # enable autocast with that dtype (tensor-core matmul); fp32
+    # disables autocast and runs a pure FP32 forward. Integer
+    # dtypes are rejected by :class:`PrecisionConfig`.
     #
     # argparse has no native nested-dict type, so the precision
     # config flows through as a raw ``dict`` (set via

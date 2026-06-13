@@ -319,9 +319,11 @@ def _setup_worker(
         )
 
     # ---- GradScaler (disabled) ----
-    # V100 has FP16 tensor cores; the model runs in FP16. We
-    # disable the scaler (PyTorch's GradScaler refuses to unscale
-    # FP16 grads in this version) and run plain FP16 backward.
+    # The forward runs at the activation dtype configured in
+    # ``precision.activations`` (fp16 by default, which matches
+    # the canonical FP16 weights). We disable the scaler
+    # (PyTorch's GradScaler refuses to unscale FP16 grads in this
+    # version) and run plain backward in the configured dtype.
     # See the long comment in scripts/train.py for the history.
     scaler = torch.amp.GradScaler("cuda", enabled=False)
 
@@ -367,6 +369,7 @@ def _setup_worker(
         "run_dir": run_dir,
         "logger": logger,
         "config": config,
+        "precision": precision,
         "dataloader": dataloader,
         "prefetcher": prefetcher,
         "model": model,
@@ -396,6 +399,14 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
     scaler = ctx["scaler"]
     muon_opt = ctx["muon_opt"]
     adamw_opt = ctx["adamw_opt"]
+    # Activation precision comes from the precision config:
+    # fp16 / bf16 → ``torch.amp.autocast`` with that dtype
+    # (tensor-core matmul); fp32 → autocast disabled (pure FP32
+    # forward). Resolved once per worker because autocast is a
+    # hot-path and the dtype never changes after setup.
+    precision = ctx["precision"]
+    autocast_enabled = precision.autocast_enabled
+    autocast_dtype = precision.autocast_dtype
 
     global_step = 0
     accumulated_loss = 0.0
@@ -425,8 +436,14 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 input_ids = batch["input_ids"].to(gpus[rank], non_blocking=True)
                 labels = batch["labels"].to(gpus[rank], non_blocking=True)
 
+                # Autocast is driven by ``precision.activations``:
+                # fp16 / bf16 enable autocast with that dtype; fp32
+                # disables it (a no-op ``enabled=False`` context is
+                # still entered so the surrounding code is uniform).
                 with torch.amp.autocast(
-                    device_type="cuda", dtype=torch.float16,
+                    device_type="cuda",
+                    dtype=autocast_dtype,
+                    enabled=autocast_enabled,
                 ):
                     outputs = model(input_ids, labels=labels)
                     loss = outputs["loss"]

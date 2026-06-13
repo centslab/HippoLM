@@ -127,6 +127,103 @@ def test_precision_config_float_clears_scale_silently():
 
 
 # --------------------------------------------------------------------------- #
+# activations (autocast dtype).                                               #
+# --------------------------------------------------------------------------- #
+def test_precision_config_default_activations_is_fp16():
+    """The dataclass default for ``activations`` is FP16 — matches
+    the canonical yml and the historical hardcoded autocast dtype.
+    """
+    p = PrecisionConfig()
+    assert p.activations.dtype == DType.FP16
+
+
+def test_precision_config_activations_fp16_enables_autocast():
+    """fp16 activations → autocast on, dtype=torch.float16."""
+    p = PrecisionConfig(activations=TensorPrecision(dtype=DType.FP16))
+    assert p.autocast_enabled is True
+    assert p.autocast_dtype == torch.float16
+
+
+def test_precision_config_activations_bf16_enables_autocast():
+    """bf16 activations → autocast on, dtype=torch.bfloat16."""
+    p = PrecisionConfig(activations=TensorPrecision(dtype=DType.BF16))
+    assert p.autocast_enabled is True
+    assert p.autocast_dtype == torch.bfloat16
+
+
+def test_precision_config_activations_fp32_disables_autocast():
+    """fp32 activations → autocast off. The dtype returned by
+    :attr:`autocast_dtype` is still FP32 (so a caller that ignores
+    ``autocast_enabled`` does not crash) but the autocast context
+    is a no-op.
+    """
+    p = PrecisionConfig(activations=TensorPrecision(dtype=DType.FP32))
+    assert p.autocast_enabled is False
+    assert p.autocast_dtype == torch.float32
+
+
+def test_precision_config_activations_rejects_int8():
+    """``activations`` only accepts floating dtypes — integer
+    dtypes make no semantic sense (autocast does not consume an
+    int dtype) and must fail at config-parse time rather than at
+    the first forward pass.
+    """
+    try:
+        PrecisionConfig(activations=TensorPrecision(
+            dtype=DType.INT8, scale=ScaleMode.NO,
+        ))
+    except ValueError as e:
+        assert "activations" in str(e) and "not allowed" in str(e)
+    else:
+        raise AssertionError(
+            "PrecisionConfig with int8 activations should have raised"
+        )
+
+
+def test_precision_config_activations_rejects_int4():
+    """Same as the int8 case — integer dtypes are never valid for
+    activations.
+    """
+    try:
+        PrecisionConfig(activations=TensorPrecision(
+            dtype=DType.INT4, scale=ScaleMode.PER_CHANNEL,
+        ))
+    except ValueError as e:
+        assert "activations" in str(e) and "not allowed" in str(e)
+    else:
+        raise AssertionError(
+            "PrecisionConfig with int4 activations should have raised"
+        )
+
+
+def test_precision_config_from_dict_parses_activations():
+    """The yml loader pulls ``activations`` through to the typed
+    config so the training loop can read it.
+    """
+    p = PrecisionConfig.from_dict({
+        "activations": {"dtype": "bf16"},
+    })
+    assert p.activations.dtype == DType.BF16
+    assert p.autocast_enabled is True
+    assert p.autocast_dtype == torch.bfloat16
+
+
+def test_precision_config_to_dict_round_trips_activations():
+    """``to_dict`` includes the activations entry so a logged /
+    serialized config can be reloaded losslessly.
+    """
+    p = PrecisionConfig.from_dict({
+        "activations": {"dtype": "fp32"},
+    })
+    d = p.to_dict()
+    assert d["activations"] == {"dtype": "fp32"}
+    # Round-trip: the dict should reload to the same config.
+    p2 = PrecisionConfig.from_dict(d)
+    assert p2.activations.dtype == DType.FP32
+    assert p2.autocast_enabled is False
+
+
+# --------------------------------------------------------------------------- #
 # CPUAdamW storage dtypes.                                                    #
 # --------------------------------------------------------------------------- #
 def _small_linear() -> nn.Linear:
