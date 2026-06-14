@@ -82,16 +82,18 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
     total_norm = local_sq.sqrt().item()
-    if total_norm > max_norm > 0.0:
+    # Clip only when the norm exceeds the cap.  An earlier revision
+    # applied a second unconditional ``s.accum.mul_(max_norm / (total_norm
+    # + eps))`` below this guard, which had two bugs:
+    #   (a) when total_norm < max_norm it AMPLIFIED small grads
+    #       (``max_norm / total_norm > 1``), wrecking training stability;
+    #   (b) when total_norm > max_norm the clip was applied twice
+    #       (quadratic clip instead of linear).
+    if max_norm > 0.0 and total_norm > max_norm:
         clip_coef = max_norm / (total_norm + 1e-6)
         for opt in opts:
             for s in opt.state.values():
                 s.accum.mul_(clip_coef)
-    if max_norm > 0.0:
-        scale = max_norm / (total_norm + 1e-6)
-        for opt in opts:
-            for s in opt.state.values():
-                s.accum.mul_(scale)
     return total_norm
 
 
