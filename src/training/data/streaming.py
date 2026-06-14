@@ -93,15 +93,26 @@ class StreamingDataset(IterableDataset):
         for example in self._ds:
             text = self._example_to_text(example)
             if text:
-                tokens = self.tokenizer(
+                # ``return_tensors=None`` returns a 1D list of
+                # token ids directly; the legacy code passed
+                # ``return_tensors="pt"`` and then ``.squeeze(0)``'d
+                # the resulting ``[1, T]`` tensor back to 1D — pure
+                # overhead. The result is a Python list, which
+                # :func:`ffd_pack_samples` (and any consumer that
+                # doesn't need a tensor) can use directly.
+                encoded = self.tokenizer(
                     text,
                     max_length=self.max_seq_len,
                     truncation=True,
-                    return_tensors="pt",
+                    return_tensors=None,
                 )
-                input_ids = tokens["input_ids"].squeeze(0)
-                if len(input_ids) >= 2:
-                    yield {"input_ids": input_ids, "labels": input_ids.clone()}
+                # Qwen tokenizer returns a list under "input_ids"
+                # (or a BatchEncoding with .input_ids as a list).
+                ids = encoded["input_ids"] if isinstance(
+                    encoded, dict,
+                ) else encoded.input_ids
+                if len(ids) >= 2:
+                    yield {"input_ids": ids, "labels": list(ids)}
 
     def __len__(self) -> int:
         # Streaming: arbitrary large number for any caller that needs it.
