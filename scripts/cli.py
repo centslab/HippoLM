@@ -57,12 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_heads", type=int, default=16)
     p.add_argument("--head_dim", type=int, default=64)
     p.add_argument("--expand_v", type=float, default=1.0)
-    p.add_argument("--kda_mode", type=str, default="chunk",
+    p.add_argument("--gdn2_mode", type=str, default="chunk",
                    choices=["chunk", "fused_recurrent"])
     p.add_argument("--use_short_conv", type=bool, default=False)
     p.add_argument("--allow_neg_eigval", type=bool, default=False)
-    p.add_argument("--safe_gate", type=bool, default=False)
-    p.add_argument("--lower_bound", type=float, default=None)
     p.add_argument("--conv_size", type=int, default=4)
     p.add_argument("--conv_bias", type=bool, default=False)
     p.add_argument("--num_layers", type=int, default=32)

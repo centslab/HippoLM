@@ -7,7 +7,6 @@ in the YAML config directory which is reserved for the YAML
 files driving a run).
 """
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -20,15 +19,14 @@ class HippoConfig:
     tie_word_embeddings: bool = True
     use_bias: bool = False
 
-    # KDA (Kimi Delta Attention)
+    # GDN2 (Gated DeltaNet 2): KDA's scalar beta is replaced with two
+    # channel-wise gates (b on the key axis, w on the value axis).
     num_heads: int = 16
     head_dim: int = 64
     expand_v: float = 1.0  # Value dimension expansion factor
-    kda_mode: str = "chunk"  # "chunk" for training, "fused_recurrent" for inference
-    use_short_conv: bool = False  # No local convolution (global KDA, NoPE)
+    gdn2_mode: str = "chunk"  # "chunk" for training, "fused_recurrent" for inference
+    use_short_conv: bool = False  # No local convolution (global GDN2, NoPE)
     allow_neg_eigval: bool = False
-    safe_gate: bool = False
-    lower_bound: Optional[float] = None  # Required when safe_gate=True
     conv_size: int = 4
     conv_bias: bool = False
 
@@ -49,7 +47,7 @@ class HippoConfig:
         # Derived
         self.block_size: int = self.num_layers // self.num_blocks
         self.kv_channels: int = self.num_heads * self.head_dim
-        # Validate KDA mode
-        assert self.kda_mode in ("chunk", "fused_recurrent"), (
-            f"kda_mode must be 'chunk' or 'fused_recurrent', got {self.kda_mode!r}"
+        # Validate GDN2 mode
+        assert self.gdn2_mode in ("chunk", "fused_recurrent"), (
+            f"gdn2_mode must be 'chunk' or 'fused_recurrent', got {self.gdn2_mode!r}"
         )

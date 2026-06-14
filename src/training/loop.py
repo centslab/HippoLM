@@ -184,11 +184,9 @@ def _setup_worker(
         num_heads=args.num_heads,
         head_dim=args.head_dim,
         expand_v=args.expand_v,
-        kda_mode=args.kda_mode,
+        gdn2_mode=args.gdn2_mode,
         use_short_conv=args.use_short_conv,
         allow_neg_eigval=args.allow_neg_eigval,
-        safe_gate=args.safe_gate,
-        lower_bound=args.lower_bound,
         conv_size=args.conv_size,
         conv_bias=args.conv_bias,
         num_layers=args.num_layers,
@@ -574,8 +572,8 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # the column with the largest value to localize the
                 # slow phase:
                 #   data_ms  = queue wait + .to()  (data path slow?)
-                #   fwd_ms   = forward  (model/KDA slow?)
-                #   bwd_ms   = backward (model/KDA slow?)
+                #   fwd_ms   = forward  (model/GDN2 slow?)
+                #   bwd_ms   = backward (model/GDN2 slow?)
                 #   sync_ms  = D2H wait + CPU add (DMA/CPU add slow?)
                 mb_timing = getattr(args, "mb_timing", 0)
                 if (

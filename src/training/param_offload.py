@@ -1032,7 +1032,7 @@ def build_param_groups(
 
     Standard Muon routing:
         - 1D params (RMSNorm.weight, BlockAttnRes.query,
-          KDA A_log/dt_bias with ``_no_weight_decay``): AdamW
+          GDN2 A_log/dt_bias with ``_no_weight_decay``): AdamW
         - 2D Linear weights: Muon
         - Embedding + lm_head: AdamW (per user spec)
 
@@ -1055,7 +1055,7 @@ def build_param_groups(
         # caught by the ``replicated.`` prefix here.
         if name.startswith("lm_head.") or name.startswith("replicated."):
             adamw_params.append(p)
-        # KDA short-conv weights are 3D (nn.Conv1d: [D, 1, W]).
+        # GDN2 short-conv weights are 3D (nn.Conv1d: [D, 1, W]).
         # CPUMuon._newton_schulz does ``g.t()`` which only works on
         # 2-D matrices, so we must route them to AdamW. These params
         # are tiny (393K total) so the precision/regularization

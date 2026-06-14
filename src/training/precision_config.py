@@ -27,7 +27,7 @@ The keys under each entry:
 The six tensor classes (one :class:`TensorPrecision` each):
 
   - ``model_weights``  — the GPU-side trainable params (FFN,
-    KDA, AttnRes, embed, lm_head, RMSNorm). FP16 is the
+    GDN2, AttnRes, embed, lm_head, RMSNorm). FP16 is the
     default (V100 has FP16 tensor cores; BF16 is also fine on
     5060Ti / H100).
   - ``gradients``      — the CPU pinned accumulator

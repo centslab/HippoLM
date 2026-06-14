@@ -92,7 +92,7 @@ def pin_nccl_environment() -> None:
     GPUs).
 
     Also disable the NCCL heartbeat watchdog: the first step
-    compiles many Triton kernels (chunk_kda fwd/bwd × 32 layers,
+    compiles many Triton kernels (chunk_gdn2 fwd/bwd × 32 layers,
     fused CE, fused RMSNormGated) which can hold the GIL for
     >480s, making the watchdog falsely report a hang and abort
     the job. We additionally widen the heartbeat timeout

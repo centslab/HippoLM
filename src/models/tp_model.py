@@ -27,17 +27,17 @@ TP design (assumes a single process spanning N GPUs):
     ``[B, T, vocab // world]`` sharded logits tensor is never
     materialised (replaces the old TPLmHead path which did the
     matmul and then ``.contiguous()``'d a copy for the CE kernel).
-  - KDA q/k/v projections (output = key_dim / value_dim, sharded
+  - GDN2 q/k/v projections (output = key_dim / value_dim, sharded
     along the head dim)
 
   Row-parallel (input sharded, all-reduce output)
   -----------------------------------------------
   - SwiGLU down_proj (input = intermediate, sharded; output
     all-reduced to full hidden)
-  - KDA o_proj (input = value_dim sharded, output all-reduced)
+  - GDN2 o_proj (input = value_dim sharded, output all-reduced)
 
 The forward pass is: sharded embed (masked lookup + all-reduce
-on the partial embeddings) -> 32 layers (attn_norm -> KDA ->
+on the partial embeddings) -> 32 layers (attn_norm -> GDN2 ->
 mlp_norm -> SwiGLU -> all-reduce inside down_proj and inside
 o_proj) -> final norm -> fused lm_head+CE (sharded matmul +
 online chunked softmax) -> scalar loss.
@@ -591,44 +591,55 @@ class TPLmHead(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# TP Kimi Delta Attention                                                     #
+# TP Gated DeltaNet 2 (GDN2)                                                  #
 # --------------------------------------------------------------------------- #
-class TPKDA(nn.Module):
-    """TP-sharded Kimi Delta Attention.
+class TPGDN2(nn.Module):
+    """TP-sharded Gated DeltaNet 2.
+
+    Direct successor to the (now removed) TPKDA class. The only
+    structural change versus the KDA version is that the scalar
+    beta gate is split into two channel-wise gates (``b`` on the
+    key axis, ``w`` on the value axis) and that the kernel call
+    passes ``b`` and ``w`` separately to :func:`chunk_gdn2`.
 
     Per-rank layout (world = TP group size):
 
-    - ``q_proj`` / ``k_proj``: column-parallel on ``key_dim``.
-      Each rank: ``[key_dim // world, hidden_size]``.
-    - ``v_proj``: column-parallel on ``value_dim``.
-      Each rank: ``[value_dim // world, hidden_size]``.
+    - ``qkv_proj``: column-parallel on ``2*key_dim + value_dim``.
+      Each rank: ``[2*key_dim + value_dim // world, hidden_size]``
+      (see fused QKV below).
     - ``q_conv1d`` / ``k_conv1d`` / ``v_conv1d``: depthwise conv
       with per-channel filter; each rank has the channels in its
       head slice. Shape: ``[c_per_rank, 1, conv_size]``.
-    - ``f_proj``: column-parallel, hidden→head_v_dim→gate_dim. The
-      first linear outputs ``head_v_dim`` (per-head) and the
-      second outputs ``gate_dim // world`` (per-rank).
-    - ``g_proj``: same shape as ``f_proj`` (column-parallel).
-    - ``b_proj``: column-parallel on ``num_v_heads``.
-    - ``A_log``: ``[num_v_heads // world]`` FP32.
-    - ``dt_bias``: ``[gate_dim // world]`` FP32.
+    - ``f_proj1``: column-parallel ``head_v_dim → key_dim``.
+      The first f_proj layer (``fg_first``) is replicated because
+      its output (``head_v_dim``) is a per-head bottleneck that
+      is the same on every rank.
+    - ``g_proj1``: column-parallel ``head_v_dim → value_dim``.
+      Same replicated-first-layer story as f_proj.
+    - ``b_proj``: column-parallel on ``key_dim`` (NEW vs KDA:
+      erase gate is per-key-channel, not per-v-head-scalar).
+    - ``w_proj``: column-parallel on ``value_dim`` (NEW for GDN2:
+      channel-wise write gate).
+    - ``A_log``: ``[num_heads // world]`` FP32.
+    - ``dt_bias``: ``[key_dim // world]`` FP32 (matches KDA's
+      gate_dim since ``num_v_heads == num_heads`` in our setup).
     - ``o_norm``: per-head RMSNorm on ``head_v_dim``; weight
       ``[head_v_dim]`` (replicated within each rank's head slice).
     - ``o_proj``: row-parallel on ``value_dim``; all-reduces the
       output to ``[hidden_size]``.
 
-    The chunk-KDA kernel itself is rank-local: each rank runs the
+    The chunk-GDN2 kernel itself is rank-local: each rank runs the
     full chunk algorithm on its ``H // world`` heads with a
     rank-local recurrent state. No inter-rank communication is
-    required inside the KDA op — only the o_proj all-reduce.
+    required inside the GDN2 op — only the o_proj all-reduce.
     """
 
     def __init__(self, config, layer_idx: int, device=None, dtype=None) -> None:
         super().__init__()
         from src.models.ops._vendored.fla.modules import FusedRMSNormGated, ShortConvolution
-        from src.models.ops._vendored.fla.ops.kda import chunk_kda
+        from src.models.ops._vendored.fla.ops.gdn2 import chunk_gdn2
 
-        self._chunk_kda = chunk_kda  # cache for forward
+        self._chunk_gdn2 = chunk_gdn2  # cache for forward
 
         self.world = get_tp_world_size()
         self.rank = get_tp_rank()
@@ -640,30 +651,30 @@ class TPKDA(nn.Module):
         d_v = int(d_h * config.expand_v)
         key_dim = nh * d_h
         value_dim = nvh * d_v
-        gate_dim = nvh * d_h  # gate_dim = num_v_heads * head_k_dim
 
         assert nh % self.world == 0, f"num_heads={nh} not divisible by tp_world={self.world}"
         assert nvh % self.world == 0, f"num_v_heads={nvh} not divisible by tp_world={self.world}"
         assert value_dim % self.world == 0, f"value_dim={value_dim} not divisible by tp_world={self.world}"
-        assert gate_dim % self.world == 0, f"gate_dim={gate_dim} not divisible by tp_world={self.world}"
+        assert key_dim % self.world == 0, f"key_dim={key_dim} not divisible by tp_world={self.world}"
 
         self.hpp = nh // self.world           # heads per partition (qk and v share this)
         self.key_per_partition = key_dim // self.world
         self.value_per_partition = value_dim // self.world
-        self.gate_per_partition = gate_dim // self.world
         self.head_k_dim = d_h
         self.head_v_dim = d_v
         self.num_heads = nh
         self.num_v_heads = nvh
         self.hidden_size = h
         self.expand_v = config.expand_v
-        self.mode = config.kda_mode
+        self.mode = config.gdn2_mode
         self.use_short_conv = config.use_short_conv
         self.conv_size = config.conv_size
         self.conv_bias = config.conv_bias
         self.allow_neg_eigval = config.allow_neg_eigval
-        self.safe_gate = config.safe_gate
-        self.lower_bound = config.lower_bound
+        # GDN2 has no ``safe_gate`` / ``lower_bound`` knobs; the
+        # gate path is the standard softplus-on-pre-activation
+        # scaled by ``-exp(A_log)``. The KDA-side config fields
+        # were removed from HippoConfig in the KDA → GDN2 swap.
         self.layer_idx = layer_idx
         self.norm_eps = config.rms_norm_eps
 
@@ -672,7 +683,7 @@ class TPKDA(nn.Module):
         # Output channels: [0:key_per_partition] = Q,
         # [key_per_partition:2*key_per_partition] = K,
         # [2*key_per_partition:2*key_per_partition+value_per_partition] = V.
-        # Saves 2 kernel launches per KDA layer (3 -> 1).
+        # Saves 2 kernel launches per GDN2 layer (3 -> 1).
         self.qkv_proj = ColumnParallelLinear(
             h, 2 * key_dim + value_dim, bias=False,
             device=device, dtype=dtype,
@@ -698,45 +709,44 @@ class TPKDA(nn.Module):
         # ``head_v_dim`` is a per-head bottleneck (the same on every
         # rank), so it's a vanilla ``nn.Linear`` (replicated). We
         # fuse the two first layers into one ``nn.Linear`` with
-        # output = 2*d_v (saves 1 kernel launch per KDA layer).
+        # output = 2*d_v (saves 1 kernel launch per GDN2 layer).
         #
         # The second layers are NOT fused: packing f and g into one
-        # big ``ColumnParallelLinear(2*d_v, gate_dim + value_dim)``
+        # big ``ColumnParallelLinear(2*d_v, key_dim + value_dim)``
         # requires a weight matrix with 50% zeros (the off-diagonal
         # blocks). The fused matmul would execute those zero*input
         # FMAs, doubling the FLOPs of this layer with no compute
         # benefit. So we keep f_proj[1] and g_proj[1] as separate
-        # ColumnParallelLinear's. (Tested empirically in
-        # test_fused_proj_bench.py: fusing FG-second makes TPKDA
-        # ~5% slower.)
+        # ColumnParallelLinear's. (Same reasoning as the KDA
+        # implementation — see test_fused_proj_bench.py.)
         self.fg_first = nn.Linear(
             h, 2 * d_v, bias=False, device=device, dtype=dtype,
         )
         self.f_proj1 = ColumnParallelLinear(
-            d_v, gate_dim, bias=False, device=device, dtype=dtype,
+            d_v, key_dim, bias=False, device=device, dtype=dtype,
         )
         self.g_proj1 = ColumnParallelLinear(
             d_v, value_dim, bias=True, device=device, dtype=dtype,
         )
 
-        # ---- b_proj: column-parallel on num_v_heads ---- #
-        self.b_proj = ColumnParallelLinear(h, nvh, bias=False, device=device, dtype=dtype)
+        # ---- b_proj (NEW vs KDA shape): channel-wise erase gate on K axis ---- #
+        self.b_proj = ColumnParallelLinear(h, key_dim, bias=False, device=device, dtype=dtype)
+        # ---- w_proj: channel-wise write gate on V axis (NEW for GDN2) ---- #
+        self.w_proj = ColumnParallelLinear(h, value_dim, bias=False, device=device, dtype=dtype)
 
-        # ---- A_log, dt_bias: sharded along num_v_heads ---- #
+        # ---- A_log, dt_bias: per-rank shards ---- #
+        # A_log: per-QK-head decay rate (FP32, replicated as log-uniform init).
         import math as _math
-        if config.safe_gate:
-            self.A_log = nn.Parameter(
-                torch.zeros(self.hpp, dtype=torch.float32, device=device)
+        self.A_log = nn.Parameter(
+            torch.log(
+                torch.empty(self.hpp, dtype=torch.float32, device=device).uniform_(1, 16)
             )
-        else:
-            self.A_log = nn.Parameter(
-                torch.log(
-                    torch.empty(self.hpp, dtype=torch.float32, device=device).uniform_(1, 16)
-                )
-            )
+        )
         self.A_log._no_weight_decay = True
+        # dt_bias: per-key-channel softplus bias (FP32). Size matches
+        # the per-rank ``key_per_partition``.
         dt = torch.exp(
-            torch.rand(self.gate_per_partition, dtype=torch.float32, device=device) *
+            torch.rand(self.key_per_partition, dtype=torch.float32, device=device) *
             (_math.log(0.1) - _math.log(0.001)) + _math.log(0.001)
         ).clamp(min=1e-4)
         inv_dt = dt + torch.log(-torch.expm1(-dt))
@@ -798,29 +808,39 @@ class TPKDA(nn.Module):
         f_inter, g_inter = fg_first.chunk(2, dim=-1)
         g = self.f_proj1(f_inter)
         g_for_norm = self.g_proj1(g_inter)
-        beta = self.b_proj(x).sigmoid()
+
+        # Channel-wise gates (NEW vs KDA). Both squashed to [0, 1]:
+        #   b: erase gate on the K axis (replaces KDA's scalar beta)
+        #   w: write gate on the V axis (NEW for GDN2)
+        b = self.b_proj(x).sigmoid()
+        w = self.w_proj(x).sigmoid()
 
         # Reshape to per-head: each rank has ``hpp`` heads.
         # q, k: [B, T, hpp, head_k_dim]
-        # g:    [B, T, hpp, head_k_dim]  (gate_dim/world = hpp*head_k_dim)
+        # g:    [B, T, hpp, head_k_dim]  (key_per_partition = hpp*head_k_dim)
         # v:    [B, T, hpp, head_v_dim]
+        # b:    [B, T, hpp, head_k_dim]
+        # w:    [B, T, hpp, head_v_dim]
         q = rearrange(q, "... (h d) -> ... h d", d=self.head_k_dim)
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
         g = rearrange(g, "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
+        b = rearrange(b, "... (h d) -> ... h d", d=self.head_k_dim)
+        w = rearrange(w, "... (h d) -> ... h d", d=self.head_v_dim)
 
         if self.allow_neg_eigval:
-            beta = beta * 2.0
+            b = b * 2.0
 
-        # chunk_kda: rank-local. No TP comm inside the kernel.
-        o, _ = self._chunk_kda(
-            q=q, k=k, v=v, g=g, beta=beta,
+        # chunk_gdn2: rank-local. No TP comm inside the kernel.
+        # ``use_gate_in_kernel=True`` makes the kernel compute the
+        # softplus(g + dt_bias) * -exp(A_log) activation internally
+        # (saves a separate activation kernel launch).
+        o, _ = self._chunk_gdn2(
+            q=q, k=k, v=v, g=g, b=b, w=w,
             A_log=self.A_log, dt_bias=self.dt_bias,
             initial_state=None, output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
-            safe_gate=self.safe_gate,
-            lower_bound=self.lower_bound,
             cu_seqlens=None,
         )
 
@@ -838,8 +858,8 @@ class TPKDA(nn.Module):
 # TP HippoModel                                                               #
 # --------------------------------------------------------------------------- #
 class TPHippoLayer(nn.Module):
-    """TP version of HippoLayer. KDA is sharded along the head dim
-    via :class:`TPKDA`; FFN is sharded via :class:`TPSwiGLU`.
+    """TP version of HippoLayer. GDN2 is sharded along the head dim
+    via :class:`TPGDN2`; FFN is sharded via :class:`TPSwiGLU`.
 
     AttnRes no longer lives inside each layer. The block-boundary
     AttnRes is a single per-device replicated module
@@ -865,7 +885,7 @@ class TPHippoLayer(nn.Module):
 
         self.attn_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
         self.mlp_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
-        self.kda = _to(TPKDA(config, layer_idx=layer_idx))
+        self.gdn2 = _to(TPGDN2(config, layer_idx=layer_idx))
         self.ffn = TPSwiGLU(config, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -875,10 +895,10 @@ class TPHippoLayer(nn.Module):
             x: ``[B, T, hidden_size]`` replicated hidden state.
 
         Returns:
-            ``[B, T, hidden_size]`` after KDA and FFN with
+            ``[B, T, hidden_size]`` after GDN2 and FFN with
             standard residual connections.
         """
-        x = x + self.kda(self.attn_norm(x))
+        x = x + self.gdn2(self.attn_norm(x))
         x = x + self.ffn(self.mlp_norm(x))
         return x
 
@@ -1133,12 +1153,12 @@ class TPHippoModel(nn.Module):
                 for pname, p in src_params.items():
                     dst_params[pname].data.copy_(p.data)
 
-        # 2) Per-layer replicated sub-modules (KDA, attn_norm,
+        # 2) Per-layer replicated sub-modules (GDN2, attn_norm,
         # mlp_norm). AttnRes is no longer per-layer; the block
         # boundary version lives at the model level and is
         # already synced above.
         for li, src_layer in enumerate(self.layers_per_device[src_device]):
-            for sub_name in ("kda", "attn_norm", "mlp_norm"):
+            for sub_name in ("gdn2", "attn_norm", "mlp_norm"):
                 src_sub = getattr(src_layer, sub_name)
                 src_params = dict(src_sub.named_parameters(recurse=True))
                 for dst_device, dst_layers in self.layers_per_device.items():

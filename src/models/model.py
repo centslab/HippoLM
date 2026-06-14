@@ -3,7 +3,7 @@
 Block-boundary Block AttnRes (official Kimi design):
   - 32 layers are partitioned into 8 blocks of 4 layers each.
   - Within a block, every layer is a standard residual transformer
-    ``x = x + KDA(RMSNorm(x)); x = x + FFN(RMSNorm(x))``. There
+    ``x = x + GDN2(RMSNorm(x)); x = x + FFN(RMSNorm(x))``. There
     is no per-layer AttnRes; the only AttnRes invocation is at
     the block boundary, where the next block's input is computed
     by softmax-attending over the completed block representations
@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from .norms import RMSNorm
-from .kda import KDA
+from .gdn2 import GDN2
 from .ops.attn_res import BlockAttnRes
 from .activation import SwiGLU
 
@@ -41,7 +41,7 @@ class HippoLayer(nn.Module):
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Core sub-layers.
-        self.kda = KDA(config, layer_idx=layer_idx)
+        self.gdn2 = GDN2(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -51,10 +51,10 @@ class HippoLayer(nn.Module):
             x: ``[B, T, hidden_size]`` input.
 
         Returns:
-            ``[B, T, hidden_size]`` output after KDA and FFN with
+            ``[B, T, hidden_size]`` output after GDN2 and FFN with
             standard residual connections.
         """
-        x = x + self.kda(self.attn_norm(x))
+        x = x + self.gdn2(self.attn_norm(x))
         x = x + self.ffn(self.mlp_norm(x))
         return x
 
