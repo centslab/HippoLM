@@ -77,10 +77,17 @@ def load_streaming_with_fallback(
 
     Behavior matrix:
       - ``use_ms=False`` or ``ms_name is None``  -> HF streaming directly
-      - Local cached parquet available              -> use :class:`LocalParquetIterable`
-      - MS streaming succeeds                       -> return MS iterator
-      - MS raises a network exception               -> warn, fall back to HF
-      - MS raises ``ImportError`` (not installed)   -> warn, fall back to HF
+      - :class:`RotatingParquetIterable` discovery + part-0 download
+        succeeds                                    -> return rotating iterator
+        (this is the v0.0.2 path: one-time MS API
+         listing of the dataset's part-*.parquet
+         files, then walk through them with 50%
+         pre-download of the next part and a
+         bounded local cache).
+      - MS part discovery fails (HTTP error /
+        unknown config)                -> MS streaming (legacy path)
+      - MS streaming raises a network exception     -> warn, fall back to HF
+      - MS streaming raises ``ImportError``         -> warn, fall back to HF
       - MS raises anything else (HTTPError 4xx,
         ValueError on schema, KeyError on field)    -> re-raise unchanged
 
@@ -91,17 +98,31 @@ def load_streaming_with_fallback(
     row-group by row-group from a slow CDN can take >10 min and is
     non-deterministic.
     """
-    from .parquet import LocalParquetIterable
-    from .prefetch import prefetch_first_parquet
+    from .rotating import (
+        RotatingParquetIterable,
+        resolve_parts_for_config,
+    )
 
     if use_ms and ms_name and not os.environ.get("HIPPOLM_NO_PREFETCH"):
-        cached = prefetch_first_parquet(ms_name, config_name, log)
-        if cached is not None:
-            log.info(
-                f"Using local cached parquet for {ms_name}"
-                f" (subset={config_name}): {cached}"
+        try:
+            parts = resolve_parts_for_config(ms_name, config_name, log)
+            if parts:
+                log.info(
+                    f"Discovered {len(parts)} part files for {ms_name}"
+                    f" (subset={config_name}); using RotatingParquetIterable"
+                    f" (50% pre-download, max 2 cached files)"
+                )
+                rot = RotatingParquetIterable(
+                    ms_name, config_name, log=log,
+                )
+                rot.open()  # synchronous part-0 download
+                return rot
+        except Exception as e:
+            log.warning(
+                f"RotatingParquetIterable discovery failed for {ms_name}"
+                f" (config={config_name}): {type(e).__name__}: {e};"
+                f" falling back to MS streaming."
             )
-            return LocalParquetIterable(cached)
         try:
             ds = load_modelscope_streaming(ms_name, config_name, split)
             log.info(
