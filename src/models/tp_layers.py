@@ -126,16 +126,26 @@ def shutdown_tp() -> None:
 # TP linear layers                                                            #
 # --------------------------------------------------------------------------- #
 class _AllReduce(torch.autograd.Function):
-    """Forward: all-reduce. Backward: identity (sum's gradient is 1)."""
+    """Forward: all-reduce. Backward: identity (sum's gradient is 1).
+
+    Implementation note: NCCL's ``all_reduce`` is in-place (the
+    output buffer is the same as the input buffer). The earlier
+    ``out = x.clone()`` was a leftover from a transport that needed
+    a separate output buffer; NCCL doesn't, and the clone was
+    adding an extra full-tensor copy per all-reduce (which on a
+    ``[B, T, H] = [4, 4096, 1024]`` tensor is 32 MB at FP16).
+    In-place is safe here because the autograd graph never uses
+    ``x`` again after this op (the next node consumes the
+    all-reduce's output).
+    """
 
     @staticmethod
     def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         if _TP_WORLD_SIZE == 1:
             return x
         import torch.distributed as dist
-        out = x.clone()
-        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=_TP_GROUP)
-        return out
+        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=_TP_GROUP)
+        return x
 
     @staticmethod
     def backward(ctx, grad):  # type: ignore[override]
@@ -163,9 +173,8 @@ class _AllReduceSum(torch.autograd.Function):
         if _TP_WORLD_SIZE == 1:
             return x
         import torch.distributed as dist
-        out = x.clone()
-        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=_TP_GROUP)
-        return out
+        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=_TP_GROUP)
+        return x
 
     @staticmethod
     def backward(ctx, grad):  # type: ignore[override]
@@ -197,6 +206,10 @@ class _AllReduceMax(torch.autograd.Function):
             ctx.save_for_backward(x, x)
             return x
         import torch.distributed as dist
+        # ``_AllReduceMax`` needs the pre-reduce ``x`` for the
+        # backward mask, so we still need a copy here. The copy
+        # is unavoidable; the in-place trick from ``_AllReduce``
+        # would clobber the saved tensor.
         out = x.clone()
         dist.all_reduce(out, op=dist.ReduceOp.MAX, group=_TP_GROUP)
         ctx.save_for_backward(x, out)
