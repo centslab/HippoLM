@@ -84,7 +84,7 @@ def log_pre_step_diag(
         f"  [diag-step {step} pre]"
         f" total_norm={total_norm:.3e}"
         f" muon: acc_max={_max_over_states(muon_state, 'accum'):.3e}"
-        f" mom_max={_max_over_states(muon_state, 'exp_avg_sq'):.3e}"
+        f" mom_max={_max_over_states(muon_state, 'mom_buf'):.3e}"
         f" pmax={_max_over_states(muon_state, 'param'):.3e}"
         f" | adamw: acc_max={_max_over_states(adamw_state, 'accum'):.3e}"
         f" m_max={_max_over_states(adamw_state, 'm'):.3e}"
