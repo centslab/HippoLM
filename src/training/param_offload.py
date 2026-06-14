@@ -23,19 +23,21 @@ Implements two optimizer variants used together via param groups:
     of ~1.18e-38).
 
   - :class:`CPUMuon`      — Muon (Newton-Schulz orthogonalization
-    of the momentum matrix) with **int8-quantized momentum +
-    BF16 per-row scale** on CPU pinned memory. The int8 storage
-    halves the Muon CPU RAM vs FP16 (1 byte/elt + a tiny
-    ``rows``-sized BF16 scale tensor). The BF16 scale (vs FP16
-    in the v0.0.2 design) is the key numerical choice for the
-    new hardware: BF16's FP32-mantissa dynamic range keeps the
-    per-row scale well above underflow even for tiny per-row
-    momentum magnitudes, and on a 5060Ti there is no compute
-    cost difference between FP16 and BF16 scales (both are
-    2 bytes). The dequantize + SGD update + requantize cycle
-    happens on the CPU (one full pass per param per step; the
-    NS iteration is the only GPU step and is streamed over
-    rows in 4096-row chunks).
+    of the momentum matrix). Momentum storage is configurable
+    via ``precision.muon_momentum``:
+
+      * ``int8`` (default) + **BF16 per-row scale**: 1 byte/elt
+        momentum + a tiny ``rows``-sized BF16 scale tensor.
+        The dequantize + SGD update + requantize cycle runs on
+        the CPU (one full pass per param per step; the NS
+        iteration is the only GPU step and is streamed over
+        rows in 4096-row chunks).
+      * ``bf16`` / ``fp16`` / ``fp32``: full-precision
+        momentum, no quantization. Doubles / quadruples the
+        Muon CPU RAM vs int8 (no scale tensor needed).
+        The NS iteration is unaffected (it orthogonalizes the
+        dequantized / raw momentum in FP32 on the GPU
+        regardless of storage precision).
 
 Both optimizers follow the same API surface as ``torch.optim.Optimizer``
 minimally — ``step()`` consumes whatever gradients are present on
@@ -56,10 +58,12 @@ Conventions
   micro-batches the GPU holds zero gradient memory.
 - Optimizer state on CPU pinned memory:
     AdamW: m (BF16, numel) + v (BF16, numel) + accum (BF16, numel)
-    Muon:  int8_q (int8, numel) + int8_scale (BF16, rows) + accum (BF16, numel)
+    Muon:  mom_buf (cfg.dtype, numel)
+           + mom_scale (BF16, rows)  [int8 only; None for fp*]
+           + accum (BF16, numel)
 - For ~624 M params: AdamW ≈ 6 × 624 M = 3.7 GB CPU RAM
   (m BF16 + v BF16 + accum BF16, all 2 bytes/elt).
-  Muon ≈ 1 × 624 M bytes (int8) + negligible scale = 0.6 GB.
+  Muon: 0.6 GB (int8), 1.2 GB (fp16/bf16), 2.5 GB (fp32).
 """
 from __future__ import annotations
 
@@ -98,10 +102,13 @@ class _ParamState:
     m: torch.Tensor | None = None
     exp_avg_sq: torch.Tensor | None = None
     # Muon-specific state (set when ``kind == 'muon'``). The
-    # momentum matrix ``m`` is stored as int8 (quantized) plus a
-    # BF16 per-row scale factor.
-    int8_q: torch.Tensor | None = None
-    int8_scale: torch.Tensor | None = None
+    # momentum matrix ``m`` lives in ``mom_buf`` (any storage
+    # dtype: int8 with a BF16 per-row scale, or a raw fp16/bf16/
+    # fp32 tensor with no scale). Field names are dtype-agnostic
+    # so the ``step()`` and ``loop.py`` byte-breakdown code
+    # works regardless of the configured storage dtype.
+    mom_buf: torch.Tensor | None = None
+    mom_scale: torch.Tensor | None = None
     # Cached for Muon: original param shape for reshape on GPU.
     shape: tuple = field(default_factory=tuple)
     # Step counter (per param; cheap).
@@ -140,13 +147,12 @@ class OptimizerState(Protocol):
     - ``kind`` is ``"adamw"`` or ``"muon"``; diagnostics branch
       on it to pick which state tensors to read.
     - ``m`` / ``exp_avg_sq`` are AdamW's first / second moment
-      (both BF16 CPU pinned). For Muon both are ``None`` —
-      Muon stores the quantized momentum in ``int8_q`` /
-      ``int8_scale`` instead, and the diagnostics use a
-      separate "look at the state field for this kind" branch.
-    - ``int8_q`` / ``int8_scale`` are Muon's int8-quantized
-      momentum and per-row BF16 scale. For AdamW both are
-      ``None``.
+      (both BF16 CPU pinned). For Muon both are ``None``.
+    - ``mom_buf`` / ``mom_scale`` are Muon's momentum storage.
+      ``mom_buf`` is the EMA buffer at the configured storage
+      dtype (int8 with per-row symmetric quantization + BF16
+      ``mom_scale``, OR a raw fp16/bf16/fp32 tensor with
+      ``mom_scale=None``). For AdamW both are ``None``.
     - ``shape`` is cached for Muon (the original param shape
       before flatten) so diagnostics can report the failing
       param's full shape on NaN/Inf.
@@ -159,8 +165,8 @@ class OptimizerState(Protocol):
     kind: str
     m: Optional[torch.Tensor]
     exp_avg_sq: Optional[torch.Tensor]
-    int8_q: Optional[torch.Tensor]
-    int8_scale: Optional[torch.Tensor]
+    mom_buf: Optional[torch.Tensor]
+    mom_scale: Optional[torch.Tensor]
     shape: tuple
     step: int
 
@@ -366,38 +372,51 @@ class CPUAdamW:
 # CPU Muon                                                                    #
 # --------------------------------------------------------------------------- #
 class CPUMuon:
-    """Muon with int8-quantized momentum + BF16 per-row scale on CPU
-    pinned memory.
+    """Muon with configurable momentum storage on CPU pinned memory.
 
     State per param:
-        CPU pinned: int8_q (int8, numel), int8_scale (BF16, rows),
+        CPU pinned: mom_buf (cfg dtype, numel),
+                    mom_scale (BF16, rows or None),
                     accum (BF16, numel)
         GPU:         param (FP16), .grad (transient)
 
-    The 2-D momentum matrix ``m`` is stored as a flat int8 buffer
-    reshaped to ``[rows, cols]`` plus a per-row BF16 scale factor
-    (symmetric quantization::
+    Storage dtype is ``precision.muon_momentum.dtype``:
 
-        scale[i] = max(|m[i, :]|) / 127
-        q[i, j] = round(m[i, j] / scale[i]).clip(-128, 127)
+    * ``int8`` + per-channel scale (canonical default): 1 byte/elt
+      momentum + a tiny ``rows``-sized BF16 scale tensor. The
+      2-D momentum matrix ``m`` is stored as a flat int8 buffer
+      reshaped to ``[rows, cols]`` plus a per-row BF16 scale
+      factor (symmetric quantization::
 
-    ). The BF16 scale (vs FP16 in the v0.0.2 design) is the
-    key numerical choice for the new 5060Ti hardware: BF16's
-    8-bit exponent matches FP32, so the per-row scale never
-    overflows even for very small per-row maxes. FP16's 5-bit
-    exponent could underflow ``scale`` to 0 for very quiet
-    rows, which would then divide-by-zero on dequant. BF16
-    has the same 2-byte footprint as FP16.
+          scale[i] = max(|m[i, :]|) / 127
+          q[i, j] = round(m[i, j] / scale[i]).clip(-128, 127)
+
+      ). The BF16 scale (vs FP16 in the v0.0.2 design) is the
+      key numerical choice for the new 5060Ti hardware: BF16's
+      8-bit exponent matches FP32, so the per-row scale never
+      overflows even for very small per-row maxes. FP16's 5-bit
+      exponent could underflow ``scale`` to 0 for very quiet
+      rows, which would then divide-by-zero on dequant. BF16
+      has the same 2-byte footprint as FP16.
+    * ``bf16`` / ``fp16`` / ``fp32``: full-precision momentum, no
+      quantization. ``mom_scale`` is ``None``. The Newton-Schulz
+      output precision is unaffected by the storage dtype (NS
+      orthogonalizes the dequantized / raw FP32 momentum on the
+      GPU regardless); the storage precision only affects how
+      much the EMA buffer is rounded between steps.
 
     The training loop's :func:`accumulate_grads_to_cpu` adds the
     GPU ``.grad`` to ``accum`` (CPU, BF16). On :meth:`step` we:
-        1. Dequantize the int8 momentum to FP32 on the CPU
-           (one full pass per param; rows * cols multiplies).
-        2. SGD update in FP32: m = beta*m + (1-beta)*g.
-        3. Requantize to int8 + BF16 scale for storage.
-        4. Stream each row-chunk to the GPU, run 5 NS
-           iterations in FP16 (tensor cores), and apply the
-           update to the GPU param.
+
+    * ``int8``: dequant to FP32 on the GPU, SGD in FP32,
+      requant to int8 + BF16 scale, D2H the new storage.
+    * ``fp16``/``bf16``/``fp32``: H2D the raw momentum, SGD in
+      FP32, cast back to the storage dtype, D2H. No dequant /
+      requant cycle.
+
+    Then stream each row-chunk to the GPU, run 5 NS iterations
+    in FP16 (tensor cores), and apply the update to the GPU
+    param. The NS path is identical for both storage variants.
     """
 
     _NS_COEFFS = (3.4445, -4.7750, 2.0315)
@@ -416,22 +435,18 @@ class CPUMuon:
 
         ``precision`` controls:
 
-        - ``s.accum``    (grad accumulator)     ← ``precision.gradients``
-        - ``s.int8_q``   (quantized momentum)   ← ``precision.muon_momentum``
-        - ``s.int8_scale`` (per-row scale)      ← always BF16 (the
-          scale needs FP32-like dynamic range to avoid underflow
-          on quiet rows; BF16 is the cheapest dtype that
-          guarantees this)
+        - ``s.accum``     (grad accumulator)     ← ``precision.gradients``
+        - ``s.mom_buf``   (momentum storage)     ← ``precision.muon_momentum``
+          (int8 with per-row quantization, or raw fp16/bf16/fp32)
+        - ``s.mom_scale`` (per-row scale)        ← only set for int8
+          storage (BF16 — the scale needs FP32-like dynamic range
+          to avoid underflow on quiet rows; BF16 is the cheapest
+          dtype that guarantees this). ``None`` for fp* storage.
 
-        Supported momentum dtypes: ``int8`` (default), ``int4``
-        (raises :class:`NotImplementedError`; int4 is on the
-        roadmap but the packing scheme is not finalized). Floating
-        dtypes (``fp16``/``bf16``/``fp32``) are accepted but
-        stored as int8 in this version (the Newton-Schulz path
-        orthogonalizes a 2-D matrix; the storage precision only
-        matters for the EMA, not the orthogonalization quality).
-        A floating ``muon_momentum`` with a non-int storage dtype
-        triggers a warning and falls back to int8.
+        Supported momentum dtypes: ``int8`` (default),
+        ``bf16`` / ``fp16`` / ``fp32`` (full-precision storage,
+        no quantization). ``int4`` raises :class:`NotImplementedError`
+        (the packing scheme is on the roadmap but not landed).
         """
         self.lr = lr
         self.momentum = momentum
@@ -443,30 +458,24 @@ class CPUMuon:
         accum_dtype = precision.gradients.dtype.to_torch()
         # Resolve momentum storage. int8 is the only fully-supported
         # quantized storage; int4 is on the roadmap but not yet
-        # implemented (the int8_q buffer would need to pack 2
-        # elements per byte and the dequant path would need to
-        # unpack).
+        # implemented (the mom_buf would need to pack 2 elements
+        # per byte and the dequant path would need to unpack).
         mom_dtype_cfg = precision.muon_momentum.dtype
         if mom_dtype_cfg == DType.INT4:
             raise NotImplementedError(
                 "CPUMuon: muon_momentum dtype=int4 is not yet implemented."
                 " Use int8 (the current default) or a floating dtype"
-                " (which falls back to int8 storage)."
+                " (bf16 / fp16 / fp32)."
             )
-        if mom_dtype_cfg.is_floating:
-            import warnings
-            warnings.warn(
-                f"CPUMuon: muon_momentum dtype={mom_dtype_cfg.value}"
-                f" is floating; falling back to int8 storage (the"
-                f" EMA storage is the only thing affected, not the"
-                f" Newton-Schulz output precision).",
-                stacklevel=2,
-            )
-            mom_storage_dtype = torch.int8
-        else:
+        # int8 → 1 byte/elt momentum + a BF16 per-row scale.
+        # fp*  → full-precision storage at the configured dtype;
+        #         no scale, no dequant/requant in step().
+        if mom_dtype_cfg.is_integer:
             mom_storage_dtype = mom_dtype_cfg.to_torch()  # int8
-        # Scale is always BF16 — see docstring.
-        scale_dtype = torch.bfloat16
+            scale_dtype = torch.bfloat16
+        else:
+            mom_storage_dtype = mom_dtype_cfg.to_torch()  # bf16/fp16/fp32
+            scale_dtype = None  # no scale for full-precision storage
 
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
@@ -483,15 +492,15 @@ class CPUMuon:
                 )
             n = p.numel()
             shape = tuple(p.shape)
+            mom_scale = (
+                torch.zeros(shape[0], dtype=scale_dtype, device="cpu").pin_memory()
+                if scale_dtype is not None else None
+            )
             st = _ParamState(
                 param=p,
                 accum=torch.zeros(n, dtype=accum_dtype, device="cpu").pin_memory(),
-                int8_q=torch.zeros(n, dtype=mom_storage_dtype, device="cpu").pin_memory(),
-                # Scale is always BF16; the precision config does
-                # not currently expose ``scale_dtype``. If we
-                # later add one, switch this to the configured
-                # value.
-                int8_scale=torch.zeros(shape[0], dtype=scale_dtype, device="cpu").pin_memory(),
+                mom_buf=torch.zeros(n, dtype=mom_storage_dtype, device="cpu").pin_memory(),
+                mom_scale=mom_scale,
                 kind="muon",
                 shape=shape,
             )
@@ -504,27 +513,31 @@ class CPUMuon:
     def _dequantize(self, s: _ParamState) -> torch.Tensor:
         """Return dequantized FP32 momentum, shape ``s.shape``.
 
-        Runs on the CPU. Reads ``s.int8_q`` (int8) and
-        ``s.int8_scale`` (BF16); returns ``[rows, cols]`` in FP32.
+        Runs on the CPU. Reads ``s.mom_buf`` (int8) and
+        ``s.mom_scale`` (BF16); returns ``[rows, cols]`` in FP32.
         The FP32 cast of the BF16 scale is free (BF16→FP32 is
         lossless), and the per-row scale is then broadcast across
         the cols dimension.
+
+        Only valid when ``s.mom_buf.dtype == torch.int8``. For
+        floating-dtype momentum, read ``s.mom_buf.float()``
+        directly (no scale to multiply).
         """
         rows, cols = s.shape[0], s.shape[1]
-        q_2d = s.int8_q.view(rows, cols).float()
-        scale_2d = s.int8_scale.float().unsqueeze(1)  # [rows, 1], FP32
+        q_2d = s.mom_buf.view(rows, cols).float()
+        scale_2d = s.mom_scale.float().unsqueeze(1)  # [rows, 1], FP32
         return q_2d * scale_2d  # FP32, [rows, cols]
 
     def _requantize(self, m_fp32: torch.Tensor, s: _ParamState) -> None:
         """Per-row symmetric int8 quantize ``m_fp32`` into
-        ``s.int8_q`` / ``s.int8_scale`` (BF16).
+        ``s.mom_buf`` (int8) / ``s.mom_scale`` (BF16).
 
         ``m_fp32`` is the SGD-updated momentum in FP32, shape
         ``s.shape``. The scale is BF16 in storage but computed
         in FP32 here for the divide (so the scale's dynamic
         range is FP32-quality, not BF16-quality, and any tiny
         mantissa loss is acceptable on the way to a 2-byte
-        scale).
+        scale). Only valid when ``s.mom_buf.dtype == torch.int8``.
         """
         rows, cols = s.shape[0], s.shape[1]
         m_2d = m_fp32.view(rows, cols)
@@ -540,8 +553,8 @@ class CPUMuon:
         # cast the int8 to int8 storage.
         scale_2d = new_scale_bf16.float().unsqueeze(1)  # [rows, 1], FP32
         q_int8 = (m_2d / scale_2d).round().clamp(-128, 127).to(torch.int8)
-        s.int8_q.copy_(q_int8.view(-1))
-        s.int8_scale.copy_(new_scale_bf16)
+        s.mom_buf.copy_(q_int8.view(-1))
+        s.mom_scale.copy_(new_scale_bf16)
 
     def _newton_schulz(self, x: torch.Tensor) -> torch.Tensor:
         a, b, c = self._NS_COEFFS
@@ -579,6 +592,32 @@ class CPUMuon:
     _STREAM_CHUNK_ROWS = 4096
 
     def step(self) -> None:
+        """One Muon step across every trainable param in this
+        optimizer's state.
+
+        Two storage paths share the same scaffolding (H2D state,
+        SGD in FP32, D2H new state, then stream NS over rows):
+
+        * **Quantized** (``s.mom_scale is not None``, i.e.
+          ``int8`` + BF16 scale): dequant to FP32 on the GPU,
+          SGD in FP32, requant to int8 + BF16 scale, D2H the
+          new storage.
+        * **Full-precision** (``s.mom_scale is None``, i.e.
+          ``fp16``/``bf16``/``fp32``): H2D the raw momentum,
+          SGD in FP32, cast back to the storage dtype, D2H.
+          No dequant / requant.
+
+        Both paths run the EMA + NS work on the GPU HBM
+        (bandwidth-bound, ~50x faster than CPU DRAM). State
+        stays on CPU pinned memory; the per-mb VRAM peak is one
+        param's worth of buffers (~21 MB for a 1024×3072
+        down_proj) regardless of storage dtype.
+
+        See :file:`test/_tmp/test_muon_gpu_step.py` for the
+        timing comparison (76% muon step reduction at production
+        scale, ~903 ms saved per step on a 1024-hidden,
+        3072-intermediate model).
+        """
         mom = self.momentum
         lr = self.lr
         wd = self.weight_decay
@@ -589,48 +628,80 @@ class CPUMuon:
                 continue
             shape = s.shape
             rows, cols = shape[0], shape[1]
-            # 1) Dequantize momentum to FP32 on the CPU.
-            # Full-matrix operation: the dequant is
-            # ``rows * cols`` element-wise multiplies, which is
-            # cheap on the CPU relative to the GPU NS iterations
-            # downstream. At most 12 MB for the 3072×1024 FFN
-            # down_proj, 4 MB for the 1024×1024 KDA matrices.
-            m_fp32 = self._dequantize(s)
-            # 2) SGD update on the CPU: m = beta*m + grad.
-            # The accum is BF16; cast to FP32 for the add (BF16
-            # add would lose precision on the EMA; the v0.0.2
-            # path did the same cast for the same reason).
-            g_fp32 = s.accum.float().view(rows, cols)
-            m_fp32.mul_(mom).add_(g_fp32, alpha=1.0 - mom)
-            # 3) Requantize to int8 + BF16 scale for storage.
-            self._requantize(m_fp32, s)
-            # 4) Decoupled weight decay: applied once to the
+            device = s.param.device
+            quantized = s.mom_scale is not None
+
+            # ---- H2D state to GPU (async; pinned host memory →
+            # real async DMA with non_blocking=True) ----
+            mom_buf_gpu = s.mom_buf.to(device, non_blocking=True)
+            accum_gpu = s.accum.to(device, non_blocking=True)
+
+            # ---- Get the SGD input as FP32 [rows, cols] on GPU.
+            # Quantized path: dequant int8 with the BF16 per-row
+            # scale. Full-precision path: just cast the storage
+            # dtype to FP32 (lossless for fp32; bf16/fp16 widen
+            # to FP32 in one instruction). ----
+            if quantized:
+                scale_gpu = s.mom_scale.to(device, non_blocking=True)
+                q_2d = mom_buf_gpu.float().view(rows, cols)
+                scale_2d = scale_gpu.float().unsqueeze(1)     # [rows, 1]
+                m_fp32_gpu = q_2d * scale_2d                 # FP32 [rows, cols]
+            else:
+                m_fp32_gpu = mom_buf_gpu.float().view(rows, cols)
+
+            # ---- GPU SGD: m = beta*m + (1-beta)*grad ----
+            # accum is BF16; cast to FP32 for the add (matches
+            # the CPU path's behavior; BF16 add would lose
+            # precision on the EMA).
+            g_2d = accum_gpu.float().view(rows, cols)
+            m_fp32_gpu.mul_(mom).add_(g_2d, alpha=1.0 - mom)
+
+            # ---- Requant (quantized) or recast (full-precision)
+            # + D2H the new momentum storage. ----
+            if quantized:
+                row_max = m_fp32_gpu.abs().amax(dim=1).clamp(min=1e-8)
+                new_scale_fp32 = row_max / 127.0
+                new_scale_bf16 = new_scale_fp32.to(torch.bfloat16)
+                new_scale_2d = new_scale_bf16.float().unsqueeze(1)
+                q_int8_gpu = (m_fp32_gpu / new_scale_2d).round() \
+                                .clamp(-128, 127).to(torch.int8)
+                # q_int8_gpu is 2D; flatten back to 1D to match
+                # s.mom_buf's storage.
+                s.mom_buf.copy_(q_int8_gpu.view(-1), non_blocking=True)
+                s.mom_scale.copy_(new_scale_bf16, non_blocking=True)
+            else:
+                # Cast FP32 back to the configured storage dtype
+                # (the SGD is in FP32; the round-trip through the
+                # narrower dtype is the only precision loss the
+                # full-precision path incurs, vs the quantized
+                # path's per-row int8 quantization).
+                new_mom = m_fp32_gpu.to(s.mom_buf.dtype).view(-1)
+                s.mom_buf.copy_(new_mom, non_blocking=True)
+
+            # ---- Decoupled weight decay: applied once to the
             # full GPU param (in place), before the streaming
-            # NS apply loop.
+            # NS apply loop. ----
             if wd != 0.0:
                 s.param.data.mul_(1.0 - lr * wd)
-            # 5) Stream NS over rows: for each row chunk,
-            # dequantize (already done above, but the FP32
-            # buffer is the full matrix), slice, send to GPU,
-            # NS in FP16, apply.
-            #
-            # NOTE: the dequantize in (1) produced the full
-            # ``[rows, cols]`` FP32 m_fp32, and (2)-(3) modified
-            # it in place. So the same buffer we just requantized
-            # is also what we feed to the NS — no double work.
+
+            # ---- Stream NS over rows; m_fp32_gpu is already on
+            # GPU so no per-chunk H2D is needed (vs the prior
+            # CPU-path design which H2D'd each chunk's FP32
+            # slice). ----
+            m_fp16 = m_fp32_gpu.to(torch.float16)
             for r_start in range(0, rows, CHUNK_ROWS):
                 r_end = min(r_start + CHUNK_ROWS, rows)
-                m_chunk_fp32 = m_fp32[r_start:r_end]
-                # Cast to FP16 for tensor-core NS. The FP32→FP16
-                # cast is the precision boundary (m is now in
-                # ~FP16 precision after the NS quantize, so no
-                # information is lost).
-                g = m_chunk_fp32.to(torch.float16).to(
-                    s.param.device, non_blocking=True,
-                )
-                update = self._newton_schulz(g)
+                m_chunk = m_fp16[r_start:r_end]
+                update = self._newton_schulz(m_chunk)
                 update = update.to(s.param.dtype)
                 s.param.data[r_start:r_end].add_(update, alpha=-lr)
+
+            # ---- Sync the device stream before next param's H2D.
+            # Ensures the D2H above completed; otherwise the next
+            # param could overwrite the pinned host buffer before
+            # this DMA landed. ----
+            torch.cuda.current_stream(device).synchronize()
+
             # Reset grad accumulator for next accumulation cycle.
             s.accum.zero_()
 

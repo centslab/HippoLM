@@ -35,6 +35,7 @@ from pathlib import Path
 # out.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -292,8 +293,8 @@ def test_muon_default_storage_is_int8_with_bf16_scale():
     opt = CPUMuon([p])
     s = next(iter(opt.state.values()))
     assert s.accum.dtype == torch.bfloat16
-    assert s.int8_q.dtype == torch.int8
-    assert s.int8_scale.dtype == torch.bfloat16
+    assert s.mom_buf.dtype == torch.int8
+    assert s.mom_scale.dtype == torch.bfloat16
 
 
 def test_muon_fp32_gradients_stored_as_fp32():
@@ -305,22 +306,23 @@ def test_muon_fp32_gradients_stored_as_fp32():
     assert s.accum.dtype == torch.float32
 
 
-def test_muon_floating_momentum_falls_back_to_int8_with_warning():
-    """``muon_momentum: { dtype: bf16 }`` is accepted (the yml
-    schema allows it) but the storage stays int8 because
-    the EMA storage is the only thing affected; the NS
-    output precision is independent. Warning fires so
-    users see the fallback.
+@pytest.mark.parametrize("mom_dtype, torch_dt", [
+    (DType.BF16, torch.bfloat16),
+    (DType.FP16, torch.float16),
+    (DType.FP32, torch.float32),
+])
+def test_muon_floating_momentum_uses_full_precision_storage(mom_dtype, torch_dt):
+    """``muon_momentum: { dtype: bf16/fp16/fp32 }`` is honored:
+    the momentum buffer is allocated in the configured dtype
+    and there is no scale tensor (no quantization).
     """
     p = _muon_param()
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        opt = CPUMuon([p], precision=PrecisionConfig(
-            muon_momentum=TensorPrecision(dtype=DType.BF16),
-        ))
+    opt = CPUMuon([p], precision=PrecisionConfig(
+        muon_momentum=TensorPrecision(dtype=mom_dtype),
+    ))
     s = next(iter(opt.state.values()))
-    assert s.int8_q.dtype == torch.int8
-    assert any("falling back to int8" in str(w.message) for w in caught)
+    assert s.mom_buf.dtype == torch_dt
+    assert s.mom_scale is None
 
 
 def test_muon_int4_raises_not_implemented():
@@ -421,13 +423,19 @@ def test_adamw_parity_default_and_explicit_bf16():
     assert torch.equal(lin_a.weight.data, lin_b.weight.data)
 
 
-def test_muon_step_runs_for_int8_and_fallback_paths():
-    """int8 momentum (canonical) and floating-momentum-fallback
-    both produce a step() that updates the weight.
+def test_muon_step_runs_for_int8_and_floating_storage_paths():
+    """int8 momentum (canonical) and full-precision bf16/fp16/fp32
+    momentum all produce a step() that updates the weight.
     """
+    # GPU is required: step() runs NS on GPU and syncs the
+    # current CUDA stream. Skip cleanly when CUDA is unavailable.
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda", 0)
+
     # int8 momentum (canonical yml path)
     torch.manual_seed(0)
-    p1 = nn.Parameter(torch.randn(8, 8))
+    p1 = nn.Parameter(torch.randn(8, 8, device=device))
     opt1 = CPUMuon([p1], precision=PrecisionConfig(
         muon_momentum=TensorPrecision(dtype=DType.INT8, scale=ScaleMode.PER_CHANNEL),
     ))
@@ -437,15 +445,12 @@ def test_muon_step_runs_for_int8_and_fallback_paths():
     opt1.step()
     assert not torch.equal(p1.data, initial)
 
-    # bf16 momentum → falls back to int8 storage, but the
-    # algorithm still runs and updates the weight.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        torch.manual_seed(0)
-        p2 = nn.Parameter(torch.randn(8, 8))
-        opt2 = CPUMuon([p2], precision=PrecisionConfig(
-            muon_momentum=TensorPrecision(dtype=DType.BF16),
-        ))
+    # bf16 momentum → full-precision storage, no dequant/requant.
+    torch.manual_seed(0)
+    p2 = nn.Parameter(torch.randn(8, 8, device=device))
+    opt2 = CPUMuon([p2], precision=PrecisionConfig(
+        muon_momentum=TensorPrecision(dtype=DType.BF16),
+    ))
     p2.grad = torch.randn_like(p2) * 0.01
     accumulate_grads_to_cpu([opt2])
     initial2 = p2.data.clone()
