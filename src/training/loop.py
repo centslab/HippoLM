@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import queue
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -145,6 +146,13 @@ def _setup_worker(
     # history. gloo doesn't have device_id, so we skip that
     # argument for the sim path.
     torch.cuda.set_device(gpus[rank])
+    # TF32 for FP32 tensor-core matmul (FP16 weights + FP16
+    # activations still use tensor cores; this is for any leftover
+    # FP32 matmuls — layer norms etc.). "high" picks the fastest of
+    # the three TF32 modes (10-bit mantissa); "highest" is exact FP32
+    # for numerics-sensitive work. The global default is "highest"
+    # so "high" is a deliberate opt-in for speed.
+    torch.set_float32_matmul_precision("high")
     backend = "gloo" if args.tp_sim else "nccl"
     pg_kwargs: dict = dict(
         backend=backend,
@@ -369,17 +377,55 @@ def _setup_worker(
     n_muon = sum(s.param.numel() for s in muon_opt.state.values())
     n_adamw = sum(s.param.numel() for s in adamw_opt.state.values())
     n_muon_rows = sum(s.shape[0] for s in muon_opt.state.values())
-    muon_bytes = (
-        n_muon * 1             # int8 momentum
-        + n_muon_rows * 2      # BF16 per-row scale
-        + n_muon * 2           # BF16 accum
+    # Per-param byte breakdown, kept in named variables so the log
+    # line below (and any future debugger) can see the components
+    # separately. The big one is always the ``accum`` (BF16, one
+    # element per param) — it's the grad accumulator for
+    # ``gradient_accumulation_steps`` and is the bulk of the
+    # state.
+    #
+    # Muon's momentum storage dtype is configurable
+    # (``precision.muon_momentum``): int8 with a BF16 per-row
+    # scale (canonical), or full-precision bf16/fp16/fp32 (no
+    # scale). We read the actual dtype off the first state
+    # entry rather than hardcoding, so the log message reflects
+    # whatever the user configured.
+    muon_states = list(muon_opt.state.values())
+    if muon_states:
+        muon_mom_dtype = muon_states[0].mom_buf.dtype
+        muon_mom_bytes_per_elt = muon_mom_dtype.itemsize
+        # Scale tensor exists only for int8 storage (None for fp*).
+        muon_has_scale = muon_states[0].mom_scale is not None
+    else:
+        muon_mom_dtype = torch.int8
+        muon_mom_bytes_per_elt = 1
+        muon_has_scale = False
+    muon_mom = n_muon * muon_mom_bytes_per_elt
+    muon_scale = (n_muon_rows * 2) if muon_has_scale else 0
+    muon_accum = n_muon * 2  # BF16 accum (precision.gradients)
+    adamw_m = n_adamw * 2
+    adamw_v = n_adamw * 2
+    adamw_accum = n_adamw * 2
+    muon_bytes = muon_mom + muon_scale + muon_accum
+    adamw_bytes = adamw_m + adamw_v + adamw_accum
+    muon_mom_label = (
+        f"{str(muon_mom_dtype).replace('torch.', '')}_mom"
     )
-    adamw_bytes = n_adamw * 6  # BF16 m + BF16 v + BF16 accum
+    muon_scale_str = (
+        f" + bf16_scale={muon_scale / 1024**3:.3f} GB"
+        if muon_has_scale else ""
+    )
     logger.info(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
-        f" ({muon_bytes / 1024**3:.2f} GB int8 momentum + BF16 scale on CPU),"
+        f" ({muon_bytes / 1024**3:.2f} GB total:"
+        f" {muon_mom_label}={muon_mom / 1024**3:.3f} GB"
+        f"{muon_scale_str}"
+        f" + bf16_accum={muon_accum / 1024**3:.3f} GB),"
         f" AdamW params={n_adamw:,}"
-        f" ({adamw_bytes / 1024**3:.2f} GB BF16 m+v on CPU)."
+        f" ({adamw_bytes / 1024**3:.2f} GB total:"
+        f" bf16_m={adamw_m / 1024**3:.3f} GB"
+        f" + bf16_v={adamw_v / 1024**3:.3f} GB"
+        f" + bf16_accum={adamw_accum / 1024**3:.3f} GB)."
     )
 
     return {
@@ -438,6 +484,7 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
             if rank == 0:
                 logger.info(f"Epoch {epoch + 1}/{args.epochs}")
             for batch_idx, batch in enumerate(dataloader):
+                _mb_t_loop_start = time.perf_counter()
                 if global_step >= args.max_steps:
                     if rank == 0:
                         logger.info(
@@ -456,6 +503,12 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
 
                 input_ids = batch["input_ids"].to(gpus[rank], non_blocking=True)
                 labels = batch["labels"].to(gpus[rank], non_blocking=True)
+                # End of "data wait + H2D" phase. The time from
+                # ``_mb_t_loop_start`` to here is dominated by the
+                # queue wait when the prefetcher is slower than the
+                # consumer (data-path-bound) and by the small
+                # ``.to(non_blocking=True)`` H2D copy otherwise.
+                _mb_t_data_end = time.perf_counter()
 
                 # Autocast is driven by ``precision.activations``:
                 # fp16 / bf16 enable autocast with that dtype; fp32
@@ -468,6 +521,8 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 ):
                     outputs = model(input_ids, labels=labels)
                     loss = outputs["loss"]
+                torch.cuda.synchronize(gpus[rank])
+                _mb_t_fwd_end = time.perf_counter()
                 mb_loss = loss.detach().float().item()
                 if rank == 0 and (
                     global_step < _DIAG_STEPS or not math.isfinite(mb_loss)
@@ -476,17 +531,28 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         f"  [diag] mb={batch_idx} loss={mb_loss:.6e}"
                     )
                 (loss / args.gradient_accumulation_steps).backward()
+                torch.cuda.synchronize(gpus[rank])
+                _mb_t_bwd_end = time.perf_counter()
                 accumulated_loss += mb_loss
 
-                # Sync CUDA and apply the CPU-side adds for the
-                # D2H transfers that the per-param hooks issued
-                # during ``backward()`` above. The hooks (see
-                # :func:`register_grad_offload_hooks`) already
-                # cleared each ``.grad`` as they fired, so the
-                # peak GPU grad memory at this point is at most
-                # one param's grad (whatever autograd is
-                # currently processing — none, since backward
-                # has returned).
+                # Per-microbatch flush. The per-param post-accumulate-grad
+                # hooks (see :func:`register_grad_offload_hooks`) issue
+                # D2H transfers; we sync the current device's stream and
+                # fold the CPU src tensors into ``s.accum`` so the
+                # pending list does NOT grow across microbatches.
+                #
+                # Why not defer the sync to the end of the cycle?
+                # The DMAs each carry a pinned CPU source buffer. With
+                # ``gradient_accumulation_steps=64`` and ~1 GB of grads
+                # per microbatch, deferring would pin ~64 GB of CPU
+                # memory before any flush — well over the system
+                # pinned-memory budget. The per-microbatch sync waits
+                # for the current stream's DMAs to complete (~100-200 µs
+                # on a 5060Ti; negligible vs the 100+ ms forward/backward
+                # of the next microbatch, which itself is the real
+                # bottleneck). The end-of-cycle flush below is now a
+                # no-op (the queue is already empty) but is kept as
+                # belt-and-suspenders for correctness.
                 flush_pending_grads(sync_device=gpus[rank])
                 # Manual flush for the tied-embed params (see
                 # :data:`src.training.param_offload._manual_flush_param_ids`):
@@ -497,10 +563,43 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # the *complete* grad. No-op for any model without
                 # tied / custom-autograd params.
                 flush_manual_flush_params([muon_opt, adamw_opt])
+                _mb_t_sync_end = time.perf_counter()
                 del loss, outputs, input_ids, labels
                 microbatch_in_cycle += 1
 
+                # Per-microbatch timing log, opt-in via
+                # ``--mb_timing N``. Logs the first N microbatches of
+                # every step (not just the first step) so you can see
+                # whether the breakdown changes mid-training. Read
+                # the column with the largest value to localize the
+                # slow phase:
+                #   data_ms  = queue wait + .to()  (data path slow?)
+                #   fwd_ms   = forward  (model/KDA slow?)
+                #   bwd_ms   = backward (model/KDA slow?)
+                #   sync_ms  = D2H wait + CPU add (DMA/CPU add slow?)
+                mb_timing = getattr(args, "mb_timing", 0)
+                if (
+                    rank == 0
+                    and mb_timing > 0
+                    and microbatch_in_cycle <= mb_timing
+                ):
+                    logger.info(
+                        f"  [mb-time] step={global_step}"
+                        f" mb={microbatch_in_cycle}/{args.gradient_accumulation_steps}"
+                        f" data_ms={(_mb_t_data_end - _mb_t_loop_start) * 1000:6.1f}"
+                        f" fwd_ms={(_mb_t_fwd_end - _mb_t_data_end) * 1000:6.1f}"
+                        f" bwd_ms={(_mb_t_bwd_end - _mb_t_fwd_end) * 1000:6.1f}"
+                        f" sync_ms={(_mb_t_sync_end - _mb_t_bwd_end) * 1000:6.1f}"
+                    )
+
                 if microbatch_in_cycle >= args.gradient_accumulation_steps:
+                    # End-of-cycle sync. Already a no-op given the
+                    # per-microbatch flush above, but kept so the
+                    # accumulator reads below (inf/nan check, grad-norm,
+                    # optimizer step) see a fully synced queue even
+                    # if the per-microbatch flush is later changed
+                    # (e.g. amortized over K microbatches).
+                    flush_pending_grads(sync_device=gpus[rank])
                     # Inf/nan check on the accumulated CPU grads.
                     found_inf = False
                     for opt in (muon_opt, adamw_opt):

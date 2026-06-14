@@ -140,6 +140,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use_dummy_data", action="store_true", default=False,
                    help="Skip the streaming/tokenize path and use a "
                         "random dummy DataLoader. Fastest smoke test.")
+    p.add_argument("--mb_timing", type=int, default=0,
+                   help="If > 0, log per-microbatch timing breakdown "
+                        "(data_ms / h2d_ms / fwd_ms / bwd_ms / sync_ms) for "
+                        "the first N microbatches of every step. Use to "
+                        "localize which phase of a microbatch is slow.")
     p.add_argument(
         "--shuffle", type=bool, default=True,
         help="Shuffle the streaming dataset. Disable (--shuffle false) for "
