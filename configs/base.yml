@@ -33,9 +33,9 @@ epochs: 1
 max_steps: 1000
 batch_size: 4
 seq_len: 4096
-learning_rate: 0.03
+learning_rate: 0.01
 weight_decay: 0.01
-gradient_accumulation_steps: 64
+gradient_accumulation_steps: 16
 
 # Optimizer
 muon_lr: 0.02            # Muon (2D matrices) learning rate
@@ -56,10 +56,10 @@ seed: 42                 # RNG seed for replicated-param init on each device.
 # fp16 / bf16 enable ``torch.amp.autocast`` with that dtype; fp32
 # disables autocast and runs a pure FP32 forward.
 precision:
-  model_weights: { dtype: fp16 }
+  model_weights: { dtype: bf16 }
   gradients:     { dtype: bf16 }
-  activations:   { dtype: fp16 }
-  muon_momentum: { dtype: int8,  scale: per-channel }
+  activations:   { dtype: bf16 }
+  muon_momentum: { dtype: bf16 }
   adamw_m:       { dtype: bf16 }
   adamw_v:       { dtype: bf16 }
 
