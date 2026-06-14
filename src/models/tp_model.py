@@ -245,12 +245,17 @@ class TPSwiGLU(nn.Module):
 
     def __init__(self, config, device=None, dtype=None) -> None:
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
-            config.hidden_size, config.intermediate_size,
-            bias=config.use_bias, device=device, dtype=dtype,
-        )
-        self.up_proj = ColumnParallelLinear(
-            config.hidden_size, config.intermediate_size,
+        # Fused gate+up projection: one ColumnParallelLinear with
+        # output = 2 * intermediate_size. The first ``intermediate``
+        # output channels are the gate, the next ``intermediate``
+        # are the up. This halves the matmul kernel-launch count
+        # vs. two separate ColumnParallelLinear's (3 -> 2 per
+        # SwiGLU). Bias: when ``use_bias`` is True the fused bias
+        # is one tensor of size ``2 * intermediate_per_partition``
+        # on this rank (gate half then up half); we expose it as
+        # ``self.gate_up_bias`` so the forward can split it.
+        self.gate_up_proj = ColumnParallelLinear(
+            config.hidden_size, 2 * config.intermediate_size,
             bias=config.use_bias, device=device, dtype=dtype,
         )
         self.down_proj = RowParallelLinear(
@@ -259,12 +264,15 @@ class TPSwiGLU(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is replicated (full hidden). gate/up produce
-        # sharded intermediate slices on this rank. down is
-        # row-parallel and all-reduces back to full hidden.
-        gate = F.silu(self.gate_proj(x))
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
+        # x is replicated (full hidden). gate_up_proj produces
+        # sharded intermediate slices on this rank: the first
+        # ``inter_per_partition`` channels are the gate, the next
+        # ``inter_per_partition`` are the up. down is row-parallel
+        # and all-reduces back to full hidden.
+        gu = self.gate_up_proj(x)
+        inter_per_partition = self.gate_up_proj.out_features_per_partition // 2
+        gate, up = gu.split(inter_per_partition, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 # --------------------------------------------------------------------------- #
@@ -659,10 +667,16 @@ class TPKDA(nn.Module):
         self.layer_idx = layer_idx
         self.norm_eps = config.rms_norm_eps
 
-        # ---- Column-parallel projections (q / k / v) ---- #
-        self.q_proj = ColumnParallelLinear(h, key_dim, bias=False, device=device, dtype=dtype)
-        self.k_proj = ColumnParallelLinear(h, key_dim, bias=False, device=device, dtype=dtype)
-        self.v_proj = ColumnParallelLinear(h, value_dim, bias=False, device=device, dtype=dtype)
+        # ---- Fused QKV projection (column-parallel) ---- #
+        # One ColumnParallelLinear with output = 2*key_dim + value_dim.
+        # Output channels: [0:key_per_partition] = Q,
+        # [key_per_partition:2*key_per_partition] = K,
+        # [2*key_per_partition:2*key_per_partition+value_per_partition] = V.
+        # Saves 2 kernel launches per KDA layer (3 -> 1).
+        self.qkv_proj = ColumnParallelLinear(
+            h, 2 * key_dim + value_dim, bias=False,
+            device=device, dtype=dtype,
+        )
 
         # ---- Depthwise conv1d (per-channel, sharded) ---- #
         if config.use_short_conv:
@@ -679,23 +693,30 @@ class TPKDA(nn.Module):
                 bias=config.conv_bias, activation="silu",
             ).to(device=device, dtype=dtype)
 
-        # ---- f_proj / g_proj (replicated first, column-parallel second) ---- #
+        # ---- Fused FG first layer + split FG second layer ---- #
         # The first layer of each is ``hidden → head_v_dim`` where
         # ``head_v_dim`` is a per-head bottleneck (the same on every
-        # rank), so it's a vanilla ``nn.Linear`` (replicated). The
-        # second layer is ``head_v_dim → gate_dim`` (or
-        # ``head_v_dim → value_dim``) and is sharded across the
-        # TP group along the output dim: each rank produces
-        # ``gate_dim // world`` channels. The intermediate
-        # ``head_v_dim`` is the *same* tensor on every rank, so
-        # the second layer's column-parallel matmul is well-defined.
-        self.f_proj = nn.Sequential(
-            nn.Linear(h, d_v, bias=False, device=device, dtype=dtype),
-            ColumnParallelLinear(d_v, gate_dim, bias=False, device=device, dtype=dtype),
+        # rank), so it's a vanilla ``nn.Linear`` (replicated). We
+        # fuse the two first layers into one ``nn.Linear`` with
+        # output = 2*d_v (saves 1 kernel launch per KDA layer).
+        #
+        # The second layers are NOT fused: packing f and g into one
+        # big ``ColumnParallelLinear(2*d_v, gate_dim + value_dim)``
+        # requires a weight matrix with 50% zeros (the off-diagonal
+        # blocks). The fused matmul would execute those zero*input
+        # FMAs, doubling the FLOPs of this layer with no compute
+        # benefit. So we keep f_proj[1] and g_proj[1] as separate
+        # ColumnParallelLinear's. (Tested empirically in
+        # test_fused_proj_bench.py: fusing FG-second makes TPKDA
+        # ~5% slower.)
+        self.fg_first = nn.Linear(
+            h, 2 * d_v, bias=False, device=device, dtype=dtype,
         )
-        self.g_proj = nn.Sequential(
-            nn.Linear(h, d_v, bias=False, device=device, dtype=dtype),
-            ColumnParallelLinear(d_v, value_dim, bias=True, device=device, dtype=dtype),
+        self.f_proj1 = ColumnParallelLinear(
+            d_v, gate_dim, bias=False, device=device, dtype=dtype,
+        )
+        self.g_proj1 = ColumnParallelLinear(
+            d_v, value_dim, bias=True, device=device, dtype=dtype,
         )
 
         # ---- b_proj: column-parallel on num_v_heads ---- #
@@ -742,10 +763,14 @@ class TPKDA(nn.Module):
         """
         from einops import rearrange
 
-        # q/k/v projections (column-parallel) -> [B, T, c_per_rank]
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        # Fused QKV: one matmul produces [B, T, 2*key+v] which
+        # we split into Q / K / V per rank. Saves 2 kernel
+        # launches vs. 3 separate projections.
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(
+            [self.key_per_partition, self.key_per_partition, self.value_per_partition],
+            dim=-1,
+        )
 
         if self.use_short_conv:
             # Depthwise conv1d on each rank's channel slice.
@@ -762,10 +787,18 @@ class TPKDA(nn.Module):
             k = F.silu(k)
             v = F.silu(v)
 
-        # f_proj, g_proj, b_proj (column-parallel).
-        g = self.f_proj(x)
+        # FG path: one nn.Linear (``fg_first``) produces the
+        # concatenated f/g intermediates; two separate
+        # ColumnParallelLinear's (``f_proj1``, ``g_proj1``) project
+        # each to its output. We keep the second layers split
+        # because fusing them would require a 50%-zero weight
+        # matrix and double the FLOPs of this layer (see comment
+        # in __init__).
+        fg_first = self.fg_first(x)
+        f_inter, g_inter = fg_first.chunk(2, dim=-1)
+        g = self.f_proj1(f_inter)
+        g_for_norm = self.g_proj1(g_inter)
         beta = self.b_proj(x).sigmoid()
-        g_for_norm = self.g_proj(x)
 
         # Reshape to per-head: each rank has ``hpp`` heads.
         # q, k: [B, T, hpp, head_k_dim]
