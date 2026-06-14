@@ -46,6 +46,7 @@ from src.training.diagnostics import log_post_opt_diag, log_pre_step_diag
 from src.training.param_offload import (
     accumulate_grads_to_cpu,
     build_param_groups,
+    flush_manual_flush_params,
     flush_pending_grads,
     register_grad_offload_hooks,
     zero_cpu_grad_accum,
@@ -346,7 +347,25 @@ def _setup_worker(
     # training loop calls :func:`flush_pending_grads` once per
     # microbatch to sync CUDA and apply the CPU adds. See
     # :func:`register_grad_offload_hooks` for the design.
-    register_grad_offload_hooks([muon_opt, adamw_opt])
+    #
+    # ``manual_flush_params`` are the tied-embed params whose
+    # grad is the sum of (a) the natural-path grad from
+    # ``nn.Embedding`` and (b) the FusedLinearCE dw, which is
+    # added by ``_TiedFusedLCEFunction.backward`` AFTER the
+    # natural-path ``accumulate_grad_`` has fired. For these
+    # params we skip the streaming hook and instead call
+    # :func:`flush_manual_flush_params` per microbatch (after
+    # ``backward()`` returns) so we read the *complete* grad.
+    manual_flush = []
+    embed_param = model.replicated_per_device[gpus[0]].get(
+        "embed_tokens", None
+    )
+    if embed_param is not None and hasattr(embed_param, "weight"):
+        manual_flush.append(embed_param.weight)
+    register_grad_offload_hooks(
+        [muon_opt, adamw_opt],
+        manual_flush_params=manual_flush or None,
+    )
     n_muon = sum(s.param.numel() for s in muon_opt.state.values())
     n_adamw = sum(s.param.numel() for s in adamw_opt.state.values())
     n_muon_rows = sum(s.shape[0] for s in muon_opt.state.values())
@@ -469,6 +488,15 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # currently processing — none, since backward
                 # has returned).
                 flush_pending_grads(sync_device=gpus[rank])
+                # Manual flush for the tied-embed params (see
+                # :data:`src.training.param_offload._manual_flush_param_ids`):
+                # their grad arrives via a custom autograd Function
+                # that fires after the natural-path accumulate_grad_,
+                # so we read ``p.grad`` once at the end of each
+                # microbatch (post the full ``backward()``) to get
+                # the *complete* grad. No-op for any model without
+                # tied / custom-autograd params.
+                flush_manual_flush_params([muon_opt, adamw_opt])
                 del loss, outputs, input_ids, labels
                 microbatch_in_cycle += 1
 

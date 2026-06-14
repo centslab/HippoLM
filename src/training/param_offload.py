@@ -780,8 +780,25 @@ def accumulate_grads_to_cpu(
 # :func:`flush_pending_grads` syncs CUDA and applies the adds.
 _pending_grads: list[tuple[torch.Tensor, torch.Tensor]] = []
 
+# Module-level set of param ``id(p)`` for params that need a
+# *post-backward* manual flush instead of (or in addition to) the
+# per-param streaming hook. The only param in this category for
+# HippoLM is the tied ``embed_tokens.weight``: the FusedLinearCE
+# grad arrives via a custom autograd Function that fires AFTER
+# the natural-path ``accumulate_grad_`` (which is what triggers
+# the per-param hook). If we cleared ``p.grad`` in the hook, the
+# manual ``add_`` from the custom autograd would lazy-create a
+# separate grad tensor, splitting the embed's grad across GPU +
+# CPU. Skipping the hook for these params and reading
+# ``p.grad`` once at ``flush_pending_grads`` time sees the
+# final (post-add_) grad and copies the whole thing.
+_manual_flush_param_ids: set[int] = set()
 
-def register_grad_offload_hooks(optimizers: List) -> None:
+
+def register_grad_offload_hooks(
+    optimizers: List,
+    manual_flush_params: Optional[List[nn.Parameter]] = None,
+) -> None:
     """Install a per-param post-accumulate-grad hook that streams
     each param's grad to the CPU as it is computed.
 
@@ -817,10 +834,23 @@ def register_grad_offload_hooks(optimizers: List) -> None:
     BF16 accumulator matches the BF16 m/v storage in the
     AdamW path so no further cast is needed at step() time.
 
+    ``manual_flush_params`` (optional): list of params whose
+    grad arrives via a custom autograd Function that fires
+    AFTER the natural-path ``accumulate_grad_`` (e.g. tied
+    embeddings whose LCE grad is added by a custom Function in
+    the model's backward). For these params the per-param hook
+    is **skipped** (would clear the in-progress grad), and the
+    manual ``accumulate_grads_to_cpu`` path runs once per
+    microbatch in :func:`flush_pending_grads`. See the comment
+    on ``_manual_flush_param_ids`` for the gory details.
+
     Must be called AFTER ``build_param_groups`` (so the per-param
     state exists) and BEFORE the first ``backward()``. Typically
     called once per worker in :func:`_setup_worker`.
     """
+    _manual_flush_param_ids.clear()
+    if manual_flush_params:
+        _manual_flush_param_ids.update(id(p) for p in manual_flush_params)
     seen: set[int] = set()
     for opt in optimizers:
         for s in opt.state.values():
@@ -828,6 +858,10 @@ def register_grad_offload_hooks(optimizers: List) -> None:
             if id(p) in seen:
                 continue
             seen.add(id(p))
+            if id(p) in _manual_flush_param_ids:
+                # Skip the per-param hook; flush_pending_grads
+                # handles this param via the manual path.
+                continue
             p.register_post_accumulate_grad_hook(_make_offload_hook(s))
     # Defensive: clear any stale entries (e.g. from a previous
     # run sharing the module-level queue).
@@ -886,6 +920,57 @@ def _make_offload_hook(s: _ParamState):
     return hook
 
 
+def flush_manual_flush_params(optimizers: List) -> None:
+    """Copy the GPU grad of every ``manual_flush`` param to its
+    CPU accumulator and free the GPU copy.
+
+    Intended to be called by the training loop AFTER the full
+    microbatch ``backward()`` has returned, alongside
+    :func:`flush_pending_grads`. By the time this runs, any
+    custom-autograd manual ``add_`` (e.g. the FusedLinearCE dw
+    scatter in :class:`_TiedFusedLCEFunction`) has already
+    landed in ``p.grad``, so the value we read here is the
+    *complete* microbatch grad.
+
+    This is the per-microbatch ``accumulate_grads_to_cpu`` path
+    scoped to just the params in
+    :data:`_manual_flush_param_ids` — all the other params go
+    through the streaming post-accumulate-grad hook instead.
+
+    Idempotent within a single microbatch: calling it twice
+    before the next backward would no-op the second time
+    (the GPU grad is cleared after the first call).
+    """
+    if not _manual_flush_param_ids:
+        return
+    pending: list[tuple[torch.Tensor, torch.Tensor]] = []
+    seen: set[int] = set()
+    for opt in optimizers:
+        for s in opt.state.values():
+            p = s.param
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            if id(p) not in _manual_flush_param_ids:
+                continue
+            g = p.grad
+            if g is None:
+                continue
+            src_cpu = (
+                g.detach()
+                .to(s.accum.dtype)
+                .reshape(-1)
+                .to("cpu", non_blocking=True)
+            )
+            pending.append((s.accum, src_cpu))
+            p.grad = None
+    if not pending:
+        return
+    torch.cuda.synchronize()
+    for target, src in pending:
+        target.add_(src)
+
+
 def flush_pending_grads(sync_device: int | None = None) -> None:
     """Sync CUDA and apply the CPU-side adds for any D2H transfers
     issued by the post-accumulate-grad hooks since the last flush.
@@ -900,8 +985,16 @@ def flush_pending_grads(sync_device: int | None = None) -> None:
     synchronize, no work). Safe to call multiple times per
     microbatch, though the training loop calls it once.
 
-    For the manual path (no hooks installed — e.g. unit tests
-    that set ``.grad`` directly), use
+    NOTE: this function only flushes the **per-param-hook**
+    queue. Params whose per-param hook was deliberately skipped
+    (see :data:`_manual_flush_param_ids` — typically the tied
+    embed whose grad arrives via a custom autograd Function
+    that fires after the natural-path accumulate_grad_) need
+    :func:`flush_manual_flush_params` called separately, after
+    this function.
+
+    For the manual-only path (no hooks installed at all — e.g.
+    unit tests that set ``.grad`` directly), use
     :func:`accumulate_grads_to_cpu` instead.
     """
     if not _pending_grads:

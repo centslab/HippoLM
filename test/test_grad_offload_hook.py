@@ -34,6 +34,7 @@ sys.path.insert(0, str(_REPO))
 
 from src.training.param_offload import (
     build_param_groups,
+    flush_manual_flush_params,
     flush_pending_grads,
     register_grad_offload_hooks,
     zero_cpu_grad_accum,
@@ -86,6 +87,8 @@ def test_grad_offload_hook_uses_real_grad_not_param():
         y = model(x).float().pow(2).mean()
         (y / 4).backward()
         flush_pending_grads(sync_device=device)
+        # No manual-flush params in this test; call is a no-op.
+        flush_manual_flush_params([opt])
 
     # Check: s.accum should hold 4 × (grad/4) = mean(grad) ≈
     # the true grad. Its L2 norm should be in the same order of
