@@ -767,13 +767,27 @@ def _make_offload_hook(s: _ParamState):
     """Build the post-accumulate-grad hook for one param. Closes
     over ``s`` so the hook can find the CPU accumulator and the
     target dtype without a per-call dict lookup.
+
+    PyTorch contract reminder: per the
+    :meth:`torch.Tensor.register_post_accumulate_grad_hook`
+    docstring, the argument passed to the hook is the **leaf
+    tensor** (``param``), NOT the gradient. The gradient lives
+    on ``param.grad`` at the moment the hook fires. Using ``g``
+    as if it were the grad (the previous behaviour in this
+    file) silently streamed the param values to CPU every
+    microbatch — the root cause of a multi-day "loss not
+    decreasing" incident. Always read ``p.grad`` here.
     """
     p = s.param
     accum = s.accum
     target_dtype = accum.dtype
 
     def hook(g: torch.Tensor | None) -> None:
-        if g is None:
+        # ``g`` is the leaf param per the PyTorch API contract.
+        # We need the grad, which is on ``p.grad`` at this
+        # point. (See the docstring above for the why.)
+        grad = p.grad
+        if grad is None:
             # The param had no grad this backward (e.g. it was
             # in a no-grad branch). Nothing to offload.
             return None
@@ -784,7 +798,7 @@ def _make_offload_hook(s: _ParamState):
         # carrying autograd metadata (we never want to backprop
         # through a grad-DMA).
         src = (
-            g.detach()
+            grad.detach()
             .to(target_dtype)
             .reshape(-1)
             .to("cpu", non_blocking=True)
