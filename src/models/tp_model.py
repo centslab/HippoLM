@@ -766,17 +766,39 @@ class TPGDN2(nn.Module):
             value_dim, h, bias=False, device=device, dtype=dtype,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Forward pass. ``x`` is the full hidden (replicated
         across the TP group). Returns full hidden (after the
         ``o_proj`` all-reduce).
+
+        When ``cu_seqlens`` is supplied the batch dim is folded
+        into the sequence dim so the GDN2 chunkwise kernel sees
+        ``batch_size=1`` (its hard requirement when varlen state
+        reset is in use). All projections run on the flattened
+        ``[1, B*T, hidden]`` tensor and the output is reshaped
+        back to ``[B, T, hidden]`` before ``o_proj``.
         """
         from einops import rearrange
+
+        # Packed path: fold batch dim into seq dim. The QKV /
+        # FG / gate projections are just matmuls and don't care
+        # about the leading-dim interpretation; only the chunkwise
+        # recurrence cares, and it requires ``B=1`` when
+        # ``cu_seqlens`` is set.
+        B, T, hidden = x.shape
+        if cu_seqlens is not None:
+            x_in = x.reshape(1, B * T, hidden)
+        else:
+            x_in = x
 
         # Fused QKV: one matmul produces [B, T, 2*key+v] which
         # we split into Q / K / V per rank. Saves 2 kernel
         # launches vs. 3 separate projections.
-        qkv = self.qkv_proj(x)
+        qkv = self.qkv_proj(x_in)
         q, k, v = qkv.split(
             [self.key_per_partition, self.key_per_partition, self.value_per_partition],
             dim=-1,
@@ -788,10 +810,14 @@ class TPGDN2(nn.Module):
             # causal padding, applied per-channel.
             # ``ShortConvolution.forward`` returns ``(y, cache)``;
             # we discard the cache because training uses the
-            # chunk path (no incremental decoding).
-            q, _ = self.q_conv1d(q)
-            k, _ = self.k_conv1d(k)
-            v, _ = self.v_conv1d(v)
+            # chunk path (no incremental decoding). When
+            # ``cu_seqlens`` is set the vendored
+            # :class:`ShortConvolution` resets the causal state at
+            # each doc boundary so a depthwise conv kernel does
+            # not blur tokens across an unrelated document.
+            q, _ = self.q_conv1d(q, cu_seqlens=cu_seqlens)
+            k, _ = self.k_conv1d(k, cu_seqlens=cu_seqlens)
+            v, _ = self.v_conv1d(v, cu_seqlens=cu_seqlens)
         else:
             q = F.silu(q)
             k = F.silu(k)
@@ -804,7 +830,7 @@ class TPGDN2(nn.Module):
         # because fusing them would require a 50%-zero weight
         # matrix and double the FLOPs of this layer (see comment
         # in __init__).
-        fg_first = self.fg_first(x)
+        fg_first = self.fg_first(x_in)
         f_inter, g_inter = fg_first.chunk(2, dim=-1)
         g = self.f_proj1(f_inter)
         g_for_norm = self.g_proj1(g_inter)
@@ -812,8 +838,8 @@ class TPGDN2(nn.Module):
         # Channel-wise gates (NEW vs KDA). Both squashed to [0, 1]:
         #   b: erase gate on the K axis (replaces KDA's scalar beta)
         #   w: write gate on the V axis (NEW for GDN2)
-        b = self.b_proj(x).sigmoid()
-        w = self.w_proj(x).sigmoid()
+        b = self.b_proj(x_in).sigmoid()
+        w = self.w_proj(x_in).sigmoid()
 
         # Reshape to per-head: each rank has ``hpp`` heads.
         # q, k: [B, T, hpp, head_k_dim]
@@ -835,17 +861,25 @@ class TPGDN2(nn.Module):
         # ``use_gate_in_kernel=True`` makes the kernel compute the
         # softplus(g + dt_bias) * -exp(A_log) activation internally
         # (saves a separate activation kernel launch).
+        # ``cu_seqlens`` flows straight through to the chunkwise
+        # recurrence when set.
         o, _ = self._chunk_gdn2(
             q=q, k=k, v=v, g=g, b=b, w=w,
             A_log=self.A_log, dt_bias=self.dt_bias,
             initial_state=None, output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
-            cu_seqlens=None,
+            cu_seqlens=cu_seqlens,
         )
 
+        # o has shape ``x_in.shape[:-1] + (hpp, head_v_dim)``.
+        # Reshape back to ``[B, T, hpp, head_v_dim]`` when the
+        # packed path flattened the leading dims.
+        if cu_seqlens is not None:
+            o = o.reshape(B, T, self.hpp, self.head_v_dim)
+            g_for_norm = g_for_norm.reshape(B, T, self.hpp, self.head_v_dim)
+
         # o_norm: per-head RMSNorm on the last dim.
-        # g_for_norm is [B, T, hpp, head_v_dim].
         g_for_norm = rearrange(g_for_norm, "... (h d) -> ... h d", d=self.head_v_dim)
         o = self.o_norm(o, g_for_norm)
         o = rearrange(o, "b t h d -> b t (h d)")
@@ -888,17 +922,26 @@ class TPHippoLayer(nn.Module):
         self.gdn2 = _to(TPGDN2(config, layer_idx=layer_idx))
         self.ffn = TPSwiGLU(config, device=device, dtype=dtype)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Standard residual transformer layer on the local device.
 
         Args:
             x: ``[B, T, hidden_size]`` replicated hidden state.
+            cu_seqlens: optional ``[total_docs + 1]`` long tensor
+                with global offsets across the flattened
+                ``[batch_size * seq_len]`` sequence. Forwarded
+                to the GDN2 sub-layer only; FFN / RMSNorm do not
+                depend on the doc layout.
 
         Returns:
             ``[B, T, hidden_size]`` after GDN2 and FFN with
             standard residual connections.
         """
-        x = x + self.gdn2(self.attn_norm(x))
+        x = x + self.gdn2(self.attn_norm(x), cu_seqlens=cu_seqlens)
         x = x + self.ffn(self.mlp_norm(x))
         return x
 
@@ -1173,6 +1216,7 @@ class TPHippoModel(nn.Module):
         self,
         block_layers,
         x: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run a contiguous group of ``len(block_layers)`` layers
         (one block) on the local device and return the block's
@@ -1185,16 +1229,33 @@ class TPHippoModel(nn.Module):
         ``x = x + SubLayer(x)``; there is no per-layer AttnRes
         call. AttnRes is invoked at the block boundary by the
         outer :meth:`forward` loop, not inside this body.
+
+        ``cu_seqlens`` is forwarded to every layer's GDN2 sub-
+        layer (FFN / RMSNorm ignore it). When this body runs
+        inside ``checkpoint.checkpoint`` the cu_seqlens tensor
+        is saved with the recomputation inputs automatically.
         """
         for layer in block_layers:
-            x = layer(x)
+            x = layer(x, cu_seqlens=cu_seqlens)
         return x
 
     def forward(
         self,
         input_ids: torch.Tensor,  # [B, T], lives on this rank's device
         labels: torch.Tensor | None = None,  # [B, T], same device
+        cu_seqlens: torch.Tensor | None = None,  # [total_docs+1]
     ) -> dict[str, torch.Tensor]:
+        """Run the full TP model forward.
+
+        ``cu_seqlens`` is the global offset tensor produced by
+        :func:`pack_chunk_aligned` — see that function's docstring
+        for the contract. When set the GDN2 sub-layer inside every
+        block resets the recurrent state at each ``cu_seqlens``
+        boundary; the rest of the model (FFN, RMSNorm, embed,
+        BlockAttnRes, lm_head) ignores it. The hidden state shape
+        is unchanged (``[B, T, hidden]`` on every rank) — only
+        the GDN2 sub-layer flattens / unflattens internally.
+        """
         device = input_ids.device.index if input_ids.device.type == "cuda" else input_ids.device
         embeds = self.replicated_per_device[device]["embed_tokens"](input_ids)
         attn_res = self.replicated_per_device[device]["attn_res"]
@@ -1242,7 +1303,7 @@ class TPHippoModel(nn.Module):
             end = start + block_size
             block_layers = layers[start:end]
             x = torch.utils.checkpoint.checkpoint(
-                self._block_forward, block_layers, x,
+                self._block_forward, block_layers, x, cu_seqlens,
                 use_reentrant=False, preserve_rng_state=False,
             )
             blocks.append(x)
@@ -1265,7 +1326,7 @@ class TPHippoModel(nn.Module):
             x = attn_res(blocks)
         last_start = last_block * block_size
         for layer in layers[last_start:]:
-            x = layer(x)
+            x = layer(x, cu_seqlens=cu_seqlens)
 
         hidden_states = self.replicated_per_device[device]["norm"](x)
         out: dict[str, torch.Tensor] = {}

@@ -44,17 +44,23 @@ class HippoLayer(nn.Module):
         self.gdn2 = GDN2(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Standard residual transformer layer.
 
         Args:
             x: ``[B, T, hidden_size]`` input.
+            cu_seqlens: optional varlen offsets passed through to
+                the GDN2 sub-layer (FFN / RMSNorm ignore it).
 
         Returns:
             ``[B, T, hidden_size]`` output after GDN2 and FFN with
             standard residual connections.
         """
-        x = x + self.gdn2(self.attn_norm(x))
+        x = x + self.gdn2(self.attn_norm(x), cu_seqlens=cu_seqlens)
         x = x + self.ffn(self.mlp_norm(x))
         return x
 
@@ -104,12 +110,18 @@ class HippoModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass.
 
         Args:
             input_ids: ``[batch_size, seq_len]``
             labels: Optional ``[batch_size, seq_len]`` for loss
+            cu_seqlens: Optional ``[total_docs + 1]`` global offset
+                tensor for chunk-aligned FFD-packed inputs. When
+                set the GDN2 sub-layer resets the recurrent state
+                at each ``cu_seqlens`` boundary. BlockAttnRes,
+                FFN, RMSNorm, embed, and lm_head all ignore it.
 
         Returns:
             Dict with ``logits`` and optionally ``loss``.
@@ -131,8 +143,9 @@ class HippoModel(nn.Module):
 
             start = block_idx * self.config.block_size
             end = start + self.config.block_size
-            for layer in self.layers[start:end]:
-                x = layer(x)  # Standard residual inside the block.
+            block_layers = self.layers[start:end]
+            for layer in block_layers:
+                x = layer(x, cu_seqlens=cu_seqlens)
             blocks.append(x)
 
         hidden_states = self.norm(blocks[-1])  # [B, T, D]

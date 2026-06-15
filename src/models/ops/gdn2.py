@@ -58,20 +58,57 @@ class GDN2(nn.Module):
             norm_eps=config.rms_norm_eps,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input tensor [batch_size, seq_len, hidden_size]
+            x: Input tensor ``[batch_size, seq_len, hidden_size]``.
+            cu_seqlens: optional ``[total_docs + 1]`` long tensor
+                with global offsets across the flattened
+                ``[batch_size * seq_len]`` sequence. When set, the
+                GDN2 layer is called with ``batch_size=1`` (the
+                batch dim is folded into the sequence dim) and the
+                kernel resets the recurrent state at each
+                ``cu_seqlens`` boundary. Without ``cu_seqlens`` the
+                layer treats every row of the input as an
+                independent sequence (the legacy single-doc-per-row
+                contract).
 
         Returns:
-            Output tensor [batch_size, seq_len, hidden_size]
+            Output tensor ``[batch_size, seq_len, hidden_size]``.
+            When ``cu_seqlens`` is set the output is reshaped back
+            from the ``[1, batch_size * seq_len, hidden_size]``
+            layout the kernel produced.
         """
-        output, _, _ = self.attn(
-            hidden_states=x,
+        if cu_seqlens is None:
+            # Legacy path: one doc per row, no varlen state reset.
+            output, _, _ = self.attn(
+                hidden_states=x,
+                attention_mask=None,
+                past_key_values=None,
+                use_cache=False,
+                output_attentions=False,
+            )
+            return output
+
+        # Packed path: fold the batch dim into the sequence dim so
+        # the kernel sees ``batch_size=1`` (its hard requirement
+        # when ``cu_seqlens`` is supplied, see the ``chunk_gdn2``
+        # wrapper). The vendored layer threads ``cu_seqlens``
+        # through to the conv1d (when ``use_short_conv=True``) and
+        # to the chunkwise recurrence.
+        B, T, H = x.shape
+        x_flat = x.reshape(1, B * T, H)
+        output_flat, _, _ = self.attn(
+            hidden_states=x_flat,
             attention_mask=None,
             past_key_values=None,
             use_cache=False,
             output_attentions=False,
+            cu_seqlens=cu_seqlens,
         )
-        return output
+        return output_flat.reshape(B, T, H)

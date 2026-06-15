@@ -10,7 +10,7 @@ from .cache import (
     get_cache_dir,
     list_cached_parts,
 )
-from .collate import collate_batch, ffd_pack_samples
+from .collate import collate_batch, pack_chunk_aligned
 from .dummy import dummy_dataloader
 from .parquet import LocalParquetIterable
 from .prefetch import ms_first_parquet_url, prefetch_first_parquet
@@ -33,7 +33,7 @@ from .streaming import MultiSourceStreamingDataset, StreamingDataset
 __all__ = [
     "get_cache_dir", "cache_path_for", "cache_path_for_part",
     "list_cached_parts",
-    "collate_batch", "ffd_pack_samples",
+    "collate_batch", "pack_chunk_aligned",
     "dummy_dataloader",
     "LocalParquetIterable",
     "ms_first_parquet_url", "prefetch_first_parquet",

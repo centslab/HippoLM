@@ -193,6 +193,7 @@ def _setup_worker(
         num_blocks=args.num_blocks,
         intermediate_size=args.intermediate_size,
         rms_norm_eps=args.rms_norm_eps,
+        pack_chunk_size=args.pack_chunk_size,
     )
     if rank == 0:
         logger.info(f"Model config: {config}")
@@ -296,7 +297,14 @@ def _setup_worker(
                     shuffle=args.shuffle,
                 )
             prefetcher = PrefetchBatcher(
-                dataset, batch_size=args.batch_size, queues=all_queues,
+                dataset,
+                batch_size=args.batch_size,
+                queues=all_queues,
+                seq_len=args.seq_len,
+                chunk_size=config.pack_chunk_size,
+                pad_id=tokenizer.pad_token_id,
+                eos_id=tokenizer.eos_token_id,
+                pack_buffer_size=args.pack_buffer_size,
             )
         else:
             prefetcher = None
@@ -501,6 +509,14 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
 
                 input_ids = batch["input_ids"].to(gpus[rank], non_blocking=True)
                 labels = batch["labels"].to(gpus[rank], non_blocking=True)
+                # ``cu_seqlens`` is produced on the owner rank by
+                # :class:`PrefetchBatcher` from the chunk-aware
+                # FFD packer and broadcast to every rank through
+                # the per-rank queues. Skip when the loader is the
+                # right-pad dummy path (no packing).
+                cu_seqlens = batch.get("cu_seqlens")
+                if cu_seqlens is not None:
+                    cu_seqlens = cu_seqlens.to(gpus[rank], non_blocking=True)
                 # End of "data wait + H2D" phase. The time from
                 # ``_mb_t_loop_start`` to here is dominated by the
                 # queue wait when the prefetcher is slower than the
@@ -517,7 +533,7 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     dtype=autocast_dtype,
                     enabled=autocast_enabled,
                 ):
-                    outputs = model(input_ids, labels=labels)
+                    outputs = model(input_ids, labels=labels, cu_seqlens=cu_seqlens)
                     loss = outputs["loss"]
                 torch.cuda.synchronize(gpus[rank])
                 _mb_t_fwd_end = time.perf_counter()

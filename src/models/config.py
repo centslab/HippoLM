@@ -40,6 +40,22 @@ class HippoConfig:
     # Normalization
     rms_norm_eps: float = 1e-6
 
+    # Chunk-aware FFD packing (see src/training/data/collate.py).
+    # ``pack_chunk_size`` is the alignment granularity for doc
+    # boundaries inside a pack: each doc is rounded up to a multiple
+    # of this size so the GDN2 chunkwise kernel's state-reset lands
+    # exactly at a doc boundary. The kernel's internal chunk_size is
+    # independently fixed at 64 in the vendored fla code; the only
+    # constraint is therefore that ``pack_chunk_size`` is a positive
+    # multiple of 64. ``0`` is a sentinel meaning "use ``head_dim``",
+    # which is the natural choice (one doc-state spans the head
+    # dimension's worth of tokens per chunk on average).
+    pack_chunk_size: int = 0
+    # How many input docs the owner accumulates per packing window
+    # before calling the packer. Higher = denser packs (FFD sees
+    # more candidates) at the cost of one window's latency.
+    pack_buffer_size: int = 8
+
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
             f"num_layers ({self.num_layers}) must be divisible by num_blocks ({self.num_blocks})"
@@ -50,4 +66,21 @@ class HippoConfig:
         # Validate GDN2 mode
         assert self.gdn2_mode in ("chunk", "fused_recurrent"), (
             f"gdn2_mode must be 'chunk' or 'fused_recurrent', got {self.gdn2_mode!r}"
+        )
+        # Packing
+        if self.pack_chunk_size == 0:
+            # Sentinel: defer to ``head_dim``.
+            self.pack_chunk_size = self.head_dim
+        assert self.pack_chunk_size > 0, (
+            f"pack_chunk_size must be positive, got {self.pack_chunk_size}"
+        )
+        # The vendored GDN2 chunkwise solver is hardcoded to BT=64
+        # (NC=4 sub-chunks of size 16, see
+        # src/models/ops/_vendored/fla/ops/gdn2/chunk.py). Round
+        # ``pack_chunk_size`` up to the nearest multiple of 64 so
+        # the packer's alignment matches the kernel's chunking.
+        if self.pack_chunk_size % 64 != 0:
+            self.pack_chunk_size = ((self.pack_chunk_size + 63) // 64) * 64
+        assert self.pack_buffer_size >= 1, (
+            f"pack_buffer_size must be >= 1, got {self.pack_buffer_size}"
         )

@@ -34,6 +34,17 @@ seq_len: 4096
 learning_rate: 0.01
 weight_decay: 0.01
 gradient_accumulation_steps: 16
+# Chunk-aware FFD packing (see src/training/data/collate.py).
+# ``pack_chunk_size``: alignment granularity for doc boundaries inside
+# a pack. Each doc rounds up to a multiple of this size so the GDN2
+# chunkwise kernel's state reset lands exactly at a doc boundary.
+# 0 means "use head_dim" (HippoConfig resolves). Rounded up to a
+# multiple of 64 internally (the vendored GDN2 kernel's BT).
+pack_chunk_size: 0
+# How many input docs the owner prefetcher accumulates per packing
+# window. Each window produces batch_size packed rows. Higher =
+# denser FFD packs at the cost of one window's latency.
+pack_buffer_size: 8
 
 # Optimizer
 muon_lr: 0.02            # Muon (2D matrices) learning rate

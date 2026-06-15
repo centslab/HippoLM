@@ -1,11 +1,21 @@
-"""Owner-rank background prefetch thread that fans batches into N queues."""
+"""Owner-rank background prefetch thread that fans batches into N queues.
+
+Each "batch" is produced by chunk-aligned FFD packing:
+:func:`pack_chunk_aligned` consumes ``batch_size * pack_buffer_size``
+input docs and emits ``batch_size`` packed rows plus a global
+``cu_seqlens`` tensor. The prefetcher threads the entire packed
+batch dict through the per-rank queues so every TP rank consumes
+identical inputs (input-replication contract).
+"""
 from __future__ import annotations
 
 import logging
 import threading
 import time
 
-from .collate import collate_batch
+import torch
+
+from .collate import pack_chunk_aligned
 
 
 class QueueIterator:
@@ -62,19 +72,54 @@ class PrefetchBatcher:
 
     _SENTINEL = None
 
-    def __init__(self, dataset, batch_size: int, queues) -> None:
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        queues,
+        *,
+        seq_len: int,
+        chunk_size: int,
+        pad_id: int = 0,
+        eos_id: int | None = None,
+        pack_buffer_size: int = 8,
+    ) -> None:
         """
         Args:
-            dataset: an iterable yielding raw samples.
-            batch_size: number of samples to collate per output batch.
+            dataset: an iterable yielding raw tokenized samples
+                (``{"input_ids": [...int], "labels": [...int]}``).
+            batch_size: number of packed rows in each output batch.
             queues: list of queue-likes (``mp.Queue`` cross-process,
                 ``queue.Queue`` in-process), one per consumer rank
                 **including the owner's own queue**. The worker
                 broadcasts each batch into every queue here.
+            seq_len: target packed sequence length. Must be a
+                multiple of ``chunk_size``.
+            chunk_size: alignment granularity for doc boundaries
+                inside a pack (see :func:`pack_chunk_aligned`).
+            pad_id: padding token id.
+            eos_id: optional EOS token id. When set, each doc is
+                forced to end with this id before packing.
+            pack_buffer_size: how many input docs to pull per
+                packing window. Higher = denser packs at the cost
+                of one window's latency. The packer produces
+                ``batch_size`` rows from this buffer; oversized
+                windows (more docs than fit) only emit a single
+                batch and discard the rest on the next pull.
         """
         if not queues:
             raise ValueError("PrefetchBatcher: queues must be non-empty")
+        if pack_buffer_size < 1:
+            raise ValueError(
+                f"PrefetchBatcher: pack_buffer_size must be >= 1, got"
+                f" {pack_buffer_size}"
+            )
         self._batch_size = batch_size
+        self._pack_buffer_size = pack_buffer_size
+        self._seq_len = seq_len
+        self._chunk_size = chunk_size
+        self._pad_id = pad_id
+        self._eos_id = eos_id
         self._queues = list(queues)
         self._iter = iter(dataset)
         self._stop = threading.Event()
@@ -87,13 +132,26 @@ class PrefetchBatcher:
         self._worker.start()
 
     def _fetch_one(self):
-        """Pull ``batch_size`` samples from the dataset and collate.
+        """Pull up to ``batch_size * pack_buffer_size`` samples from
+        the dataset and pack them into a single batch dict.
 
-        Returns the collated batch dict, or :attr:`_SENTINEL` if the
+        Returns the packed batch dict, or :attr:`_SENTINEL` if the
         dataset iterator is exhausted before any sample was read.
+        The packed batch has shape::
+
+            {
+              "input_ids":  [B, seq_len]    long,
+              "labels":     [B, seq_len]    long  (-100 at pad),
+              "cu_seqlens": [total_docs+1]  long,
+            }
+
+        The "total_docs" count can vary across batches (FFD output
+        is data-dependent); the model is responsible for handling
+        a per-batch variable-length ``cu_seqlens``.
         """
-        batch = []
-        for _ in range(self._batch_size):
+        target = self._batch_size * self._pack_buffer_size
+        batch: list[dict] = []
+        for _ in range(target):
             try:
                 batch.append(next(self._iter))
             except StopIteration:
@@ -106,7 +164,39 @@ class PrefetchBatcher:
                 f" {time.monotonic() - self._t0:.2f}s"
             )
             self._first_sample_logged = True
-        return collate_batch(batch)
+
+        # Pull the raw id lists out of each sample dict. The
+        # tokenizer yields a 1D list of ints (the streaming
+        # dataset's ``return_tensors=None`` path); older 1D
+        # tensors are handled by ``.tolist()``.
+        token_lists: list[list[int]] = []
+        for s in batch:
+            ids = s["input_ids"]
+            if isinstance(ids, torch.Tensor):
+                ids = ids.detach().cpu().tolist()
+            else:
+                ids = list(ids)
+            token_lists.append(ids)
+
+        input_ids, labels, cu_seqlens = pack_chunk_aligned(
+            token_lists,
+            seq_len=self._seq_len,
+            chunk_size=self._chunk_size,
+            pad_id=self._pad_id,
+            eos_id=self._eos_id,
+        )
+        # Pin input_ids and labels so the consumer's
+        # ``.to('cuda', non_blocking=True)`` can actually overlap
+        # with the next forward pass. ``cu_seqlens`` is small
+        # enough that pinning is not worth the alloc cost.
+        if torch.cuda.is_available():
+            input_ids = input_ids.pin_memory()
+            labels = labels.pin_memory()
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "cu_seqlens": cu_seqlens,
+        }
 
     def _broadcast(self, item) -> None:
         """Put ``item`` into every consumer queue. Blocking — slow

@@ -98,7 +98,7 @@ class StreamingDataset(IterableDataset):
                 # ``return_tensors="pt"`` and then ``.squeeze(0)``'d
                 # the resulting ``[1, T]`` tensor back to 1D — pure
                 # overhead. The result is a Python list, which
-                # :func:`ffd_pack_samples` (and any consumer that
+                # :func:`pack_chunk_aligned` (and any consumer that
                 # doesn't need a tensor) can use directly.
                 encoded = self.tokenizer(
                     text,

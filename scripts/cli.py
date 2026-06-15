@@ -150,6 +150,23 @@ def build_parser() -> argparse.ArgumentParser:
              "for short validation runs.",
     )
 
+    # ---- Chunk-aware FFD packing ----
+    p.add_argument(
+        "--pack_chunk_size", type=int, default=0,
+        help="Alignment granularity for doc boundaries inside a pack. "
+             "Each doc rounds up to a multiple of this size so the GDN2 "
+             "chunkwise kernel's state reset lands exactly at a doc "
+             "boundary. 0 means 'use head_dim' (HippoConfig resolves). "
+             "Rounded up to a multiple of 64 internally.",
+    )
+    p.add_argument(
+        "--pack_buffer_size", type=int, default=8,
+        help="How many input docs the owner prefetcher accumulates per "
+             "packing window. Higher = denser FFD packs at the cost of "
+             "one window's latency. Each window produces batch_size "
+             "packed rows.",
+    )
+
     # ---- GPU ----
     p.add_argument("--min_gpu_memory_mb", type=int, default=10240)
     p.add_argument("--muon_lr", type=float, default=0.02,
