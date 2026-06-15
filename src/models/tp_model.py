@@ -1307,26 +1307,38 @@ class TPHippoModel(nn.Module):
                 use_reentrant=False, preserve_rng_state=False,
             )
             blocks.append(x)
-        # Last block: NO checkpointing wrapper. KDA's autograd
-        # graph is the only one in the model that benefits from
-        # not being wrapped in ``torch.utils.checkpoint`` —
-        # because the KDA Triton kernels compute their
-        # intermediates in the forward pass and want to reuse
-        # them in backward (their backward is more expensive
-        # than re-doing the chunked forward would be, due to
-        # the extra ``g_cumsum``/``Aqk``/``Akk``/``w``/``u``
-        # tensors they cache). The other blocks' forward is
-        # cheap enough that the per-block checkpoint + recompute
-        # strategy above is a net win, but the last block would
-        # suffer the worst of both worlds (cache per-layer
-        # activations, but recompute them anyway for backward)
-        # if we kept the wrapper here.
+        # Last block: per-layer checkpointing for every layer
+        # except the very last one. The first n-1 blocks are
+        # already block-level-checkpointed above (one
+        # ``_block_forward`` re-run per block, ~7 recomputations
+        # across the full 8-block model). For the last block we
+        # want a finer granularity: 3 of the 4 layers get
+        # wrapped in ``torch.utils.checkpoint.checkpoint`` with
+        # ``use_reentrant=True`` so their recomputed GDN2
+        # internals are freed as soon as that layer's backward
+        # finishes (peak memory: 1 layer worth, not 4). The
+        # very last layer is left un-checkpointed because its
+        # GDN2 internals feed the lm_head + fused CE loss —
+        # recomputing them would force a 1-forward-step
+        # recompute on every backward, and the GDN2 backward
+        # kernel is comparable in cost to a forward so caching
+        # is the right trade. Net: 3 extra recomputations per
+        # step (one per checkpointed layer in the last block),
+        # saving ~3/4 of the last-block activation memory.
         last_block = num_blocks - 1
         if last_block > 0:
             x = attn_res(blocks)
         last_start = last_block * block_size
-        for layer in layers[last_start:]:
-            x = layer(x, cu_seqlens=cu_seqlens)
+        last_block_layers = layers[last_start:]
+        for layer in last_block_layers[:-1]:
+            x = torch.utils.checkpoint.checkpoint(
+                layer, x, cu_seqlens,
+                use_reentrant=True, preserve_rng_state=False,
+            )
+        # Final layer of the last block: NO checkpoint wrapper.
+        # Its GDN2 internals (q, k, v, b, w, Aqk, Akk, w_wy,
+        # u_wy, qg, kg, v_new, h) are held for backward.
+        x = last_block_layers[-1](x, cu_seqlens=cu_seqlens)
 
         hidden_states = self.replicated_per_device[device]["norm"](x)
         out: dict[str, torch.Tensor] = {}

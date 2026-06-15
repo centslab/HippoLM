@@ -144,8 +144,25 @@ class HippoModel(nn.Module):
             start = block_idx * self.config.block_size
             end = start + self.config.block_size
             block_layers = self.layers[start:end]
-            for layer in block_layers:
-                x = layer(x, cu_seqlens=cu_seqlens)
+            # Last block: per-layer checkpointing for every
+            # layer except the very last one (matches the TP
+            # path's strategy; see tp_model.py for the full
+            # rationale). 3 of the 4 layers are wrapped in
+            # ``torch.utils.checkpoint.checkpoint`` with
+            # ``use_reentrant=True`` so the GDN2 internals are
+            # freed as soon as that layer's backward completes;
+            # the final layer keeps its full cache to feed the
+            # lm_head + fused CE backward.
+            if block_idx == self.config.num_blocks - 1:
+                for layer in block_layers[:-1]:
+                    x = torch.utils.checkpoint.checkpoint(
+                        layer, x, cu_seqlens,
+                        use_reentrant=True, preserve_rng_state=False,
+                    )
+                x = block_layers[-1](x, cu_seqlens=cu_seqlens)
+            else:
+                for layer in block_layers:
+                    x = layer(x, cu_seqlens=cu_seqlens)
             blocks.append(x)
 
         hidden_states = self.norm(blocks[-1])  # [B, T, D]

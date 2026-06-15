@@ -616,13 +616,21 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     flush_pending_grads(sync_device=gpus[rank])
                     # Inf/nan check on the accumulated CPU grads.
                     found_inf = False
-                    for opt in (muon_opt, adamw_opt):
-                        for s in opt.state.values():
-                            if not torch.isfinite(s.accum).all():
+                    nan_opt_name = None
+                    nan_s_id = None
+                    n_nan_accum_total = 0
+                    for opt_name, opt in (("muon", muon_opt), ("adamw", adamw_opt)):
+                        for sid, s in opt.state.items():
+                            n_nan = (~torch.isfinite(s.accum)).sum().item()
+                            n_nan_accum_total += n_nan
+                            if n_nan > 0 and not found_inf:
                                 found_inf = True
-                                break
+                                nan_opt_name = opt_name
+                                nan_s_id = sid
                         if found_inf:
                             break
+                    if rank == 0 and global_step < 5:
+                        print(f"  [CHECK-DEBUG] step={global_step} n_nan_accum_total={n_nan_accum_total} found_inf={found_inf}")
                     if not found_inf:
                         total_norm = _compute_and_clip_grad_norm(
                             [muon_opt, adamw_opt], args.max_grad_norm,
