@@ -908,10 +908,6 @@ def _make_offload_hook(s: _ParamState):
             .reshape(-1)
             .to("cpu", non_blocking=True)
         )
-        # DEBUG
-        n_nan = (~torch.isfinite(src)).sum().item()
-        if n_nan > 0:
-            print(f"  [HOOK-DEBUG] param {p.shape} has {n_nan} non-finite in CPU src, max_abs={src.abs().max().item() if torch.isfinite(src).any() else 'inf'}")
         _pending_grads.append((accum, src))
         # Free the GPU grad right now so the memory is available
         # for the next param's backward. The hook return value

@@ -173,6 +173,26 @@ def pack_chunk_aligned(
             f"(should never happen — FFD guarantees placement)"
         )
 
+    # ALWAYS append the batch end ``n_packs * seq_len`` as a final
+    # cu_seqlens entry. This marks the end of the last pack AND
+    # implicitly the start of any tail-pad "doc" (the all-pad
+    # trailing region when the last real doc ends before
+    # ``n_packs * seq_len``). Without this, the EFKDA's chunkwise
+    # kernel never resets its recurrent state ``h`` at the start of
+    # the tail-pad chunks, the stale ``h`` from the last real doc
+    # flows into the padding chunks' ``p = (k * g_cum.exp()).T @ h``
+    # and the ``(I+T)^{-1}`` solve amplifies the error. At prod
+    # dims (B=6 packs at T=4096, ~32 real docs packed, with a
+    # ~2.4k-token tail pad from the last pack not being full) this
+    # produces a NaN in the FORWARD of layer 1+ in train mode.
+    # The labels for the tail pad are all -100 so the loss is
+    # unaffected, but the autograd graph carries the NaN into the
+    # FusedLCE and back into the params. Closing the cu_seqlens
+    # range with ``n_packs * seq_len`` makes the kernel reset ``h``
+    # at that boundary, which the padding chunks are free to ignore
+    # (their labels are -100 and the FusedLCE masks them).
+    cu_seqlens_list.append(n_packs * seq_len)
+
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.long)
     return input_ids, labels, cu_seqlens
 
