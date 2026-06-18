@@ -59,6 +59,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expand_v", type=float, default=1.0)
     p.add_argument("--gdn2_mode", type=str, default="chunk",
                    choices=["chunk", "fused_recurrent"])
+    p.add_argument("--efkda_kernel", type=str, default="triton",
+                   choices=["triton", "ref"],
+                   help="EFKDA backend: 'triton' (production; Triton fwd + "
+                        "PyTorch ref bwd) or 'ref' (pure-PyTorch, slow).")
+    p.add_argument("--efkda_mode", type=str, default="chunk",
+                   choices=["chunk"],
+                   help="EFKDA recurrence mode (only 'chunk' implemented).")
     p.add_argument("--use_short_conv", type=bool, default=False)
     p.add_argument("--allow_neg_eigval", type=bool, default=False)
     p.add_argument("--conv_size", type=int, default=4)

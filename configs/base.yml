@@ -6,11 +6,14 @@ hidden_size: 1024
 tie_word_embeddings: true
 use_bias: false
 
-# GDN2 (Gated DeltaNet 2)
+# EFKDA (EFLA-form KDA: KDA recurrence re-expressed with the rank-1
+# closed-form alpha = (1 - exp(-beta*||k||^2)) / ||k||^2; see
+# src/models/ops/efkda.py and arXiv 2512.12602).
 num_heads: 8
 head_dim: 128
 expand_v: 1.0
-gdn2_mode: chunk           # chunk for training, fused_recurrent for inference
+efkda_kernel: triton       # "triton" = production (fwd via Triton, bwd via PyTorch ref), "ref" = pure-PyTorch (debug only)
+efkda_mode: chunk
 use_short_conv: true
 allow_neg_eigval: false
 conv_size: 4

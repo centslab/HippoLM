@@ -184,6 +184,8 @@ def _setup_worker(
         num_heads=args.num_heads,
         head_dim=args.head_dim,
         expand_v=args.expand_v,
+        efkda_kernel=args.efkda_kernel,
+        efkda_mode=args.efkda_mode,
         gdn2_mode=args.gdn2_mode,
         use_short_conv=args.use_short_conv,
         allow_neg_eigval=args.allow_neg_eigval,

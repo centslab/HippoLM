@@ -28,16 +28,18 @@ TP design (assumes a single process spanning N GPUs):
     materialised (replaces the old TPLmHead path which did the
     matmul and then ``.contiguous()``'d a copy for the CE kernel).
   - GDN2 q/k/v projections (output = key_dim / value_dim, sharded
-    along the head dim)
+    along the head dim) — note: with the KDA → EFKDA swap the token
+    mixing sub-layer is :class:`TPEFKDA`; the q/k/v sharding math is
+    unchanged.
 
   Row-parallel (input sharded, all-reduce output)
   -----------------------------------------------
   - SwiGLU down_proj (input = intermediate, sharded; output
     all-reduced to full hidden)
-  - GDN2 o_proj (input = value_dim sharded, output all-reduced)
+  - EFKDA o_proj (input = value_dim sharded, output all-reduced)
 
 The forward pass is: sharded embed (masked lookup + all-reduce
-on the partial embeddings) -> 32 layers (attn_norm -> GDN2 ->
+on the partial embeddings) -> 32 layers (attn_norm -> EFKDA ->
 mlp_norm -> SwiGLU -> all-reduce inside down_proj and inside
 o_proj) -> final norm -> fused lm_head+CE (sharded matmul +
 online chunked softmax) -> scalar loss.
@@ -889,11 +891,299 @@ class TPGDN2(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# TP HippoModel                                                               #
+# TP EFKDA (EFLA-form KDA)                                                    #
 # --------------------------------------------------------------------------- #
+class TPEFKDA(nn.Module):
+    """TP-sharded EFKDA (EFLA closed-form KDA).
+
+    Replaces TPGDN2. Structurally mirrors it for the column- and row-
+    parallel sharding math, but the underlying recurrence is KDA's
+    scalar-beta one (vs GDN2's channel-wise b on K + w on V). The
+    wrapper at :class:`src.models.ops.efkda.EFKDA` is the source of
+    truth for the recurrence math; this class re-uses the same kernel
+    (``efla_chunk_kda`` from the vendored fla) and adds the TP shard.
+
+    Per-rank layout (world = TP group size):
+
+    - ``qkv_proj``: column-parallel on ``2*key_dim + value_dim``. Each
+      rank: ``[2*key_per_partition + value_per_partition, hidden_size]``
+      (one matmul produces Q, K, V slices; saves 2 kernel launches vs
+      three separate projections).
+    - ``q_conv1d`` / ``k_conv1d`` / ``v_conv1d``: depthwise conv with
+      per-channel filter; each rank has the channels in its head slice.
+    - ``fg_first``: ``nn.Linear(h, 2*head_v_dim)``, replicated (the
+      per-head bottleneck is the same on every rank; one fused matmul
+      produces both f and g first-layer outputs).
+    - ``f_proj1``: column-parallel ``head_v_dim → key_dim``.
+    - ``g_proj1``: column-parallel ``head_v_dim → value_dim``,
+      with bias (the sigmoid-gate bias).
+    - ``b_proj``: column-parallel ``h → num_v_heads_per_partition``
+      (EFKDA uses KDA's per-V-head scalar beta, not GDN2's per-channel
+      erase gate). The sharded shape matches V's sharding so the
+      kernel sees beta per local V-head.
+    - A_log: ``[num_v_heads_per_partition]`` FP32 (per-V-head decay
+      rate, matches the kernel's per-V-head g application).
+    - dt_bias: ``[key_per_partition]`` FP32 (per-key-channel).
+    - o_norm: per-head RMSNorm on ``head_v_dim``; weight ``[head_v_dim]``
+      (replicated within each rank's head slice).
+    - o_proj: row-parallel on value_dim; all-reduces to ``[hidden_size]``.
+
+    The kernel itself is rank-local: each rank runs the full chunk
+    algorithm on its ``H // world`` heads with a rank-local recurrent
+    state. No inter-rank communication inside the recurrence — only the
+    o_proj all-reduce.
+    """
+
+    def __init__(self, config, layer_idx: int, device=None, dtype=None) -> None:
+        super().__init__()
+        from src.models.ops._vendored.fla.modules import FusedRMSNormGated, ShortConvolution
+        from src.models.ops._vendored.fla.ops.kda.chunk_efla_naive import (
+            efla_chunk_kda as _efla_chunk_kda_ref,
+        )
+
+        # Try to swap in the Triton kernel for forward (production
+        # path). The bwd re-runs the PyTorch reference inside the
+        # autograd.Function so the kernel choice affects fwd only.
+        self._efla_chunk_kda = _efla_chunk_kda_ref
+        self._efkda_kernel_backend = getattr(config, "efkda_kernel", "ref")
+        if self._efkda_kernel_backend == "triton":
+            try:
+                from src.models.ops.efkda_triton import (
+                    efla_chunk_kda as _efla_chunk_kda_tri,
+                )
+                self._efla_chunk_kda = _efla_chunk_kda_tri
+            except ImportError as _e:
+                import warnings
+                warnings.warn(
+                    f"[TPEFKDA] efkda_kernel='triton' requested but "
+                    f"src.models.ops.efkda_triton failed to import "
+                    f"({_e!r}); falling back to the PyTorch reference "
+                    f"kernel (will be slow).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._efkda_kernel_backend = "ref"
+
+        self.world = get_tp_world_size()
+        self.rank = get_tp_rank()
+
+        h = config.hidden_size
+        nh = config.num_heads
+        nvh = config.num_heads  # EFKDA has no GVA at the kernel level
+        d_h = config.head_dim
+        d_v = int(d_h * config.expand_v)
+        key_dim = nh * d_h
+        value_dim = nvh * d_v
+
+        assert nh % self.world == 0, f"num_heads={nh} not divisible by tp_world={self.world}"
+        assert nvh % self.world == 0, f"num_v_heads={nvh} not divisible by tp_world={self.world}"
+        assert value_dim % self.world == 0, f"value_dim={value_dim} not divisible by tp_world={self.world}"
+        assert key_dim % self.world == 0, f"key_dim={key_dim} not divisible by tp_world={self.world}"
+
+        self.hpp = nh // self.world           # heads per partition (qk and v share this)
+        self.key_per_partition = key_dim // self.world
+        self.value_per_partition = value_dim // self.world
+        self.head_k_dim = d_h
+        self.head_v_dim = d_v
+        self.num_heads = nh
+        self.num_v_heads = nvh
+        self.hidden_size = h
+        self.expand_v = config.expand_v
+        self.use_short_conv = config.use_short_conv
+        self.conv_size = config.conv_size
+        self.conv_bias = config.conv_bias
+        self.allow_neg_eigval = config.allow_neg_eigval
+        self.layer_idx = layer_idx
+        self.norm_eps = config.rms_norm_eps
+
+        # ---- Fused QKV projection (column-parallel) ---- #
+        # One ColumnParallelLinear with output = 2*key_dim + value_dim.
+        # Output channels: [0:key_per_partition] = Q,
+        # [key_per_partition:2*key_per_partition] = K,
+        # [2*key_per_partition:2*key_per_partition+value_per_partition] = V.
+        self.qkv_proj = ColumnParallelLinear(
+            h, 2 * key_dim + value_dim, bias=False,
+            device=device, dtype=dtype,
+        )
+
+        # ---- Depthwise conv1d (per-channel, sharded) ---- #
+        if config.use_short_conv:
+            self.q_conv1d = ShortConvolution(
+                hidden_size=self.key_per_partition, kernel_size=config.conv_size,
+                bias=config.conv_bias, activation="silu",
+            ).to(device=device, dtype=dtype)
+            self.k_conv1d = ShortConvolution(
+                hidden_size=self.key_per_partition, kernel_size=config.conv_size,
+                bias=config.conv_bias, activation="silu",
+            ).to(device=device, dtype=dtype)
+            self.v_conv1d = ShortConvolution(
+                hidden_size=self.value_per_partition, kernel_size=config.conv_size,
+                bias=config.conv_bias, activation="silu",
+            ).to(device=device, dtype=dtype)
+
+        # ---- Fused FG first layer + split FG second layer ---- #
+        # The first layer of each is ``hidden → head_v_dim`` where
+        # ``head_v_dim`` is a per-head bottleneck (the same on every
+        # rank), so it's a vanilla ``nn.Linear`` (replicated). Fused
+        # into one ``nn.Linear`` with output = 2*d_v (saves 1 kernel
+        # launch per EFKDA layer).
+        self.fg_first = nn.Linear(
+            h, 2 * d_v, bias=False, device=device, dtype=dtype,
+        )
+        self.f_proj1 = ColumnParallelLinear(
+            d_v, key_dim, bias=False, device=device, dtype=dtype,
+        )
+        self.g_proj1 = ColumnParallelLinear(
+            d_v, value_dim, bias=True, device=device, dtype=dtype,
+        )
+
+        # ---- b_proj: KDA-style per-V-head scalar beta ---- #
+        # Column-parallel on num_v_heads. The sharded shape matches V's
+        # sharding (V is sharded on num_v_heads), so the kernel sees
+        # beta per local V-head without any gather.
+        self.b_proj = ColumnParallelLinear(
+            h, self.hpp, bias=False, device=device, dtype=dtype,
+        )
+
+        # ---- A_log, dt_bias: per-rank shards ---- #
+        # A_log: per-V-head decay rate (FP32). Shape: [num_v_heads //
+        # world] = [hpp], matching the sharded b_proj output.
+        import math as _math
+        self.A_log = nn.Parameter(
+            torch.log(
+                torch.empty(self.hpp, dtype=torch.float32, device=device).uniform_(1, 16)
+            )
+        )
+        self.A_log._no_weight_decay = True
+        # dt_bias: per-key-channel softplus bias (FP32). Size matches
+        # the per-rank ``key_per_partition``.
+        dt = torch.exp(
+            torch.rand(self.key_per_partition, dtype=torch.float32, device=device) *
+            (_math.log(0.1) - _math.log(0.001)) + _math.log(0.001)
+        ).clamp(min=1e-4)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+
+        # ---- o_norm: per-head RMSNorm on head_v_dim ---- #
+        self.o_norm = FusedRMSNormGated(
+            d_v, activation="sigmoid", eps=self.norm_eps,
+            device=device, dtype=dtype,
+        )
+
+        # ---- o_proj: row-parallel on value_dim ---- #
+        self.o_proj = RowParallelLinear(
+            value_dim, h, bias=False, device=device, dtype=dtype,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass. ``x`` is the full hidden (replicated across
+        the TP group). Returns full hidden (after the ``o_proj``
+        all-reduce).
+
+        When ``cu_seqlens`` is supplied the batch dim is folded into
+        the sequence dim so the chunkwise kernel sees ``batch_size=1``
+        (its hard requirement when varlen state reset is in use).
+        """
+        from einops import rearrange
+
+        B, T, hidden = x.shape
+        if cu_seqlens is not None:
+            x_in = x.reshape(1, B * T, hidden)
+        else:
+            x_in = x
+
+        # Fused QKV: one matmul produces [B, T, 2*key+v] which we split
+        # into Q / K / V per rank. Saves 2 kernel launches vs. 3
+        # separate projections.
+        qkv = self.qkv_proj(x_in)
+        q, k, v = qkv.split(
+            [self.key_per_partition, self.key_per_partition, self.value_per_partition],
+            dim=-1,
+        )
+
+        if self.use_short_conv:
+            q, _ = self.q_conv1d(q, cu_seqlens=cu_seqlens)
+            k, _ = self.k_conv1d(k, cu_seqlens=cu_seqlens)
+            v, _ = self.v_conv1d(v, cu_seqlens=cu_seqlens)
+        else:
+            q = F.silu(q)
+            k = F.silu(k)
+            v = F.silu(v)
+
+        # FG path: one nn.Linear (``fg_first``) produces the concatenated
+        # f/g intermediates; two separate ColumnParallelLinear's
+        # (``f_proj1``, ``g_proj1``) project each to its output.
+        fg_first = self.fg_first(x_in)
+        f_inter, g_inter = fg_first.chunk(2, dim=-1)
+        g = self.f_proj1(f_inter)
+        g_for_norm = self.g_proj1(g_inter)
+
+        # Scalar beta: KDA's per-V-head gate (sigmoid). NOT a per-K-
+        # channel erase gate (that's GDN2).
+        beta = self.b_proj(x_in).sigmoid()
+
+        # Reshape to per-head: each rank has ``hpp`` heads.
+        # q, k: [B, T, hpp, head_k_dim]
+        # g:    [B, T, hpp, head_k_dim]
+        # v:    [B, T, hpp, head_v_dim]
+        # beta: [B, T, hpp]
+        q = rearrange(q, "... (h d) -> ... h d", d=self.head_k_dim)
+        k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
+        g = rearrange(g, "... (h d) -> ... h d", d=self.head_k_dim)
+        v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
+        # beta stays as [B, T, hpp]; the kernel broadcasts over K and V.
+
+        # Per-head A_log decay rate (FP32 for the cumsum's stability).
+        # g_per_head = softplus(f_proj + dt_bias); then g = -exp(A_log) * g.
+        # ``g`` here is the f_proj1 output (pre-softplus); we add
+        # dt_bias in fp32 and apply softplus, then A_log's decay.
+        # Mirrors the EFKDA wrapper's
+        # ``g = F.softplus(self.f_proj(x_in).float() + self.dt_bias)``.
+        g = F.softplus(
+            g.float() + self.dt_bias.view(1, 1, self.hpp, self.head_k_dim)
+        )
+        g = -self.A_log.float().exp().view(1, 1, self.hpp, 1) * g
+
+        if self.allow_neg_eigval:
+            beta = beta * 2.0
+
+        # L2-normalize q and k (matches fla KDA's
+        # ``use_qk_l2norm_in_kernel=True`` semantics; with l2norm'd k,
+        # the closed-form alpha simplifies to 1 - exp(-beta)).
+        q = F.normalize(q, p=2, dim=-1, eps=1e-6)
+        k = F.normalize(k, p=2, dim=-1, eps=1e-6)
+
+        # efla_chunk_kda: rank-local. No TP comm inside the kernel.
+        # ``cu_seqlens`` flows straight through to the chunkwise
+        # recurrence when set; the kernel resets ``h`` at every chunk
+        # that starts a new doc.
+        o, _ = self._efla_chunk_kda(
+            q=q, k=k, v=v, g=g, beta=beta,
+            initial_state=None, output_final_state=False,
+            chunk_size=64,
+            cu_seqlens=cu_seqlens,
+        )
+
+        # o has shape ``x_in.shape[:-1] + (hpp, head_v_dim)``.
+        if cu_seqlens is not None:
+            o = o.reshape(B, T, self.hpp, self.head_v_dim)
+            g_for_norm = g_for_norm.reshape(B, T, self.hpp, self.head_v_dim)
+
+        # o_norm: per-head RMSNorm on the last dim.
+        g_for_norm = rearrange(g_for_norm, "... (h d) -> ... h d", d=self.head_v_dim)
+        o = self.o_norm(o, g_for_norm)
+        o = rearrange(o, "b t h d -> b t (h d)")
+        # o_proj: row-parallel, all-reduces to [B, T, hidden_size].
+        o = self.o_proj(o)
+        return o
 class TPHippoLayer(nn.Module):
-    """TP version of HippoLayer. GDN2 is sharded along the head dim
-    via :class:`TPGDN2`; FFN is sharded via :class:`TPSwiGLU`.
+    """TP version of HippoLayer. EFKDA is sharded along the head dim
+    via :class:`TPEFKDA`; FFN is sharded via :class:`TPSwiGLU`.
 
     AttnRes no longer lives inside each layer. The block-boundary
     AttnRes is a single per-device replicated module
@@ -919,7 +1209,7 @@ class TPHippoLayer(nn.Module):
 
         self.attn_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
         self.mlp_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
-        self.gdn2 = _to(TPGDN2(config, layer_idx=layer_idx))
+        self.efkda = _to(TPEFKDA(config, layer_idx=layer_idx))
         self.ffn = TPSwiGLU(config, device=device, dtype=dtype)
 
     def forward(
@@ -934,14 +1224,14 @@ class TPHippoLayer(nn.Module):
             cu_seqlens: optional ``[total_docs + 1]`` long tensor
                 with global offsets across the flattened
                 ``[batch_size * seq_len]`` sequence. Forwarded
-                to the GDN2 sub-layer only; FFN / RMSNorm do not
+                to the EFKDA sub-layer only; FFN / RMSNorm do not
                 depend on the doc layout.
 
         Returns:
-            ``[B, T, hidden_size]`` after GDN2 and FFN with
+            ``[B, T, hidden_size]`` after EFKDA and FFN with
             standard residual connections.
         """
-        x = x + self.gdn2(self.attn_norm(x), cu_seqlens=cu_seqlens)
+        x = x + self.efkda(self.attn_norm(x), cu_seqlens=cu_seqlens)
         x = x + self.ffn(self.mlp_norm(x))
         return x
 
@@ -1196,12 +1486,12 @@ class TPHippoModel(nn.Module):
                 for pname, p in src_params.items():
                     dst_params[pname].data.copy_(p.data)
 
-        # 2) Per-layer replicated sub-modules (GDN2, attn_norm,
+        # 2) Per-layer replicated sub-modules (EFKDA, attn_norm,
         # mlp_norm). AttnRes is no longer per-layer; the block
         # boundary version lives at the model level and is
         # already synced above.
         for li, src_layer in enumerate(self.layers_per_device[src_device]):
-            for sub_name in ("gdn2", "attn_norm", "mlp_norm"):
+            for sub_name in ("efkda", "attn_norm", "mlp_norm"):
                 src_sub = getattr(src_layer, sub_name)
                 src_params = dict(src_sub.named_parameters(recurse=True))
                 for dst_device, dst_layers in self.layers_per_device.items():
@@ -1230,7 +1520,7 @@ class TPHippoModel(nn.Module):
         call. AttnRes is invoked at the block boundary by the
         outer :meth:`forward` loop, not inside this body.
 
-        ``cu_seqlens`` is forwarded to every layer's GDN2 sub-
+        ``cu_seqlens`` is forwarded to every layer's EFKDA sub-
         layer (FFN / RMSNorm ignore it). When this body runs
         inside ``checkpoint.checkpoint`` the cu_seqlens tensor
         is saved with the recomputation inputs automatically.
@@ -1249,12 +1539,12 @@ class TPHippoModel(nn.Module):
 
         ``cu_seqlens`` is the global offset tensor produced by
         :func:`pack_chunk_aligned` — see that function's docstring
-        for the contract. When set the GDN2 sub-layer inside every
+        for the contract. When set the EFKDA sub-layer inside every
         block resets the recurrent state at each ``cu_seqlens``
         boundary; the rest of the model (FFN, RMSNorm, embed,
         BlockAttnRes, lm_head) ignores it. The hidden state shape
         is unchanged (``[B, T, hidden]`` on every rank) — only
-        the GDN2 sub-layer flattens / unflattens internally.
+        the EFKDA sub-layer flattens / unflattens internally.
         """
         device = input_ids.device.index if input_ids.device.type == "cuda" else input_ids.device
         embeds = self.replicated_per_device[device]["embed_tokens"](input_ids)
@@ -1314,13 +1604,13 @@ class TPHippoModel(nn.Module):
         # across the full 8-block model). For the last block we
         # want a finer granularity: 3 of the 4 layers get
         # wrapped in ``torch.utils.checkpoint.checkpoint`` with
-        # ``use_reentrant=True`` so their recomputed GDN2
+        # ``use_reentrant=True`` so their recomputed EFKDA
         # internals are freed as soon as that layer's backward
         # finishes (peak memory: 1 layer worth, not 4). The
         # very last layer is left un-checkpointed because its
-        # GDN2 internals feed the lm_head + fused CE loss —
+        # EFKDA internals feed the lm_head + fused CE loss —
         # recomputing them would force a 1-forward-step
-        # recompute on every backward, and the GDN2 backward
+        # recompute on every backward, and the EFKDA backward
         # kernel is comparable in cost to a forward so caching
         # is the right trade. Net: 3 extra recomputations per
         # step (one per checkpointed layer in the last block),
@@ -1336,7 +1626,7 @@ class TPHippoModel(nn.Module):
                 use_reentrant=True, preserve_rng_state=False,
             )
         # Final layer of the last block: NO checkpoint wrapper.
-        # Its GDN2 internals (q, k, v, b, w, Aqk, Akk, w_wy,
+        # Its EFKDA internals (q, k, v, beta, g_cum, Aqk, Akk, w, u,
         # u_wy, qg, kg, v_new, h) are held for backward.
         x = last_block_layers[-1](x, cu_seqlens=cu_seqlens)
 

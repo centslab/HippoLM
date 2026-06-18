@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from .norms import RMSNorm
-from .gdn2 import GDN2
+from .ops.efkda import EFKDA
 from .ops.attn_res import BlockAttnRes
 from .activation import SwiGLU
 
@@ -41,7 +41,7 @@ class HippoLayer(nn.Module):
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Core sub-layers.
-        self.gdn2 = GDN2(config, layer_idx=layer_idx)
+        self.gdn2 = EFKDA(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
     def forward(

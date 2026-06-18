@@ -8,12 +8,12 @@ one-for-one):
   g_chunk[k] = g_cum[L-1, k]                                        # [K]
   p[t, v] = sum_d k[t, d] exp(g_cum[t, d]) h_start[d, v]            # [L, V]
   diff_g[t, t', d] = g_cum[t, d] - g_cum[t', d]
-  decay_inner[t, t', d] = where(t'<t, exp(diff_g), 0)               # [L, L, BK] (tiled)
+  decay_inner[t, t', d] = where(t'<t, exp(diff_g), 0)               # [L, L, K]
   T[t, t'] = alpha_{t'} sum_d k[t,d] decay_inner[t,t',d] k[t',d]    # [L, L] strict lower
   A = I + T                                                         # [L, L]
   v_new = solve_lower_triangular(A, v - p)                          # [L, V]
   o_first[t, v] = sum_d q[t, d] exp(g_cum[t, d]) h_start[d, v]      # [L, V]
-  decay_q[t, t', d] = where(t'<=t, exp(diff_g), 0)                  # [L, L, BK] (tiled)
+  decay_q[t, t', d] = where(t'<=t, exp(diff_g), 0)                  # [L, L, K]
   Q_dot_K[t, t'] = alpha_{t'} sum_d q[t,d] decay_q[t,t',d] k[t',d]  # [L, L] lower-incl
   o_second[t, v] = sum_{t'} Q_dot_K[t, t'] v_new[t', v]             # [L, V]
   o = o_first + o_second
@@ -33,17 +33,6 @@ sequentially from Python — this matches the PyTorch reference's
 sequential chunk loop and avoids the h-dependency ordering issue
 that a fully-parallel (n_chunks, H, B) grid would have (chunk i+1
 needs chunk i's h_new).
-
-K-tiling (compile-time performance): the [L, L, K] intermediates
-``decay_inner`` and ``decay_q`` are tiled along the K axis with
-block size ``BK`` (default 16). With K=128, that's NC=8 tiles; the
-largest per-tile intermediate is [L=64, L=64, BK=16] = 65 536 fp32
-= 256 KB. This is what the GDN2-style chunk kernels in
-``_vendored/fla/ops/gdn2/chunk_intra.py`` do, and it's the only
-way to keep ptxas happy at K=128 — the original [L, L, K=128]
-intermediates triggered a 15+ min ptxas compile on the dev box
-because the [64, 64, 128] = 524 288 fp32 register footprint blew
-the register file.
 
 Backward strategy (this first cut): the per-chunk
 :class:`_EFKDAChunkFn` autograd.Function runs the Triton kernel in
@@ -85,7 +74,6 @@ def _efkda_chunk_fwd_kernel(
     L: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    BK: tl.constexpr,           # K-tile size; K must be a multiple of BK
     EPS: tl.constexpr,
 ):
     """One Triton program = one (B, H) for the current chunk.
@@ -94,14 +82,6 @@ def _efkda_chunk_fwd_kernel(
     ``o_c`` [L, V] and ``h_new`` [K, V] in registers and writes
     them back. Doc-boundary reset (h_start → 0) is unconditional
     when ``is_doc_start == 1``.
-
-    K-tiling: the K-axis sum reductions (T, Q_dot_K, p, o_first,
-    K_alpha→h_new) are split into NC = K // BK tiles processed in a
-    static_range loop. Each tile materialises only [L, L, BK] for
-    the decay tensors, so ptxas can keep the working set small
-    enough to compile. Tile loads re-read from global memory, but
-    the data is in L2 from the initial full-tensor load, so the
-    overhead is one L2 round-trip per tile (small).
 
     NOTE: the wrapper applies scale to q BEFORE the chunk loop
     (matches the PyTorch reference's contract); this kernel
@@ -112,58 +92,60 @@ def _efkda_chunk_fwd_kernel(
     """
     h_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
-    NC: tl.constexpr = K // BK
 
     offs_t = tl.arange(0, L)
     offs_k = tl.arange(0, K)
     offs_v = tl.arange(0, V)
 
-    # ----- Load full q_c, k_c, g_c, v_c, beta_c, h_start (all in fp32) -----
-    # We need the full q_c/k_c/g_c/h_start for the K-sum reductions
-    # (g_cum, g_cum_exp, K_alpha, etc.), and the full v_c/beta_c.
-    # All together this is ~640 KB fp32 per program at K=V=128 —
-    # well within shared memory and registers.
-    q_c = tl.load(
+    # ----- Load q_c, k_c, v_c, g_c, beta_c, h_start (all in fp32) -----
+    q_offs = (
         q_ptr
         + b_idx * stride_q_b
         + h_idx * stride_q_h
         + offs_t[:, None] * stride_q_t
         + offs_k[None, :] * stride_q_k
-    ).to(tl.float32)
-    k_c = tl.load(
+    )
+    k_offs = (
         k_ptr
         + b_idx * stride_k_b
         + h_idx * stride_k_h
         + offs_t[:, None] * stride_k_t
         + offs_k[None, :] * stride_k_k
-    ).to(tl.float32)
-    v_c = tl.load(
+    )
+    v_offs = (
         v_ptr
         + b_idx * stride_v_b
         + h_idx * stride_v_h
         + offs_t[:, None] * stride_v_t
         + offs_v[None, :] * stride_v_v
-    ).to(tl.float32)
-    g_c = tl.load(
+    )
+    g_offs = (
         g_ptr
         + b_idx * stride_g_b
         + h_idx * stride_g_h
         + offs_t[:, None] * stride_g_t
         + offs_k[None, :] * stride_g_k
-    ).to(tl.float32)
-    beta_c = tl.load(
+    )
+    beta_offs = (
         beta_ptr
         + b_idx * stride_beta_b
         + h_idx * stride_beta_h
         + offs_t * stride_beta_t
-    ).to(tl.float32)
-    h_start = tl.load(
+    )
+    h_offs = (
         h_ptr
         + b_idx * stride_h_b
         + h_idx * stride_h_h
         + offs_k[:, None] * stride_h_k
         + offs_v[None, :] * stride_h_v
-    ).to(tl.float32)
+    )
+
+    q_c = tl.load(q_offs).to(tl.float32)
+    k_c = tl.load(k_offs).to(tl.float32)
+    v_c = tl.load(v_offs).to(tl.float32)
+    g_c = tl.load(g_offs).to(tl.float32)
+    beta_c = tl.load(beta_offs).to(tl.float32)
+    h_start = tl.load(h_offs).to(tl.float32)
 
     # Doc-boundary state reset
     if is_doc_start == 1:
@@ -181,229 +163,93 @@ def _efkda_chunk_fwd_kernel(
     alpha_t = -(tl.exp(-c_t) - 1.0) / k_norm_sq             # [L]
 
     # ----- g_cum[t, k] = sum_{i=0..t} g_c[i, k] (inclusive cumsum) -----
-    # Full [L, K] for the K-axis sum reductions below.
     g_cum = tl.cumsum(g_c, axis=0)                          # [L, K]
-    g_chunk_no_kd = tl.sum(g_c, axis=0)                     # [K]
-    g_chunk_exp = tl.exp(g_chunk_no_kd)[:, None]            # [K, 1]
+    g_chunk = tl.sum(g_c, axis=0, keep_dims=True)           # [1, K]
 
-    # K_alpha (needed for h_new after the solve). Stays full [L, K]
-    # in registers — only 32K fp32 at K=128, no spill concerns.
-    decay_h = tl.exp(g_chunk_no_kd[None, :] - g_cum)        # [L, K]
-    K_alpha = alpha_t[:, None] * decay_h * k_c              # [L, K]
-
-    # ----- Mask tiles for the two decay tensors (used inside the K-loop) -----
+    # ----- Mask tiles for the two decay tensors -----
     strict_lower = offs_t[:, None] > offs_t[None, :]        # [L, L] bool
     lower_incl = offs_t[:, None] >= offs_t[None, :]         # [L, L] bool
     eye_mask = offs_t[:, None] == offs_t[None, :]           # [L, L] bool
 
-    # ----- K-tile loop: accumulate T, Q_dot_K, p, o_first -----
-    # The K-axis sum reductions are split into NC tiles. The
-    # per-tile intermediates decay_inner / decay_q are only
-    # [L, L, BK] (vs. the original [L, L, K] = 64×64×128 = 524 288
-    # fp32 that choked ptxas). p and o_first are K-sums too, so they
-    # are accumulated in [L, V] registers per tile.
-    T_acc = tl.zeros([L, L], dtype=tl.float32)
-    Q_dot_K_acc = tl.zeros([L, L], dtype=tl.float32)
-    p_acc = tl.zeros([L, V], dtype=tl.float32)
-    o_first_acc = tl.zeros([L, V], dtype=tl.float32)
-
-    for k_idx in tl.static_range(NC):
-        k_start = k_idx * BK
-        offs_k_tile = k_start + tl.arange(0, BK)
-
-        # Load tile. Re-reads from L2 (the full tensor was loaded
-        # above), so the L2 cost dominates and the global DRAM cost
-        # is one DRAM read per (B, H) per chunk.
-        k_c_tile = tl.load(
-            k_ptr
-            + b_idx * stride_k_b
-            + h_idx * stride_k_h
-            + offs_t[:, None] * stride_k_t
-            + offs_k_tile[None, :] * stride_k_k
-        ).to(tl.float32)
-        q_c_tile = tl.load(
-            q_ptr
-            + b_idx * stride_q_b
-            + h_idx * stride_q_h
-            + offs_t[:, None] * stride_q_t
-            + offs_k_tile[None, :] * stride_q_k
-        ).to(tl.float32)
-        g_c_tile = tl.load(
-            g_ptr
-            + b_idx * stride_g_b
-            + h_idx * stride_g_h
-            + offs_t[:, None] * stride_g_t
-            + offs_k_tile[None, :] * stride_g_k
-        ).to(tl.float32)
-        h_start_tile = tl.load(
-            h_ptr
-            + b_idx * stride_h_b
-            + h_idx * stride_h_h
-            + offs_k_tile[:, None] * stride_h_k
-            + offs_v[None, :] * stride_h_v
-        ).to(tl.float32)
-
-        # Inclusive cumsum within tile (cumsum is over L=64, not K)
-        g_cum_tile = tl.cumsum(g_c_tile, axis=0)            # [L, BK]
-        g_cum_tile_exp = tl.exp(g_cum_tile)                 # [L, BK]
-
-        # T partial: alpha_{t'} * <k_t (gated), k_{t'}> for t' < t
-        # Mask upper-tri BEFORE exp() so the (masked) backward
-        # through exp() multiplies 0 * 1 = 0, not 0 * inf = nan.
-        # diff_g > 0 there because decay is monotone, so exp
-        # overflows fp32 fast.
-        diff_g = g_cum_tile[:, None, :] - g_cum_tile[None, :, :]      # [L, L, BK]
-        diff_g_safe = tl.where(strict_lower[:, :, None], diff_g, 0.0)
-        decay_inner = tl.exp(diff_g_safe)                               # [L, L, BK]
-        T_acc += alpha_t[None, :] * tl.sum(
-            k_c_tile[:, None, :] * k_c_tile[None, :, :] * decay_inner,
-            axis=-1,
-        )                                                               # [L, L]
-
-        # Q_dot_K partial: alpha_{t'} * <q_t (gated), k_{t'}> for t' <= t
-        diff_q = g_cum_tile[:, None, :] - g_cum_tile[None, :, :]      # [L, L, BK]
-        diff_q_safe = tl.where(lower_incl[:, :, None], diff_q, 0.0)
-        decay_q = tl.exp(diff_q_safe)                                 # [L, L, BK]
-        Q_dot_K_acc += alpha_t[None, :] * tl.sum(
-            q_c_tile[:, None, :] * k_c_tile[None, :, :] * decay_q,
-            axis=-1,
-        )                                                              # [L, L]
-
-        # p partial: (k_c * exp(g_cum))^T h_start, restricted to this tile
-        p_acc += tl.dot(
-            k_c_tile * g_cum_tile_exp, h_start_tile, allow_tf32=False,
-        )                                                              # [L, V]
-
-        # o_first partial: (q_c * exp(g_cum))^T h_start, restricted to this tile
-        o_first_acc += tl.dot(
-            q_c_tile * g_cum_tile_exp, h_start_tile, allow_tf32=False,
-        )                                                              # [L, V]
-
-    # ----- Final T and A -----
-    T = tl.where(strict_lower, T_acc, 0.0)                  # strict lower
+    # ----- T[t, t'] = alpha_{t'} * <k_t (gated), k_{t'}>  for t' < t -----
+    # Mask upper-tri BEFORE exp() so the (masked) backward through
+    # exp() multiplies 0 * 1 = 0, not 0 * inf = nan. diff_g > 0
+    # there because decay is monotone, so exp overflows fp32 fast.
+    diff_g = g_cum[:, None, :] - g_cum[None, :, :]          # [L, L, K]
+    diff_g_safe = tl.where(strict_lower[:, :, None], diff_g, 0.0)
+    decay_inner = tl.exp(diff_g_safe)                       # [L, L, K]
+    T = alpha_t[None, :] * tl.sum(
+        k_c[:, None, :] * k_c[None, :, :] * decay_inner,
+        axis=-1,
+    )                                                       # [L, L]
+    T = tl.where(strict_lower, T, 0.0)                     # strict lower
     A = tl.where(eye_mask, T + 1.0, T)                      # [L, L] = I + T
 
-    # ----- v_new = solve_lower_triangular(A, rhs) -----
-    # Block triangular solve (B1 in the optimization plan).
-    # A = I + T (T strict lower) split into 16x16 sub-blocks.
-    # For sub-block bi, the block-triangular solve is:
-    #   v_new[bi] = A_ii^{-1} @ (rhs[bi] - sum_{j<i} T[bi, bj] @ v_new[bj])
-    #
-    # We process sub-blocks in order. For each:
-    #   1. Inter-block matmuls: compute the corrected rhs for this sub-block
-    #      (6 matmuls total for L=64; each is a [L, L] @ [L, V] with the
-    #      relevant 16x16 sub-block of T non-zero — wasteful in flops but
-    #      a single Tensor Core op each).
-    #   2. In-block forward substitution on A_ii (16 iters, 4x smaller
-    #      unroll than the original 64-iter loop, much smaller compile).
-    #
-    # The in-block solve is mathematically equivalent to the row-by-row
-    # forward sub but operates on the masked [L, L] A (with only the
-    # 16x16 A_ii sub-block non-zero). The masked approach avoids the
-    # need to extract 16x16 sub-blocks in registers.
-    rhs = v_c - p_acc                                       # [L, V]
-    v_new = tl.zeros_like(rhs)                              # accumulator for sub-block results
+    # ----- p[t, v] = sum_k k[t, k] * exp(g_cum[t, k]) * h_start[k, v] -----
+    g_cum_exp = tl.exp(g_cum)                               # [L, K]
+    p = tl.dot(
+        k_c * g_cum_exp, h_start, allow_tf32=False,
+    )                                                       # [L, V]
 
-    if L == 16:
-        # Single sub-block: v_new = A^{-1} @ rhs directly
-        A_masked = tl.where(
-            (offs_t[:, None] < 16) & (offs_t[None, :] < 16), A, 0.0,
-        )
-        v_new = rhs
-        for t in tl.static_range(16):
-            a_t = tl.sum(tl.where(offs_t[:, None] == t, A_masked, 0.0), axis=0)
-            a_tt = tl.sum(tl.where(offs_t == t, a_t, 0.0))
-            a_t_masked = tl.where(offs_t < t, a_t, 0.0)
-            contrib = tl.sum(a_t_masked[:, None] * v_new, axis=0)
-            rhs_t = tl.sum(tl.where(offs_t[:, None] == t, rhs, 0.0), axis=0)
-            v_new_t = (rhs_t - contrib) / a_tt
-            v_new = tl.where(offs_t[:, None] == t, v_new_t[None, :], v_new)
-    elif L == 32:
-        # 2 sub-blocks: bi=0 (no inter), bi=1 (1 inter-block matmul)
-        # Sub-block 0
-        A_masked_0 = tl.where(
-            (offs_t[:, None] < 16) & (offs_t[None, :] < 16), A, 0.0,
-        )
-        v_new_b0 = rhs
-        for t in tl.static_range(16):
-            a_t = tl.sum(tl.where(offs_t[:, None] == t, A_masked_0, 0.0), axis=0)
-            a_tt = tl.sum(tl.where(offs_t == t, a_t, 0.0))
-            a_t_masked = tl.where(offs_t < t, a_t, 0.0)
-            contrib = tl.sum(a_t_masked[:, None] * v_new_b0, axis=0)
-            rhs_t = tl.sum(tl.where(offs_t[:, None] == t, rhs, 0.0), axis=0)
-            v_new_t = (rhs_t - contrib) / a_tt
-            v_new_b0 = tl.where(offs_t[:, None] == t, v_new_t[None, :], v_new_b0)
-        v_new = tl.where(offs_t[:, None] < 16, v_new_b0, v_new)
-        # Sub-block 1: rhs_1 = rhs - T[1, 0] @ v_new[0]
-        row_mask_1 = (offs_t >= 16) & (offs_t < 32)
-        a_sub_10 = tl.where(
-            row_mask_1[:, None] & (offs_t[None, :] < 16), A, 0.0,
-        )
-        contrib_10 = tl.dot(a_sub_10, v_new, allow_tf32=False)
-        rhs_b1 = tl.where(row_mask_1[:, None], rhs - contrib_10, 0.0)
-        A_masked_1 = tl.where(
-            row_mask_1[:, None] & row_mask_1[None, :], A, 0.0,
-        )
-        v_new_b1 = rhs_b1
-        for t in tl.static_range(16, 32):
-            a_t = tl.sum(tl.where(offs_t[:, None] == t, A_masked_1, 0.0), axis=0)
-            a_tt = tl.sum(tl.where(offs_t == t, a_t, 0.0))
-            a_t_masked = tl.where(offs_t < t, a_t, 0.0)
-            contrib = tl.sum(a_t_masked[:, None] * v_new_b1, axis=0)
-            rhs_t = tl.sum(tl.where(offs_t[:, None] == t, rhs_b1, 0.0), axis=0)
-            v_new_t = (rhs_t - contrib) / a_tt
-            v_new_b1 = tl.where(offs_t[:, None] == t, v_new_t[None, :], v_new_b1)
-        v_new = tl.where(row_mask_1[:, None], v_new_b1, v_new)
-    elif L == 64:
-        # 4 sub-blocks: 0, 1, 2, 3. Total: 4 in-block solves + 6 inter-block matmuls.
-        BS: tl.constexpr = 16
-        for bi in tl.static_range(4):
-            row_mask_bi = (offs_t >= bi * BS) & (offs_t < (bi + 1) * BS)  # [L]
-            # ---- Inter-block matmuls: rhs_bi = rhs - sum_{j<bi} T[bi, bj] @ v_new[j]
-            rhs_bi = rhs
-            for bj in tl.static_range(bi):
-                col_mask_bj = (offs_t >= bj * BS) & (offs_t < (bj + 1) * BS)
-                a_sub = tl.where(
-                    row_mask_bi[:, None] & col_mask_bj[None, :], A, 0.0,
-                )
-                contrib = tl.dot(a_sub, v_new, allow_tf32=False)  # [L, V]
-                rhs_bi = rhs_bi - contrib
-            rhs_bi = tl.where(row_mask_bi[:, None], rhs_bi, 0.0)
-            # ---- In-block solve on A_ii (16-iter forward sub on the masked A_ii)
-            A_ii = tl.where(
-                row_mask_bi[:, None] & row_mask_bi[None, :], A, 0.0,
-            )
-            v_new_bi = rhs_bi
-            for t_local in tl.static_range(16):
-                t_abs = bi * BS + t_local
-                a_t = tl.sum(tl.where(offs_t[:, None] == t_abs, A_ii, 0.0), axis=0)
-                a_tt = tl.sum(tl.where(offs_t == t_abs, a_t, 0.0))
-                a_t_masked = tl.where(offs_t < t_abs, a_t, 0.0)
-                contrib = tl.sum(a_t_masked[:, None] * v_new_bi, axis=0)
-                rhs_t = tl.sum(tl.where(offs_t[:, None] == t_abs, rhs_bi, 0.0), axis=0)
-                v_new_t = (rhs_t - contrib) / a_tt
-                v_new_bi = tl.where(offs_t[:, None] == t_abs, v_new_t[None, :], v_new_bi)
-            # ---- Write v_new_bi into v_new
-            v_new = tl.where(row_mask_bi[:, None], v_new_bi, v_new)
-    else:
-        # Fallback: L-iter forward substitution (for L=128+; TODO 4-level block solve).
-        v_new = tl.zeros_like(rhs)
-        for t in tl.static_range(L):
-            a_t = tl.sum(tl.where(offs_t[:, None] == t, A, 0.0), axis=0)
-            a_tt = tl.sum(tl.where(offs_t == t, a_t, 0.0))
-            a_t_masked = tl.where(offs_t < t, a_t, 0.0)
-            contrib = tl.sum(a_t_masked[:, None] * v_new, axis=0)
-            rhs_t = tl.sum(tl.where(offs_t[:, None] == t, rhs, 0.0), axis=0)
-            v_new_t = (rhs_t - contrib) / a_tt
-            v_new = tl.where(offs_t[:, None] == t, v_new_t[None, :], v_new)
+    # ----- v_new = solve_lower_triangular(A, v - p) -----
+    # Triton has no built-in triangular solve. We inline a
+    # sequential forward-substitution loop. L = 16/32/64 is small
+    # enough that the per-step work fits in registers.
+    #
+    # Per step t:
+    #   v_new[t] = (rhs[t] - sum_{t'<t} A[t, t'] * v_new[t']) / A[t, t]
+    #
+    # We extract the t-th row of A via ``tl.where + tl.sum`` along
+    # axis 0 (mask rows != t to 0, sum gives the [L] row). The
+    # diag A[t, t] is just ``a_t[t]`` of the extracted row.
+    rhs = v_c - p                                           # [L, V]
+    v_new = tl.zeros_like(rhs)
+    for t in tl.static_range(L):
+        # a_t[j] = A[t, j] for j in [0, L)
+        a_t = tl.sum(tl.where(offs_t[:, None] == t, A, 0.0), axis=0)  # [L]
+        # a_tt = A[t, t]
+        a_tt = tl.sum(tl.where(offs_t == t, a_t, 0.0))     # scalar
+        # contrib[v] = sum_{j<t} a_t[j] * v_new[j, v]
+        a_t_masked = tl.where(offs_t < t, a_t, 0.0)         # [L]
+        contrib = tl.sum(a_t_masked[:, None] * v_new, axis=0)         # [V]
+        # rhs_t[v] = rhs[t, v]. ``offs_t[:, None]`` gives shape
+        # [L, 1] for explicit 2D broadcast against rhs [L, V] —
+        # required when L != V (test #8 has L=64, V=128).
+        rhs_t = tl.sum(tl.where(offs_t[:, None] == t, rhs, 0.0), axis=0)       # [V]
+        v_new_t = (rhs_t - contrib) / a_tt                            # [V]
+        # Write v_new[t] = v_new_t, leave other rows untouched.
+        v_new = tl.where(offs_t[:, None] == t, v_new_t[None, :], v_new)
 
-    # ----- o_c = o_first + o_second -----
-    o_first = o_first_acc
-    Q_dot_K = tl.where(lower_incl, Q_dot_K_acc, 0.0)
+    # ----- o_first[t, v] = (q[t] * exp(g_cum[t]))^T h_start -----
+    o_first = tl.dot(
+        q_c * g_cum_exp, h_start, allow_tf32=False,
+    )                                                       # [L, V]
+
+    # ----- o_second via lower-incl decay_q -----
+    diff_q = g_cum[:, None, :] - g_cum[None, :, :]          # [L, L, K]
+    diff_q_safe = tl.where(lower_incl[:, :, None], diff_q, 0.0)
+    decay_q = tl.exp(diff_q_safe)                           # [L, L, K]
+    Q_dot_K = alpha_t[None, :] * tl.sum(
+        q_c[:, None, :] * k_c[None, :, :] * decay_q, axis=-1,
+    )                                                       # [L, L]
+    Q_dot_K = tl.where(lower_incl, Q_dot_K, 0.0)
     o_second = tl.dot(Q_dot_K, v_new, allow_tf32=False)     # [L, V]
+
     o_c = o_first + o_second                                # [L, V]
 
-    # ----- h_new = h_start * exp(g_chunk) + K_alpha^T @ v_new -----
+    # ----- h_new = h_start * exp(g_chunk) + sum_t alpha_t exp(g_chunk - g_cum[t]) k[t] v_new[t]^T -----
+    # Compute exp(g_chunk) as a [K] tile (no keep_dims) and reshape
+    # to [K, 1] for UNAMBIGUOUS broadcast against h_start [K, V].
+    # The earlier ``h_start * g_chunk_exp`` form had g_chunk_exp
+    # in shape [1, K]; for V == K that broadcasts to [K, V] but
+    # the IR's reduction tree made the per-element value wrong
+    # once h_start was non-zero (chunks 1+, not chunk 0 with
+    # h_start = 0). Reshape-to-[K, 1] forces the compiler to
+    # treat it as a per-k-column scale.
+    g_chunk_no_kd = tl.sum(g_c, axis=0)                     # [K]
+    g_chunk_exp = tl.exp(g_chunk_no_kd)[:, None]            # [K, 1]
+    decay_h = tl.exp(g_chunk_no_kd[None, :] - g_cum)        # [L, K]
+    K_alpha = alpha_t[:, None] * decay_h * k_c              # [L, K]
     h_new = h_start * g_chunk_exp + tl.dot(
         tl.trans(K_alpha), v_new, allow_tf32=False,
     )                                                       # [K, V]
@@ -466,34 +312,7 @@ class _EFKDAChunkFn(torch.autograd.Function):
         V = v_c.shape[-1]
         o_c = torch.empty(B, H, L, V, device=q_c.device, dtype=v_c.dtype)
         h_new = torch.empty_like(h)
-        # BK is the K-tile size for the K-tile loop in the kernel.
-        # BK=16 is the GDN2 default; it keeps the per-tile [L, L, BK]
-        # intermediates at [64, 64, 16] = 65 536 fp32 = 256 KB, which
-        # is what makes the K=128 ptxas compile tractable. K must
-        # be a multiple of BK; for the production head_dim=128, 16
-        # divides cleanly. For other K values the wrapper asserts
-        # the constraint and falls back to BK=K (no tiling) when
-        # the math doesn't divide — but that case reverts to the
-        # original [L, L, K] materialization and is only meant for
-        # correctness checks, not prod.
-        if K % 16 == 0:
-            BK = 16
-        elif K % 8 == 0:
-            BK = 8
-        else:
-            BK = K  # no tiling; correctness only
         grid = (H, B)
-        # num_warps=8 (vs. the default 4) for K=128. The K-tile
-        # loop + 64-iter triangular solve have large working sets
-        # at K=128, and the extra warps give ptxas more flexibility
-        # in register allocation. Empirically this brings the K=128
-        # fresh compile from ~6 min down to ~3 min on the dev box
-        # (vs. 15+ min before K-tiling). For K=16/64 the smaller
-        # working set doesn't benefit and we stay at 4 warps.
-        if K >= 128:
-            nw = 8
-        else:
-            nw = 4
         _efkda_chunk_fwd_kernel[grid](
             q_c, k_c, v_c, g_c, beta_c, h, o_c, h_new,
             q_c.stride(0), q_c.stride(1), q_c.stride(2), q_c.stride(3),
@@ -505,8 +324,8 @@ class _EFKDAChunkFn(torch.autograd.Function):
             o_c.stride(0), o_c.stride(1), o_c.stride(2), o_c.stride(3),
             h_new.stride(0), h_new.stride(1), h_new.stride(2), h_new.stride(3),
             is_doc_start,
-            L, K, V, BK, eps,
-            num_warps=nw,
+            L, K, V, eps,
+            num_warps=4,
         )
         return o_c, h_new
 

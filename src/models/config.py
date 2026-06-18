@@ -19,13 +19,35 @@ class HippoConfig:
     tie_word_embeddings: bool = True
     use_bias: bool = False
 
-    # GDN2 (Gated DeltaNet 2): KDA's scalar beta is replaced with two
-    # channel-wise gates (b on the key axis, w on the value axis).
+    # EFKDA: KDA with EFLA closed-form alpha (Lei et al., 2025; arXiv
+    # 2512.12602). Replaces the KDA Euler-step recurrence
+    #     S_t = (I - β_t k_t kᵀ) Diag(exp(g_t)) S_{t-1} + β_t k_t v_tᵀ
+    # with the rank-1 closed form
+    #     α_t = (1 - exp(-β_t ||k_t||²)) / ||k_t||²
+    #     S_t = (I - α_t k_t k_tᵀ) D S_{t-1} + α_t k_t v_tᵀ
+    # The closed-form α absorbs the matrix exponential of the rank-1
+    # dynamics exactly (vs the small-β Euler approximation), so the
+    # recurrence is the KDA recurrence re-expressed — not a different
+    # recurrence. The wrapper (src/models/ops/efkda.py) L2-normalises
+    # q and k so ||k||=1 and α simplifies to (1 - exp(-β)).
     num_heads: int = 16
     head_dim: int = 64
     expand_v: float = 1.0  # Value dimension expansion factor
-    gdn2_mode: str = "chunk"  # "chunk" for training, "fused_recurrent" for inference
-    use_short_conv: bool = False  # No local convolution (global GDN2, NoPE)
+    # ``efkda_kernel`` selects the production kernel backend:
+    #   "triton" — the custom Triton kernel for forward, PyTorch
+    #              reference for backward (via _EFKDAChunkFn autograd).
+    #              This is the default; it is the production path.
+    #   "ref"    — pure-PyTorch reference (slow but stable; for
+    #              debugging numerical regressions). Lives at
+    #              src/models/ops/_vendored/fla/ops/kda/chunk_efla_naive.py.
+    efkda_kernel: str = "triton"
+    efkda_mode: str = "chunk"  # reserved; only "chunk" is implemented.
+    # Legacy GDN2 fields kept for backward compat (the old GDN2 path
+    # is no longer wired into the model, but downstream callers may
+    # still read these via HippoConfig / base.yml). New code should
+    # use ``efkda_kernel`` instead.
+    gdn2_mode: str = "chunk"
+    use_short_conv: bool = False  # No local convolution (global EFKDA, NoPE)
     allow_neg_eigval: bool = False
     conv_size: int = 4
     conv_bias: bool = False
@@ -63,9 +85,17 @@ class HippoConfig:
         # Derived
         self.block_size: int = self.num_layers // self.num_blocks
         self.kv_channels: int = self.num_heads * self.head_dim
-        # Validate GDN2 mode
+        # Validate GDN2 mode (legacy; kept for backward compat)
         assert self.gdn2_mode in ("chunk", "fused_recurrent"), (
             f"gdn2_mode must be 'chunk' or 'fused_recurrent', got {self.gdn2_mode!r}"
+        )
+        # Validate EFKDA backend selection
+        assert self.efkda_kernel in ("triton", "ref"), (
+            f"efkda_kernel must be 'triton' or 'ref', got {self.efkda_kernel!r}"
+        )
+        assert self.efkda_mode == "chunk", (
+            f"efkda_mode must be 'chunk' (only the chunkwise path is implemented), "
+            f"got {self.efkda_mode!r}"
         )
         # Packing
         if self.pack_chunk_size == 0:
