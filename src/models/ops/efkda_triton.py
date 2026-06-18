@@ -8,12 +8,12 @@ one-for-one):
   g_chunk[k] = g_cum[L-1, k]                                        # [K]
   p[t, v] = sum_d k[t, d] exp(g_cum[t, d]) h_start[d, v]            # [L, V]
   diff_g[t, t', d] = g_cum[t, d] - g_cum[t', d]
-  decay_inner[t, t', d] = where(t'<t, exp(diff_g), 0)               # [L, L, K]
+  decay_inner[t, t', d] = where(t'<t, exp(diff_g), 0)               # [L, L, BK] (tiled)
   T[t, t'] = alpha_{t'} sum_d k[t,d] decay_inner[t,t',d] k[t',d]    # [L, L] strict lower
   A = I + T                                                         # [L, L]
   v_new = solve_lower_triangular(A, v - p)                          # [L, V]
   o_first[t, v] = sum_d q[t, d] exp(g_cum[t, d]) h_start[d, v]      # [L, V]
-  decay_q[t, t', d] = where(t'<=t, exp(diff_g), 0)                  # [L, L, K]
+  decay_q[t, t', d] = where(t'<=t, exp(diff_g), 0)                  # [L, L, BK] (tiled)
   Q_dot_K[t, t'] = alpha_{t'} sum_d q[t,d] decay_q[t,t',d] k[t',d]  # [L, L] lower-incl
   o_second[t, v] = sum_{t'} Q_dot_K[t, t'] v_new[t', v]             # [L, V]
   o = o_first + o_second
@@ -34,12 +34,24 @@ sequential chunk loop and avoids the h-dependency ordering issue
 that a fully-parallel (n_chunks, H, B) grid would have (chunk i+1
 needs chunk i's h_new).
 
+K-tiling (compile-time performance): the [L, L, K] intermediates
+``decay_inner`` and ``decay_q`` are tiled along the K axis with
+block size ``BK`` (default 16). With K=128, that's NC=8 tiles; the
+per-tile intermediates are [L=64, L=64, BK=16] = 65 536 fp32 = 256 KB
+per K-tile, which fits in registers when processed one tile at a time.
+Without K-tiling, the original [L, L, K=128] = 524 288 fp32 register
+footprint blows ptxas at compile time (hangs >15 min on the dev box).
+The K-axis sum reductions (T, Q_dot_K, p, o_first) are accumulated
+across the NC tiles in [L, L] / [L, V] register accumulators.
+
 Backward strategy (this first cut): the per-chunk
 :class:`_EFKDAChunkFn` autograd.Function runs the Triton kernel in
 forward and re-runs the PyTorch reference's :func:`_efla_chunk_apply`
 in backward (with autograd enabled) to populate the gradient graph.
-The dedicated Triton backward is task #28 — for the first cut the
-backward is correct but not Triton-fast.
+The dedicated Triton backward (task #28) hits the 99KB shmem budget
+on the 5060 Ti at K=128 because the backprop needs *multiple*
+[L, L, BK] intermediates simultaneously (decay_inner, decay_q, N_tile,
+M1, M2, Nq, ...). Sub-tiling to [BS, BS, BK] is task #60.
 """
 from __future__ import annotations
 
@@ -74,6 +86,7 @@ def _efkda_chunk_fwd_kernel(
     L: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    BK: tl.constexpr,           # K-tile size; K must be a multiple of BK
     EPS: tl.constexpr,
 ):
     """One Triton program = one (B, H) for the current chunk.
@@ -92,6 +105,7 @@ def _efkda_chunk_fwd_kernel(
     """
     h_idx = tl.program_id(0)
     b_idx = tl.program_id(1)
+    NC: tl.constexpr = K // BK
 
     offs_t = tl.arange(0, L)
     offs_k = tl.arange(0, K)
@@ -163,35 +177,89 @@ def _efkda_chunk_fwd_kernel(
     alpha_t = -(tl.exp(-c_t) - 1.0) / k_norm_sq             # [L]
 
     # ----- g_cum[t, k] = sum_{i=0..t} g_c[i, k] (inclusive cumsum) -----
+    # Full [L, K] for h_new (decay_h) and per-tile loads below.
     g_cum = tl.cumsum(g_c, axis=0)                          # [L, K]
-    g_chunk = tl.sum(g_c, axis=0, keep_dims=True)           # [1, K]
 
-    # ----- Mask tiles for the two decay tensors -----
+    # ----- Mask tiles for the two decay tensors (used inside the K-loop) -----
     strict_lower = offs_t[:, None] > offs_t[None, :]        # [L, L] bool
     lower_incl = offs_t[:, None] >= offs_t[None, :]         # [L, L] bool
     eye_mask = offs_t[:, None] == offs_t[None, :]           # [L, L] bool
 
-    # ----- T[t, t'] = alpha_{t'} * <k_t (gated), k_{t'}>  for t' < t -----
-    # Mask upper-tri BEFORE exp() so the (masked) backward through
-    # exp() multiplies 0 * 1 = 0, not 0 * inf = nan. diff_g > 0
-    # there because decay is monotone, so exp overflows fp32 fast.
-    diff_g = g_cum[:, None, :] - g_cum[None, :, :]          # [L, L, K]
-    diff_g_safe = tl.where(strict_lower[:, :, None], diff_g, 0.0)
-    decay_inner = tl.exp(diff_g_safe)                       # [L, L, K]
-    T = alpha_t[None, :] * tl.sum(
-        k_c[:, None, :] * k_c[None, :, :] * decay_inner,
-        axis=-1,
-    )                                                       # [L, L]
-    T = tl.where(strict_lower, T, 0.0)                     # strict lower
+    # ----- K-tile accumulators -----
+    # T, Q_dot_K are K-sum reductions over [L, L] tensors. p and
+    # o_first are K-sum reductions over [L, V] tensors. The per-tile
+    # decay_inner / decay_q intermediates are only [L, L, BK] — vs.
+    # the original [L, L, K] = 64×64×128 = 524 288 fp32 that
+    # choked ptxas at compile time.
+    T_acc = tl.zeros([L, L], dtype=tl.float32)
+    Q_dot_K_acc = tl.zeros([L, L], dtype=tl.float32)
+    p_acc = tl.zeros([L, V], dtype=tl.float32)
+    o_first_acc = tl.zeros([L, V], dtype=tl.float32)
+
+    for k_idx in tl.static_range(NC):
+        k_start = k_idx * BK
+        offs_k_tile = k_start + tl.arange(0, BK)
+
+        # Re-load the [L, BK] tile from gbm (free L2 hit — the full
+        # tensor was loaded above).
+        k_tile = tl.load(
+            k_ptr + b_idx * stride_k_b + h_idx * stride_k_h
+            + offs_t[:, None] * stride_k_t + offs_k_tile[None, :] * stride_k_k,
+        ).to(tl.float32)
+        q_tile = tl.load(
+            q_ptr + b_idx * stride_q_b + h_idx * stride_q_h
+            + offs_t[:, None] * stride_q_t + offs_k_tile[None, :] * stride_q_k,
+        ).to(tl.float32)
+        g_tile = tl.load(
+            g_ptr + b_idx * stride_g_b + h_idx * stride_g_h
+            + offs_t[:, None] * stride_g_t + offs_k_tile[None, :] * stride_g_k,
+        ).to(tl.float32)
+        h_start_tile = tl.load(
+            h_ptr + b_idx * stride_h_b + h_idx * stride_h_h
+            + offs_k_tile[:, None] * stride_h_k + offs_v[None, :] * stride_h_v,
+        ).to(tl.float32)
+
+        # Per-tile cumsum along T axis (cumsum is independent per K).
+        g_cum_tile = tl.cumsum(g_tile, axis=0)              # [L, BK]
+        g_cum_tile_exp = tl.exp(g_cum_tile)                 # [L, BK]
+
+        # T partial: alpha_{t'} * <k_t (gated), k_{t'}> for t' < t.
+        # Mask upper-tri BEFORE exp() so the (masked) backward
+        # through exp() multiplies 0 * 1 = 0, not 0 * inf = nan.
+        # diff_g > 0 there because decay is monotone, so exp
+        # overflows fp32 fast.
+        diff_g = g_cum_tile[:, None, :] - g_cum_tile[None, :, :]      # [L, L, BK]
+        diff_g_safe = tl.where(strict_lower[:, :, None], diff_g, 0.0)
+        decay_inner = tl.exp(diff_g_safe)                               # [L, L, BK]
+        T_acc += alpha_t[None, :] * tl.sum(
+            k_tile[:, None, :] * k_tile[None, :, :] * decay_inner,
+            axis=-1,
+        )                                                               # [L, L]
+
+        # Q_dot_K partial: alpha_{t'} * <q_t (gated), k_{t'}> for t' <= t
+        diff_q = g_cum_tile[:, None, :] - g_cum_tile[None, :, :]      # [L, L, BK]
+        diff_q_safe = tl.where(lower_incl[:, :, None], diff_q, 0.0)
+        decay_q = tl.exp(diff_q_safe)                                 # [L, L, BK]
+        Q_dot_K_acc += alpha_t[None, :] * tl.sum(
+            q_tile[:, None, :] * k_tile[None, :, :] * decay_q,
+            axis=-1,
+        )                                                              # [L, L]
+
+        # p partial: (k_c * exp(g_cum))^T h_start, restricted to this tile
+        p_acc += tl.dot(
+            k_tile * g_cum_tile_exp, h_start_tile, allow_tf32=False,
+        )                                                              # [L, V]
+
+        # o_first partial: (q_c * exp(g_cum))^T h_start, restricted to this tile
+        o_first_acc += tl.dot(
+            q_tile * g_cum_tile_exp, h_start_tile, allow_tf32=False,
+        )                                                              # [L, V]
+
+    # ----- Final T, A -----
+    T = tl.where(strict_lower, T_acc, 0.0)                  # strict lower
     A = tl.where(eye_mask, T + 1.0, T)                      # [L, L] = I + T
 
-    # ----- p[t, v] = sum_k k[t, k] * exp(g_cum[t, k]) * h_start[k, v] -----
-    g_cum_exp = tl.exp(g_cum)                               # [L, K]
-    p = tl.dot(
-        k_c * g_cum_exp, h_start, allow_tf32=False,
-    )                                                       # [L, V]
-
-    # ----- v_new = solve_lower_triangular(A, v - p) -----
+    # ----- v_new = solve_lower_triangular(A, rhs) -----
     # Triton has no built-in triangular solve. We inline a
     # sequential forward-substitution loop. L = 16/32/64 is small
     # enough that the per-step work fits in registers.
@@ -202,7 +270,7 @@ def _efkda_chunk_fwd_kernel(
     # We extract the t-th row of A via ``tl.where + tl.sum`` along
     # axis 0 (mask rows != t to 0, sum gives the [L] row). The
     # diag A[t, t] is just ``a_t[t]`` of the extracted row.
-    rhs = v_c - p                                           # [L, V]
+    rhs = v_c - p_acc                                       # [L, V]
     v_new = tl.zeros_like(rhs)
     for t in tl.static_range(L):
         # a_t[j] = A[t, j] for j in [0, L)
@@ -220,32 +288,17 @@ def _efkda_chunk_fwd_kernel(
         # Write v_new[t] = v_new_t, leave other rows untouched.
         v_new = tl.where(offs_t[:, None] == t, v_new_t[None, :], v_new)
 
-    # ----- o_first[t, v] = (q[t] * exp(g_cum[t]))^T h_start -----
-    o_first = tl.dot(
-        q_c * g_cum_exp, h_start, allow_tf32=False,
-    )                                                       # [L, V]
+    # ----- o_first + o_second -----
+    o_first = o_first_acc                                   # [L, V]
 
-    # ----- o_second via lower-incl decay_q -----
-    diff_q = g_cum[:, None, :] - g_cum[None, :, :]          # [L, L, K]
-    diff_q_safe = tl.where(lower_incl[:, :, None], diff_q, 0.0)
-    decay_q = tl.exp(diff_q_safe)                           # [L, L, K]
-    Q_dot_K = alpha_t[None, :] * tl.sum(
-        q_c[:, None, :] * k_c[None, :, :] * decay_q, axis=-1,
-    )                                                       # [L, L]
-    Q_dot_K = tl.where(lower_incl, Q_dot_K, 0.0)
+    # ----- o_second via lower-incl decay_q (use accumulated Q_dot_K) -----
+    Q_dot_K = tl.where(lower_incl, Q_dot_K_acc, 0.0)
     o_second = tl.dot(Q_dot_K, v_new, allow_tf32=False)     # [L, V]
 
     o_c = o_first + o_second                                # [L, V]
 
     # ----- h_new = h_start * exp(g_chunk) + sum_t alpha_t exp(g_chunk - g_cum[t]) k[t] v_new[t]^T -----
-    # Compute exp(g_chunk) as a [K] tile (no keep_dims) and reshape
-    # to [K, 1] for UNAMBIGUOUS broadcast against h_start [K, V].
-    # The earlier ``h_start * g_chunk_exp`` form had g_chunk_exp
-    # in shape [1, K]; for V == K that broadcasts to [K, V] but
-    # the IR's reduction tree made the per-element value wrong
-    # once h_start was non-zero (chunks 1+, not chunk 0 with
-    # h_start = 0). Reshape-to-[K, 1] forces the compiler to
-    # treat it as a per-k-column scale.
+    # g_cum is full [L, K] in registers (32 KB at K=128, no spill concerns).
     g_chunk_no_kd = tl.sum(g_c, axis=0)                     # [K]
     g_chunk_exp = tl.exp(g_chunk_no_kd)[:, None]            # [K, 1]
     decay_h = tl.exp(g_chunk_no_kd[None, :] - g_cum)        # [L, K]
@@ -312,7 +365,28 @@ class _EFKDAChunkFn(torch.autograd.Function):
         V = v_c.shape[-1]
         o_c = torch.empty(B, H, L, V, device=q_c.device, dtype=v_c.dtype)
         h_new = torch.empty_like(h)
+        # BK is the K-tile size for the K-tile loop in the kernel.
+        # BK=16 is the GDN2 default; it keeps the per-tile [L, L, BK]
+        # intermediates at [64, 64, 16] = 65 536 fp32 per K-tile, which
+        # is what makes the K=128 ptxas compile tractable. K must
+        # be a multiple of BK; for the production head_dim=128, 16
+        # divides cleanly. For other K values the wrapper falls back
+        # to BK=K (no tiling) when the math doesn't divide — but that
+        # case reverts to the original [L, L, K] materialization and
+        # is only meant for correctness checks, not prod.
+        if K % 16 == 0:
+            BK = 16
+        elif K % 8 == 0:
+            BK = 8
+        else:
+            BK = K  # no tiling; correctness only
         grid = (H, B)
+        # num_warps=8 (vs. the default 4) for K>=128. The K-tile
+        # loop + 64-iter triangular solve have large working sets
+        # at K=128, and the extra warps give ptxas more flexibility
+        # in register allocation. For K=16/64 the smaller working
+        # set doesn't benefit and we stay at 4 warps.
+        nw = 8 if K >= 128 else 4
         _efkda_chunk_fwd_kernel[grid](
             q_c, k_c, v_c, g_c, beta_c, h, o_c, h_new,
             q_c.stride(0), q_c.stride(1), q_c.stride(2), q_c.stride(3),
@@ -324,8 +398,8 @@ class _EFKDAChunkFn(torch.autograd.Function):
             o_c.stride(0), o_c.stride(1), o_c.stride(2), o_c.stride(3),
             h_new.stride(0), h_new.stride(1), h_new.stride(2), h_new.stride(3),
             is_doc_start,
-            L, K, V, eps,
-            num_warps=4,
+            L, K, V, BK, eps,
+            num_warps=nw,
         )
         return o_c, h_new
 
