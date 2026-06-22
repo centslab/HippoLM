@@ -314,14 +314,24 @@ def _efkda_chunk_bwd_kernel(
     grad_h += tl.dot(tl.trans(k_c * g_cum_exp), grad_p, allow_tf32=False)
 
     # ===== Accumulators =====
-    # Main accumulators: [L, NC, BK]. Each is 32KB at K=128. Three of
-    # them = 96KB. Triton may keep them in registers; if not, the
-    # per-tile work is the shmem bottleneck.
-    grad_q_acc = tl.zeros([L, NC, BK], dtype=tl.float32)
-    grad_k_acc = tl.zeros([L, NC, BK], dtype=tl.float32)
-    grad_g_cum_acc = tl.zeros([L, NC, BK], dtype=tl.float32)
-    grad_g_chunk_acc = tl.zeros([NC, BK], dtype=tl.float32)
+    # Task #60 [BS, BS, BK] sub-tile rewrite — step 1: replace the
+    # [L, NC, BK] cross-tile accumulators (3 × 32KB = 96KB at K=128,
+    # OOM on the 5060 Ti's 99KB shmem) with per-K-tile stores to
+    # global memory. Each per-K-tile store writes only the K-local
+    # contributions; the chunk-final terms (grad_g_chunk[d],
+    # grad_k_from_alpha[t,d]) are added in a post-loop fixup pass
+    # below since they require the FULL accumulators across all
+    # K-tiles.
+    #
+    #   grad_alpha_acc  : [L]              — small, in registers
+    #   grad_g_chunk_acc: [NC, BK]         — Kalpha contribution,
+    #                                        accumulated across K-tiles
+    #
+    #   grad_q, grad_k, grad_g: written per-K-tile at offset k_idx*BK.
+    #     grad_g is the cumsum part only (grad_g_chunk added post-loop).
+    #     grad_k is K-local only (grad_k_from_alpha added post-loop).
     grad_alpha_acc = tl.zeros([L], dtype=tl.float32)
+    grad_g_chunk_acc = tl.zeros([NC, BK], dtype=tl.float32)
 
     nc_arange = tl.arange(0, NC)
 
@@ -332,7 +342,6 @@ def _efkda_chunk_bwd_kernel(
     for k_idx in tl.static_range(NC):
         k_start = k_idx * BK
         offs_k_tile = k_start + tl.arange(0, BK)
-        nc_mask = (nc_arange == k_idx)[None, :, None].to(tl.float32)  # [1, NC, 1]
 
         # Load K-tile
         k_tile = tl.load(
@@ -573,71 +582,134 @@ def _efkda_chunk_bwd_kernel(
             grad_g_cum_p_sub = k_sub_t * g_cum_sub_t_exp * grad_p_inner_sub  # [BS, BK]
             grad_g_cum_kt += tl.dot(ti_mask.to(tl.float32), grad_g_cum_p_sub, allow_tf32=False)
 
-        # ===== Add per-K-tile accumulators to main [L, NC, BK] accumulators =====
-        grad_q_acc += grad_q_kt[:, None, :] * nc_mask
-        grad_k_acc += grad_k_kt[:, None, :] * nc_mask
-        grad_g_cum_acc += grad_g_cum_kt[:, None, :] * nc_mask
+        # ===== Per-K-tile stores to global memory =====
+        # Replace the [L, NC, BK] accumulators with direct stores at
+        # offset k_idx*BK. Each store writes only K-local contributions;
+        # grad_g_chunk[d] and grad_k_from_alpha[t,d] are added in the
+        # post-loop fixup pass below.
+        tl.store(
+            grad_q_ptr + b_idx * stride_gq_b + h_idx * stride_gq_h
+            + offs_t[:, None] * stride_gq_t + offs_k_tile[None, :] * stride_gq_k,
+            grad_q_kt.to(grad_q_ptr.dtype.element_ty),
+        )
+        tl.store(
+            grad_k_ptr + b_idx * stride_gk_b + h_idx * stride_gk_h
+            + offs_t[:, None] * stride_gk_t + offs_k_tile[None, :] * stride_gk_k,
+            grad_k_kt.to(grad_k_ptr.dtype.element_ty),
+        )
+        # grad_g (cumsum part only — grad_g_chunk added post-loop)
+        grad_g_cum_reversed = tl.flip(grad_g_cum_kt, 0)
+        grad_g_reversed_cumsum = tl.cumsum(grad_g_cum_reversed, axis=0)
+        grad_g_kt = tl.flip(grad_g_reversed_cumsum, 0)
+        tl.store(
+            grad_g_ptr + b_idx * stride_gg_b + h_idx * stride_gg_h
+            + offs_t[:, None] * stride_gg_t + offs_k_tile[None, :] * stride_gg_k,
+            grad_g_kt.to(grad_g_ptr.dtype.element_ty),
+        )
+
         grad_alpha_acc += grad_alpha_kt
 
-    # ===== grad_g from grad_g_cum = reverse cumsum =====
-    grad_g_cum_reversed = tl.flip(grad_g_cum_acc, 0)
-    grad_g_reversed_cumsum = tl.cumsum(grad_g_cum_reversed, axis=0)
-    grad_g_base_3d = tl.flip(grad_g_reversed_cumsum, 0)
-    grad_g_base = tl.reshape(grad_g_base_3d, [L, K])
-
-    grad_g_chunk_from_Kalpha = tl.reshape(grad_g_chunk_acc, [K])
-    h_new_first_term = h_start * g_chunk_exp
-    grad_g_chunk_from_h_first = tl.sum(
-        grad_h_new * h_new_first_term, axis=1,
-    )
-    grad_g_chunk_total = grad_g_chunk_from_Kalpha + grad_g_chunk_from_h_first
-    grad_g = grad_g_base + grad_g_chunk_total[None, :]
-
     # ===== grad_beta from grad_alpha =====
-    exp_neg_c = tl.exp(-c_t)
+    exp_neg_c = tl.exp(-c_t)  # [L]
     grad_beta = grad_alpha_acc * exp_neg_c
 
     grad_k_norm_sq = grad_alpha_acc * (
         (c_t + 1.0) * exp_neg_c - 1.0
-    ) / (k_norm_sq * k_norm_sq)
-    grad_k_from_alpha = 2.0 * k_c * grad_k_norm_sq[:, None]
-    grad_k_from_alpha_3d = tl.reshape(grad_k_from_alpha, [L, NC, BK])
-    grad_k_acc += grad_k_from_alpha_3d
+    ) / (k_norm_sq * k_norm_sq)  # [L]
 
-    # ===== Write outputs =====
-    grad_q_2d = tl.reshape(grad_q_acc, [L, K])
-    grad_k_2d = tl.reshape(grad_k_acc, [L, K])
-
-    tl.store(
-        grad_q_ptr + b_idx * stride_gq_b + h_idx * stride_gq_h
-        + offs_t[:, None] * stride_gq_t + offs_k[None, :] * stride_gq_k,
-        grad_q_2d.to(grad_q_ptr.dtype.element_ty),
-    )
-    tl.store(
-        grad_k_ptr + b_idx * stride_gk_b + h_idx * stride_gk_h
-        + offs_t[:, None] * stride_gk_t + offs_k[None, :] * stride_gk_k,
-        grad_k_2d.to(grad_k_ptr.dtype.element_ty),
-    )
+    # ===== Write per-chunk outputs (grad_v, grad_h, grad_beta) =====
     tl.store(
         grad_v_ptr + b_idx * stride_gv_b + h_idx * stride_gv_h
         + offs_t[:, None] * stride_gv_t + offs_v[None, :] * stride_gv_v,
         grad_v.to(grad_v_ptr.dtype.element_ty),
     )
     tl.store(
-        grad_g_ptr + b_idx * stride_gg_b + h_idx * stride_gg_h
-        + offs_t[:, None] * stride_gg_t + offs_k[None, :] * stride_gg_k,
-        tl.reshape(grad_g, [L, K]).to(grad_g_ptr.dtype.element_ty),
+        grad_h_ptr + b_idx * stride_gh_b + h_idx * stride_gh_h
+        + offs_k[:, None] * stride_gh_k + offs_v[None, :] * stride_gh_v,
+        grad_h.to(grad_h_ptr.dtype.element_ty),
     )
     tl.store(
         grad_beta_ptr + b_idx * stride_gb_b + h_idx * stride_gb_h
         + offs_t * stride_gb_t,
         grad_beta.to(grad_beta_ptr.dtype.element_ty),
     )
-    tl.store(
-        grad_h_ptr + b_idx * stride_gh_b + h_idx * stride_gh_h
-        + offs_k[:, None] * stride_gh_k + offs_v[None, :] * stride_gh_v,
-        grad_h.to(grad_h_ptr.dtype.element_ty),
-    )
+
+    # ===== Post-loop fixup pass =====
+    # Add grad_g_chunk[d] to grad_g[t, d] and grad_k_from_alpha[t, d]
+    # to grad_k[t, d]. Both depend on the FULL chunk accumulators
+    # (grad_alpha_acc, grad_g_chunk_acc), so they run AFTER the main
+    # K-tile loop completes.
+    #
+    # grad_g_chunk[d] = (sum over K-tiles of grad_K_alpha @ h_new_first contribution)
+    #                 + grad_h_new[d] @ h_new_first_term[d]
+    #   where h_new_first_term[d, v] = h_start[d, v] * exp(g_chunk[d]).
+    #
+    # grad_k_from_alpha[t, d] = 2 * k[t, d] * grad_k_norm_sq[t]
+    #   where grad_k_norm_sq depends on FULL grad_alpha_acc.
+    #
+    # ``range`` (not tl.static_range) keeps ptxas's unroll analysis
+    # bounded by one body (not NC copies).
+    for k_idx_post in range(NC):
+        k_start_post = k_idx_post * BK
+        offs_k_tile_post = k_start_post + tl.arange(0, BK)
+
+        # Reload K-tile slices (small, fits in shmem).
+        g_tile = tl.load(
+            g_ptr + b_idx * stride_g_b + h_idx * stride_g_h
+            + offs_t[:, None] * stride_g_t + offs_k_tile_post[None, :] * stride_g_k,
+        ).to(tl.float32)
+        h_start_tile = tl.load(
+            h_ptr + b_idx * stride_h_b + h_idx * stride_h_h
+            + offs_k_tile_post[:, None] * stride_h_k + offs_v[None, :] * stride_h_v,
+        ).to(tl.float32)
+        grad_h_new_tile = tl.load(
+            grad_h_new_ptr + b_idx * stride_ghn_b + h_idx * stride_ghn_h
+            + offs_k_tile_post[:, None] * stride_ghn_k + offs_v[None, :] * stride_ghn_v,
+        ).to(tl.float32)
+        k_tile_post = tl.load(
+            k_ptr + b_idx * stride_k_b + h_idx * stride_k_h
+            + offs_t[:, None] * stride_k_t + offs_k_tile_post[None, :] * stride_k_k,
+        ).to(tl.float32)
+
+        # grad_g_chunk_from_h_first: per-d contribution from h_start * exp(g_chunk).
+        g_chunk_tile = tl.sum(g_tile, axis=0)  # [BK]
+        g_chunk_exp_tile = tl.exp(g_chunk_tile)[:, None]  # [BK, 1]
+        h_new_first_term_kt = h_start_tile * g_chunk_exp_tile  # [BK, V]
+        grad_g_chunk_from_h_first_kt = tl.sum(
+            grad_h_new_tile * h_new_first_term_kt, axis=1,
+        )  # [BK]
+        # grad_g_chunk_acc[k_idx_post, :] is the Kalpha contribution
+        # for this K-tile (full sum, since grad_g_chunk_acc is the
+        # FULL cross-tile accumulator).
+        grad_g_chunk_kt = (
+            tl.sum(grad_g_chunk_acc * (nc_arange == k_idx_post)[:, None].to(tl.float32), axis=0)
+            + grad_g_chunk_from_h_first_kt
+        )  # [BK]
+
+        # Load existing grad_g from memory (cumsum part), add grad_g_chunk_kt, store back.
+        grad_g_existing = tl.load(
+            grad_g_ptr + b_idx * stride_gg_b + h_idx * stride_gg_h
+            + offs_t[:, None] * stride_gg_t + offs_k_tile_post[None, :] * stride_gg_k,
+        ).to(tl.float32)
+        grad_g_new = grad_g_existing + grad_g_chunk_kt[None, :]
+        tl.store(
+            grad_g_ptr + b_idx * stride_gg_b + h_idx * stride_gg_h
+            + offs_t[:, None] * stride_gg_t + offs_k_tile_post[None, :] * stride_gg_k,
+            grad_g_new.to(grad_g_ptr.dtype.element_ty),
+        )
+
+        # grad_k_from_alpha (per-K-tile): 2 * k_tile * grad_k_norm_sq
+        grad_k_from_alpha_kt = 2.0 * k_tile_post * grad_k_norm_sq[:, None]  # [L, BK]
+        grad_k_existing = tl.load(
+            grad_k_ptr + b_idx * stride_gk_b + h_idx * stride_gk_h
+            + offs_t[:, None] * stride_gk_t + offs_k_tile_post[None, :] * stride_gk_k,
+        ).to(tl.float32)
+        grad_k_new = grad_k_existing + grad_k_from_alpha_kt
+        tl.store(
+            grad_k_ptr + b_idx * stride_gk_b + h_idx * stride_gk_h
+            + offs_t[:, None] * stride_gk_t + offs_k_tile_post[None, :] * stride_gk_k,
+            grad_k_new.to(grad_k_ptr.dtype.element_ty),
+        )
 
 
 # --------------------------------------------------------------------------- #
