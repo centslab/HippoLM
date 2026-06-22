@@ -227,7 +227,7 @@ def _efkda_chunk_fwd_kernel(
     p_acc = tl.zeros([L, V], dtype=tl.float32)
     o_first_acc = tl.zeros([L, V], dtype=tl.float32)
 
-    for k_idx in tl.static_range(NC):
+    for k_idx in range(NC):
         k_start = k_idx * BK
         offs_k_tile = k_start + tl.arange(0, BK)
 
