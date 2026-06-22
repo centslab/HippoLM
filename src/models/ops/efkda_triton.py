@@ -65,6 +65,37 @@ from src.models.ops._vendored.fla.ops.kda.chunk_efla_naive import (
 
 
 # --------------------------------------------------------------------------- #
+# Optional Triton backward (gated by env var EFKDA_BWD_KERNEL=triton)         #
+# --------------------------------------------------------------------------- #
+# When EFKDA_BWD_KERNEL=triton, the per-chunk autograd.Function's
+# backward calls the dedicated Triton bwd kernel in
+# :mod:`src.models.ops.efkda_bwd` instead of re-running the PyTorch
+# ref. The bwd is math-correct per the per-line comments in
+# :mod:`src.models.ops.efkda_bwd` but UNVERIFIED — it must pass the
+# numerical correctness harness in
+# ``test/_tmp/test_efkda_triton_bwd.py`` before being trusted in
+# training. The bwd currently OOMs at 99KB shmem on the 5060 Ti
+# (the [BS, BS, BK] sub-tile rewrite is task #60), so this flag
+# only flips on when the env is set AND the bwd kernel fits.
+import os as _os
+_EFKDA_BWD_KERNEL_ENV = _os.environ.get("EFKDA_BWD_KERNEL", "ref")
+if _EFKDA_BWD_KERNEL_ENV == "triton":
+    try:
+        from src.models.ops.efkda_bwd import _chunk_bwd_launch
+        _HAVE_TRITON_BWD = True
+    except Exception as _e:
+        import warnings
+        warnings.warn(
+            f"EFKDA_BWD_KERNEL=triton requested but bwd import failed: {_e!r};"
+            f" falling back to PyTorch ref bwd.",
+            RuntimeWarning,
+        )
+        _HAVE_TRITON_BWD = False
+else:
+    _HAVE_TRITON_BWD = False
+
+
+# --------------------------------------------------------------------------- #
 # Triton kernel                                                               #
 # --------------------------------------------------------------------------- #
 @triton.jit
@@ -359,6 +390,7 @@ class _EFKDAChunkFn(torch.autograd.Function):
         ctx.save_for_backward(h, q_c, k_c, v_c, g_c, beta_c)
         ctx.L = L
         ctx.eps = eps
+        ctx.is_doc_start = is_doc_start
 
         B, H = q_c.shape[0], q_c.shape[1]
         K = q_c.shape[-1]
@@ -405,13 +437,42 @@ class _EFKDAChunkFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_o, grad_h_new):
-        # Re-run the reference's chunk apply with autograd enabled
-        # to populate the gradient graph. We detach + clone the
-        # saved tensors so the re-run is a fresh forward with no
-        # shared history, then collect the gradients.
         h, q_c, k_c, v_c, g_c, beta_c = ctx.saved_tensors
         L = ctx.L
         eps = ctx.eps
+        is_doc_start = ctx.is_doc_start
+
+        # Triton bwd path (gated by env var EFKDA_BWD_KERNEL=triton).
+        # The math is correct per the per-line comments in
+        # :mod:`src.models.ops.efkda_bwd` but UNVERIFIED — the
+        # numerical correctness harness in
+        # ``test/_tmp/test_efkda_triton_bwd.py`` must pass before
+        # training uses this path.
+        if _HAVE_TRITON_BWD:
+            B, H = q_c.shape[0], q_c.shape[1]
+            K = q_c.shape[-1]
+            V = v_c.shape[-1]
+            # Default zero gradients (matches the allow_unused=True
+            # contract in the PyTorch-ref path).
+            if grad_o is None:
+                grad_o = torch.zeros(B, H, L, V, device=q_c.device, dtype=q_c.dtype)
+            if grad_h_new is None:
+                grad_h_new = torch.zeros(B, H, K, V, device=q_c.device, dtype=q_c.dtype)
+            # Cast grads to fp32 contiguous for the kernel.
+            grad_o_f = grad_o.float().contiguous()
+            grad_h_new_f = grad_h_new.float().contiguous()
+            gh, gq, gk, gv, gg, gb = _chunk_bwd_launch(
+                h, q_c, k_c, v_c, g_c, beta_c,
+                grad_o_f, grad_h_new_f,
+                L, eps, is_doc_start,
+            )
+            return gh, gq, gk, gv, gg, gb, None, None, None
+
+        # PyTorch-ref bwd path (default). Re-run the reference's
+        # chunk apply with autograd enabled to populate the gradient
+        # graph. We detach + clone the saved tensors so the re-run
+        # is a fresh forward with no shared history, then collect
+        # the gradients.
         # The state ``h`` may not have requires_grad (initial state
         # is a torch.zeros), but downstream chunks DO use it, so the
         # autograd graph DOES flow through it. Force requires_grad
