@@ -461,7 +461,14 @@ class TPFusedLceLoss(nn.Module):
         local_vocab_size: int | None = None,
     ) -> None:
         super().__init__()
-        self.embed_tokens = embed_tokens
+        # Bypass nn.Module.__setattr__ so the embed is NOT registered
+        # as a submodule. Otherwise TPFusedLceLoss.parameters()
+        # recurses into the embed and the trainable-parameter counter
+        # double-counts it (962M reported vs 708M actual — see the
+        # long note in :meth:`TPHippoModel.trainable_parameters`).
+        # The attribute is still accessible via ``self.embed_tokens``
+        # from Python; we just don't want it in ``self._modules``.
+        object.__setattr__(self, "embed_tokens", embed_tokens)
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.world = get_tp_world_size()
@@ -562,7 +569,13 @@ class TPLmHead(nn.Module):
         dtype=None,
     ) -> None:
         super().__init__()
-        self.embed_tokens = embed_tokens
+        # Bypass nn.Module.__setattr__ so the embed is NOT registered
+        # as a submodule — see the matching note in
+        # :class:`TPFusedLceLoss.__init__`. TPLmHead is the inference
+        # / generation shim; the embed is borrowed by id() so any
+        # double-counting of parameters in introspection would
+        # corrupt trainable-parameter logs.
+        object.__setattr__(self, "embed_tokens", embed_tokens)
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.world = get_tp_world_size()
@@ -1038,11 +1051,15 @@ class TPEFKDA(nn.Module):
         )
 
         # ---- b_proj: KDA-style per-V-head scalar beta ---- #
-        # Column-parallel on num_v_heads. The sharded shape matches V's
-        # sharding (V is sharded on num_v_heads), so the kernel sees
-        # beta per local V-head without any gather.
+        # Column-parallel on num_v_heads (= nh in EFKDA's setup; EFKDA
+        # has no GVA so num_v_heads == num_heads). Pass the FULL head
+        # count to ColumnParallelLinear — it shards by ``world`` to
+        # produce ``[B, T, hpp]`` per rank, matching V's sharding.
+        # Passing ``hpp`` here would shard a second time (hpp/world per
+        # rank) and the kernel would see beta with half the heads it
+        # expects (the shape mismatch seen in the smoke test).
         self.b_proj = ColumnParallelLinear(
-            h, self.hpp, bias=False, device=device, dtype=dtype,
+            h, nvh, bias=False, device=device, dtype=dtype,
         )
 
         # ---- A_log, dt_bias: per-rank shards ---- #
