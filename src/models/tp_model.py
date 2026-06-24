@@ -459,7 +459,14 @@ class TPFusedLceLoss(nn.Module):
         local_vocab_size: int | None = None,
     ) -> None:
         super().__init__()
-        self.embed_tokens = embed_tokens
+        # Bypass nn.Module.__setattr__ so the embed is NOT registered
+        # as a submodule. Otherwise TPFusedLceLoss.parameters()
+        # recurses into the embed and the trainable-parameter counter
+        # double-counts it (962M reported vs 708M actual — see the
+        # long note in :meth:`TPHippoModel.trainable_parameters`).
+        # The attribute is still accessible via ``self.embed_tokens``
+        # from Python; we just don't want it in ``self._modules``.
+        object.__setattr__(self, "embed_tokens", embed_tokens)
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.world = get_tp_world_size()
@@ -560,7 +567,13 @@ class TPLmHead(nn.Module):
         dtype=None,
     ) -> None:
         super().__init__()
-        self.embed_tokens = embed_tokens
+        # Bypass nn.Module.__setattr__ so the embed is NOT registered
+        # as a submodule — see the matching note in
+        # :class:`TPFusedLceLoss.__init__`. TPLmHead is the inference
+        # / generation shim; the embed is borrowed by id() so any
+        # double-counting of parameters in introspection would
+        # corrupt trainable-parameter logs.
+        object.__setattr__(self, "embed_tokens", embed_tokens)
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.world = get_tp_world_size()

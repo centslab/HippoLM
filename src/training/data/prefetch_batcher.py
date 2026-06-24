@@ -182,6 +182,7 @@ class PrefetchBatcher:
             token_lists,
             seq_len=self._seq_len,
             chunk_size=self._chunk_size,
+            batch_size=self._batch_size,
             pad_id=self._pad_id,
             eos_id=self._eos_id,
         )

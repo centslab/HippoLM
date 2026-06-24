@@ -47,8 +47,16 @@ gradient_accumulation_steps: 16
 # multiple of 64 internally (the vendored KDA kernel's BT).
 pack_chunk_size: 0
 # How many input docs the owner prefetcher accumulates per packing
-# window. Each window produces batch_size packed rows. Higher =
-# denser FFD packs at the cost of one window's latency.
+# window (pulls ``batch_size * pack_buffer_size`` docs per window).
+# The packer uses a fixed-pack FFD that ALWAYS emits exactly
+# ``batch_size`` packed rows, so the consumer's microbatch batch
+# dim matches ``batch_size`` by contract — overflow docs are dropped
+# and empty packs are filled with ``pad_id`` + ``-100`` labels.
+# Higher ``pack_buffer_size`` = more candidates for FFD = denser
+# packs (less tail-pad per pack), at the cost of one window's
+# prefetch latency. With default B=1 and pack_buffer_size=8 we only
+# pull 8 docs per window, which under-fills a T=16384 pack; raise
+# to 32-64 if you see sparse packs in the First-batch heartbeat.
 pack_buffer_size: 8
 
 # Optimizer

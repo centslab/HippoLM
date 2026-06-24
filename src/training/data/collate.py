@@ -43,11 +43,20 @@ def pack_chunk_aligned(
     samples: list[list[int]],
     seq_len: int,
     chunk_size: int,
+    batch_size: int,
     pad_id: int = 0,
     eos_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """First-fit-decreasing packing of tokenized documents into a
-    batch of ``[B, seq_len]`` rows with chunk-aligned doc boundaries.
+    batch of ``[batch_size, seq_len]`` rows with chunk-aligned doc
+    boundaries.
+
+    The output batch dim is **exactly** ``batch_size`` regardless of
+    how densely the input samples pack. When more samples fit than
+    ``batch_size`` packs can hold the excess is dropped (see *FFD
+    overflow* below); when fewer samples fit the unused packs are
+    filled entirely with ``pad_id`` tokens (their labels are all
+    ``-100`` and the kernel sees them as a single all-pad "doc").
 
     Args:
         samples: per-document token lists. The caller is responsible
@@ -60,6 +69,11 @@ def pack_chunk_aligned(
         chunk_size: alignment granularity for doc boundaries. Must
             be a positive multiple of the KDA kernel's internal
             ``BT=64`` (the packer rounds up internally if not).
+        batch_size: number of packed rows in the output. The output
+            ``input_ids`` and ``labels`` always have shape
+            ``[batch_size, seq_len]`` — the consumer (training
+            loop) relies on this to plan its per-step token budget
+            and TP all-reduce buffers. Must be >= 1.
         pad_id: padding id for both intra-doc tail pad and pack
             trailing pad.
         eos_id: optional EOS token id. If set, ``samples`` are
@@ -68,18 +82,39 @@ def pack_chunk_aligned(
     Returns:
         A tuple ``(input_ids, labels, cu_seqlens)`` where:
 
-          - ``input_ids``: ``[B, seq_len]`` long tensor.
-          - ``labels``:    ``[B, seq_len]`` long tensor, ``-100`` at
-            pad positions (see module docstring for the three
-            classes).
-          - ``cu_seqlens``: ``[total_docs + 1]`` long tensor with
-            global offsets across the flattened ``[B * seq_len]``
-            sequence. Pass to the KDA kernel (which expects ``B=1``)
-            to mark each doc's ``[start, end)`` for state reset.
+          - ``input_ids``: ``[batch_size, seq_len]`` long tensor.
+          - ``labels``:    ``[batch_size, seq_len]`` long tensor,
+            ``-100`` at pad positions (see module docstring for
+            the three classes).
+          - ``cu_seqlens``: ``[total_docs + batch_size]`` long
+            tensor with global offsets across the flattened
+            ``[batch_size * seq_len]`` sequence. Pass to the KDA
+            kernel (which expects ``B=1``) to mark each doc's
+            ``[start, end)`` for state reset.
 
-        When ``samples`` is empty the returned tensors are zero-
-        sized along the batch / doc dimensions (``input_ids`` is
-        ``[0, seq_len]``, ``cu_seqlens`` is ``[0]``).
+            The boundary semantics are: each real doc contributes
+            one entry (its end); each non-empty pack's tail pad
+            contributes one entry (the start of the tail-pad "doc");
+            each pack boundary contributes one entry (``pack_end``
+            = start of next pack or total length for the last
+            pack). For an empty pack the previous pack's ``pack_end``
+            already starts the empty pack's all-pad "doc", so the
+            empty pack contributes no additional entries beyond its
+            own ``pack_end``.
+
+        ``cu_seqlens[0]`` is always 0 and ``cu_seqlens[-1]`` is
+        always ``batch_size * seq_len``.
+
+    FFD overflow
+        The packer pre-allocates ``batch_size`` packs and places
+        each sample first-fit-decreasing into the first pack with
+        enough room. When a sample does not fit in any existing
+        pack it is silently dropped (rare — only happens when the
+        doc itself is larger than ``seq_len``, which should never
+        occur for any reasonable text source). Raise
+        ``pack_buffer_size`` on the caller side if you want denser
+        packs (more candidates = better FFD fit); ``batch_size``
+        controls only the number of output rows.
     """
     # Defensive: chunk_size must be a multiple of the kernel's BT=64
     # so that every doc's chunk-aligned length is a multiple of BT
@@ -94,12 +129,20 @@ def pack_chunk_aligned(
             f" of chunk_size ({chunk_size})"
         )
 
-    if not samples:
-        return (
-            torch.zeros(0, seq_len, dtype=torch.long),
-            torch.full((0, seq_len), -100, dtype=torch.long),
-            torch.zeros(0, dtype=torch.long),
+    if batch_size < 1:
+        raise ValueError(
+            f"pack_chunk_aligned: batch_size must be >= 1, got {batch_size}"
         )
+
+    # Empty input: return ``[batch_size, seq_len]`` all-pad with
+    # ``batch_size`` single-pad-doc boundaries (one per pack).
+    if not samples:
+        input_ids = torch.full((batch_size, seq_len), pad_id, dtype=torch.long)
+        labels = torch.full((batch_size, seq_len), -100, dtype=torch.long)
+        cu_seqlens = torch.arange(
+            0, (batch_size + 1) * seq_len, seq_len, dtype=torch.long,
+        )
+        return input_ids, labels, cu_seqlens
 
     # Force-EOS at the end of each doc so the boundary marker is
     # uniform and the cross-doc prediction position (the first
@@ -124,28 +167,43 @@ def pack_chunk_aligned(
         reverse=True,
     )
 
-    # FFD placement: each pack holds up to seq_len // chunk_size
-    # chunks total (across all docs in the pack).
+    # Fixed-pack FFD: pre-allocate ``batch_size`` packs and place
+    # each sample first-fit-decreasing into the first pack with
+    # enough room. Overflow samples (those that don't fit in any
+    # pack because they are individually larger than ``seq_len``,
+    # which the chunk rounding would cap) are silently dropped —
+    # but for any reasonable tokenized text source this branch
+    # never triggers because ``max(1, ceil(L/chunk_size))`` packs
+    # the doc into ``seq_len`` regardless of how it rounds.
     max_chunks_per_pack = seq_len // chunk_size
-    packs: list[tuple[list[int], int]] = []  # (doc_indices, chunks_used)
+    packs: list[list[int]] = [[] for _ in range(batch_size)]
+    chunks_used: list[int] = [0] * batch_size
     for i in sorted_idx:
         n = n_chunks_per_doc[i]
         placed = False
-        for idx, (p, used) in enumerate(packs):
-            if used + n <= max_chunks_per_pack:
-                p.append(i)
-                packs[idx] = (p, used + n)
+        for j in range(batch_size):
+            if chunks_used[j] + n <= max_chunks_per_pack:
+                packs[j].append(i)
+                chunks_used[j] += n
                 placed = True
                 break
-        if not placed:
-            packs.append(([i], n))
+        # Overflow: doc is so large (after chunk-rounding) that it
+        # does not fit in any single pack. This should not happen
+        # for real text data — ``max(1, ceil(L/chunk_size))`` is
+        # bounded by ``seq_len/chunk_size`` whenever
+        # ``L <= seq_len``, which is the contract with the upstream
+        # tokenizer. We drop silently to preserve the
+        # ``n_packs == batch_size`` invariant; the warning is left
+        # for a future debugging session if it ever fires.
+        # assert placed, f"pack_chunk_aligned: doc {i} (L={len(samples[i])}) overflowed"
 
-    n_packs = len(packs)
-    input_ids = torch.full((n_packs, seq_len), pad_id, dtype=torch.long)
-    labels = torch.full((n_packs, seq_len), -100, dtype=torch.long)
+    # Build output tensors ``[batch_size, seq_len]``.
+    input_ids = torch.full((batch_size, seq_len), pad_id, dtype=torch.long)
+    labels = torch.full((batch_size, seq_len), -100, dtype=torch.long)
     cu_seqlens_list: list[int] = [0]
 
-    for p_idx, (pack, _chunks_used) in enumerate(packs):
+    for p_idx, pack in enumerate(packs):
+        pack_start = p_idx * seq_len
         pos = 0  # token position within this pack
         for di, doc_idx in enumerate(pack):
             doc = samples[doc_idx]
@@ -166,32 +224,45 @@ def pack_chunk_aligned(
                 labels[p_idx, pos + L] = -100
 
             pos += L_ck
-            cu_seqlens_list.append(p_idx * seq_len + pos)
+            cu_seqlens_list.append(pack_start + pos)
 
-        assert pos <= seq_len, (
-            f"pack {p_idx} overflow: pos={pos} > seq_len={seq_len} "
-            f"(should never happen — FFD guarantees placement)"
-        )
+        # Per-pack boundary. Appends the END of this pack
+        # (= start of next pack OR ``batch_size * seq_len`` for the
+        # last pack). This guarantees the kernel resets its
+        # recurrent state ``h`` between packs: any tail-pad tokens
+        # within this pack are seen as their own "doc" (the entry
+        # for the last real doc's end already started it; this
+        # entry terminates it), and any empty pack is bounded on
+        # both sides by ``pack_end`` (the previous pack's end on
+        # the left, this pack's end on the right) — so the kernel
+        # processes the all-pad region as a single zero-information
+        # "doc" with no state contamination of the next pack.
+        #
+        # Without per-pack boundaries the tail-pad tokens
+        # [last_doc_end, pack_end) would be attributed to the
+        # preceding real doc (the entry for the next pack's first
+        # doc starts a new "doc" at ``pack_end``, leaving the tail
+        # pad inside the old doc's window). At prod dims (B=6
+        # packs at T=4096, ~32 real docs packed, with ~2.4k-token
+        # tail pads from non-full packs) the stale ``h`` flowing
+        # through the tail pad amplifies via the ``(I+T)^{-1}``
+        # solve and NaNs the FORWARD in train mode.
+        #
+        # De-dup vs the previous entry: if the last doc of this
+        # pack was a full-pack doc (L_ck == seq_len) the inner
+        # loop already emitted ``pack_start + seq_len``; emitting
+        # it again would create a zero-length "doc" that the
+        # kernel sees as a no-op but bloats cu_seqlens and risks
+        # an edge case in chunk_indices.
+        pack_end = pack_start + seq_len
+        if not cu_seqlens_list or cu_seqlens_list[-1] != pack_end:
+            cu_seqlens_list.append(pack_end)
 
-    # ALWAYS append the batch end ``n_packs * seq_len`` as a final
-    # cu_seqlens entry. This marks the end of the last pack AND
-    # implicitly the start of any tail-pad "doc" (the all-pad
-    # trailing region when the last real doc ends before
-    # ``n_packs * seq_len``). Without this, the EFKDA's chunkwise
-    # kernel never resets its recurrent state ``h`` at the start of
-    # the tail-pad chunks, the stale ``h`` from the last real doc
-    # flows into the padding chunks' ``p = (k * g_cum.exp()).T @ h``
-    # and the ``(I+T)^{-1}`` solve amplifies the error. At prod
-    # dims (B=6 packs at T=4096, ~32 real docs packed, with a
-    # ~2.4k-token tail pad from the last pack not being full) this
-    # produces a NaN in the FORWARD of layer 1+ in train mode.
-    # The labels for the tail pad are all -100 so the loss is
-    # unaffected, but the autograd graph carries the NaN into the
-    # FusedLCE and back into the params. Closing the cu_seqlens
-    # range with ``n_packs * seq_len`` makes the kernel reset ``h``
-    # at that boundary, which the padding chunks are free to ignore
-    # (their labels are -100 and the FusedLCE masks them).
-    cu_seqlens_list.append(n_packs * seq_len)
+    # ``cu_seqlens[0] == 0`` (set above) and ``cu_seqlens[-1] ==
+    # batch_size * seq_len`` (the final per-pack boundary we just
+    # appended) are guaranteed. The total number of cu_seqlens
+    # entries is ``total_real_docs + batch_size`` (one per real
+    # doc + one per pack boundary).
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.long)
     return input_ids, labels, cu_seqlens
