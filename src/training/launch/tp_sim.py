@@ -9,7 +9,7 @@ cross-process collectives. gloo can transport CUDA tensors (it
 D2H-stages each collective), so the sharding code paths run
 byte-for-byte the same; only the transport changes.
 
-The replicated params (GDN2, embed, RMSNorm, AttnRes) are
+The replicated params (KDA, embed, RMSNorm, AttnRes) are
 duplicated in every child process. For the default HippoConfig the
 per-process replicated weight is ~900 MB in FP16; with optimizer
 state and activations a 4-way sim is already tight on 16 GB, and

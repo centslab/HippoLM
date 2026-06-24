@@ -2,11 +2,11 @@
 boundaries.
 
 FFD packing is the primary mode: each tokenized doc is rounded up to
-a multiple of ``chunk_size`` so the GDN2 chunkwise kernel's state
+a multiple of ``chunk_size`` so the KDA chunkwise kernel's state
 reset lands exactly at a doc boundary (the kernel's intra-chunk
 computation is otherwise wrong for chunks that straddle two docs).
 The packer also produces a ``cu_seqlens`` tensor that the model
-threads into the GDN2 call so each doc's recurrence is independent
+threads into the KDA call so each doc's recurrence is independent
 across the pack.
 
 Mask policy
@@ -58,7 +58,7 @@ def pack_chunk_aligned(
         seq_len: target packed sequence length (must be a multiple
             of ``chunk_size``).
         chunk_size: alignment granularity for doc boundaries. Must
-            be a positive multiple of the GDN2 kernel's internal
+            be a positive multiple of the KDA kernel's internal
             ``BT=64`` (the packer rounds up internally if not).
         pad_id: padding id for both intra-doc tail pad and pack
             trailing pad.
@@ -74,7 +74,7 @@ def pack_chunk_aligned(
             classes).
           - ``cu_seqlens``: ``[total_docs + 1]`` long tensor with
             global offsets across the flattened ``[B * seq_len]``
-            sequence. Pass to the GDN2 kernel (which expects ``B=1``)
+            sequence. Pass to the KDA kernel (which expects ``B=1``)
             to mark each doc's ``[start, end)`` for state reset.
 
         When ``samples`` is empty the returned tensors are zero-

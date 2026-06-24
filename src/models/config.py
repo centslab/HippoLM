@@ -7,6 +7,7 @@ in the YAML config directory which is reserved for the YAML
 files driving a run).
 """
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -19,14 +20,15 @@ class HippoConfig:
     tie_word_embeddings: bool = True
     use_bias: bool = False
 
-    # GDN2 (Gated DeltaNet 2): KDA's scalar beta is replaced with two
-    # channel-wise gates (b on the key axis, w on the value axis).
+    # KDA (Kimi Delta Attention)
     num_heads: int = 16
     head_dim: int = 64
     expand_v: float = 1.0  # Value dimension expansion factor
-    gdn2_mode: str = "chunk"  # "chunk" for training, "fused_recurrent" for inference
-    use_short_conv: bool = False  # No local convolution (global GDN2, NoPE)
+    kda_mode: str = "chunk"  # "chunk" for training, "fused_recurrent" for inference
+    use_short_conv: bool = False  # No local convolution (global KDA, NoPE)
     allow_neg_eigval: bool = False
+    safe_gate: bool = False
+    lower_bound: Optional[float] = None  # Required when safe_gate=True
     conv_size: int = 4
     conv_bias: bool = False
 
@@ -43,7 +45,7 @@ class HippoConfig:
     # Chunk-aware FFD packing (see src/training/data/collate.py).
     # ``pack_chunk_size`` is the alignment granularity for doc
     # boundaries inside a pack: each doc is rounded up to a multiple
-    # of this size so the GDN2 chunkwise kernel's state-reset lands
+    # of this size so the KDA chunkwise kernel's state-reset lands
     # exactly at a doc boundary. The kernel's internal chunk_size is
     # independently fixed at 64 in the vendored fla code; the only
     # constraint is therefore that ``pack_chunk_size`` is a positive
@@ -63,9 +65,9 @@ class HippoConfig:
         # Derived
         self.block_size: int = self.num_layers // self.num_blocks
         self.kv_channels: int = self.num_heads * self.head_dim
-        # Validate GDN2 mode
-        assert self.gdn2_mode in ("chunk", "fused_recurrent"), (
-            f"gdn2_mode must be 'chunk' or 'fused_recurrent', got {self.gdn2_mode!r}"
+        # Validate KDA mode
+        assert self.kda_mode in ("chunk", "fused_recurrent"), (
+            f"kda_mode must be 'chunk' or 'fused_recurrent', got {self.kda_mode!r}"
         )
         # Packing
         if self.pack_chunk_size == 0:
@@ -74,9 +76,9 @@ class HippoConfig:
         assert self.pack_chunk_size > 0, (
             f"pack_chunk_size must be positive, got {self.pack_chunk_size}"
         )
-        # The vendored GDN2 chunkwise solver is hardcoded to BT=64
+        # The vendored KDA chunkwise solver is hardcoded to BT=64
         # (NC=4 sub-chunks of size 16, see
-        # src/models/ops/_vendored/fla/ops/gdn2/chunk.py). Round
+        # src/models/ops/_vendored/fla/ops/kda/chunk.py). Round
         # ``pack_chunk_size`` up to the nearest multiple of 64 so
         # the packer's alignment matches the kernel's chunking.
         if self.pack_chunk_size % 64 != 0:

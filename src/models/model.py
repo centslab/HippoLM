@@ -3,7 +3,7 @@
 Block-boundary Block AttnRes (official Kimi design):
   - 32 layers are partitioned into 8 blocks of 4 layers each.
   - Within a block, every layer is a standard residual transformer
-    ``x = x + GDN2(RMSNorm(x)); x = x + FFN(RMSNorm(x))``. There
+    ``x = x + KDA(RMSNorm(x)); x = x + FFN(RMSNorm(x))``. There
     is no per-layer AttnRes; the only AttnRes invocation is at
     the block boundary, where the next block's input is computed
     by softmax-attending over the completed block representations
@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from .norms import RMSNorm
-from .gdn2 import GDN2
+from .kda import KDA
 from .ops.attn_res import BlockAttnRes
 from .activation import SwiGLU
 
@@ -41,7 +41,7 @@ class HippoLayer(nn.Module):
         self.mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Core sub-layers.
-        self.gdn2 = GDN2(config, layer_idx=layer_idx)
+        self.kda = KDA(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
     def forward(
@@ -54,13 +54,13 @@ class HippoLayer(nn.Module):
         Args:
             x: ``[B, T, hidden_size]`` input.
             cu_seqlens: optional varlen offsets passed through to
-                the GDN2 sub-layer (FFN / RMSNorm ignore it).
+                the KDA sub-layer (FFN / RMSNorm ignore it).
 
         Returns:
-            ``[B, T, hidden_size]`` output after GDN2 and FFN with
+            ``[B, T, hidden_size]`` output after KDA and FFN with
             standard residual connections.
         """
-        x = x + self.gdn2(self.attn_norm(x), cu_seqlens=cu_seqlens)
+        x = x + self.kda(self.attn_norm(x), cu_seqlens=cu_seqlens)
         x = x + self.ffn(self.mlp_norm(x))
         return x
 
@@ -119,7 +119,7 @@ class HippoModel(nn.Module):
             labels: Optional ``[batch_size, seq_len]`` for loss
             cu_seqlens: Optional ``[total_docs + 1]`` global offset
                 tensor for chunk-aligned FFD-packed inputs. When
-                set the GDN2 sub-layer resets the recurrent state
+                set the KDA sub-layer resets the recurrent state
                 at each ``cu_seqlens`` boundary. BlockAttnRes,
                 FFN, RMSNorm, embed, and lm_head all ignore it.
 
@@ -149,7 +149,7 @@ class HippoModel(nn.Module):
             # path's strategy; see tp_model.py for the full
             # rationale). 3 of the 4 layers are wrapped in
             # ``torch.utils.checkpoint.checkpoint`` with
-            # ``use_reentrant=True`` so the GDN2 internals are
+            # ``use_reentrant=True`` so the KDA internals are
             # freed as soon as that layer's backward completes;
             # the final layer keeps its full cache to feed the
             # lm_head + fused CE backward.

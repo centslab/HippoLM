@@ -57,10 +57,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_heads", type=int, default=16)
     p.add_argument("--head_dim", type=int, default=64)
     p.add_argument("--expand_v", type=float, default=1.0)
-    p.add_argument("--gdn2_mode", type=str, default="chunk",
+    p.add_argument("--kda_mode", type=str, default="chunk",
                    choices=["chunk", "fused_recurrent"])
     p.add_argument("--use_short_conv", type=bool, default=False)
     p.add_argument("--allow_neg_eigval", type=bool, default=False)
+    p.add_argument("--safe_gate", type=bool, default=False,
+                   help="Whether the KDA kernel can assume the gate "
+                        "values (in log space) are in [lower_bound, 0) "
+                        "and use the M=16 TensorCore acceleration. "
+                        "Requires --lower_bound to be set.")
+    p.add_argument("--lower_bound", type=float, default=None,
+                   help="Lower bound for the KDA forget gate in log "
+                        "space. Clamps the gate output to "
+                        "[lower_bound, 0). Required when --safe_gate "
+                        "is set. -5 gives exp(g) ~= 0.0067 at minimum.")
     p.add_argument("--conv_size", type=int, default=4)
     p.add_argument("--conv_bias", type=bool, default=False)
     p.add_argument("--num_layers", type=int, default=32)
@@ -154,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--pack_chunk_size", type=int, default=0,
         help="Alignment granularity for doc boundaries inside a pack. "
-             "Each doc rounds up to a multiple of this size so the GDN2 "
+             "Each doc rounds up to a multiple of this size so the KDA "
              "chunkwise kernel's state reset lands exactly at a doc "
              "boundary. 0 means 'use head_dim' (HippoConfig resolves). "
              "Rounded up to a multiple of 64 internally.",

@@ -3,7 +3,7 @@
 Features (v0.0.1):
 - Contiguous 2/4/8 GPU selection (largest viable run, never odd)
 - Megatron-style TP (column-row parallel FFN, column-parallel
-  lm_head, replicated GDN2 / AttnRes / RMSNorm / embed)
+  lm_head, replicated KDA / AttnRes / RMSNorm / embed)
 - Muon optimizer (Newton-Schulz on GPU) for 2D Linear weights
 - AdamW for 1D params (norms, queries) and lm_head / embed
 - CPU-offloaded optimizer state (m, v, momentum) on pinned memory
@@ -37,7 +37,7 @@ physical GPUs. Internally we:
      all-reduce) is byte-for-byte the same code as the real path;
      only the transport differs.
 
-Memory note: replicated modules (GDN2 / AttnRes / embed / RMSNorm)
+Memory note: replicated modules (KDA / AttnRes / embed / RMSNorm)
 are constructed independently in every process, so N processes
 each carry a full copy. On a 16 GB GPU the practical ceiling is
 ``--tp_size=2`` (use with caution) or ``--tp_size=4`` if you shrink
