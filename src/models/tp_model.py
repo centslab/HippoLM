@@ -956,6 +956,11 @@ class TPHippoModel(nn.Module):
         self.config = config
         self.devices = list(devices)
         self.world = len(self.devices)
+        # Gradient-checkpoint sub-block size for the non-last block
+        # forward (see docs/gradient_checkpointing.md). 2 is the
+        # sweet spot at the base config; sweep harness overrides
+        # this per-build.
+        self.sub_block_size = 2
         assert self.world == get_tp_world_size(), (
             f"TP world size mismatch: devices={self.world} vs group={get_tp_world_size()}"
         )
@@ -1285,19 +1290,38 @@ class TPHippoModel(nn.Module):
         # ``x``. ``blocks`` (the list of completed block reps) is
         # held live across blocks but is small (one ``[B,T,D]``
         # per block — same order as before).
+        # Optimization (new): per-2-layer checkpoint with
+        # use_reentrant=True. Splits each 4-layer non-last block
+        # into 2 sub-blocks of 2 layers each, checkpointing each
+        # sub-block. Trades block-level checkpoint (1 saved input
+        # per 4 layers, all 4 layers' KDA state alive during
+        # block bwd) for sub-block checkpoint (1 saved input per
+        # 2 layers, 2 layers' KDA state alive during sub-block
+        # bwd). Net: ~448 MB FWD increase (extra sub-block
+        # inputs), ~1.0 GB BWD decrease (fewer KDA intermediates
+        # in flight). Trade: 1 extra fwd per sub-block per bwd
+        # (~50ms × 2 layers × 7 blocks × 2 sub-blocks = 1.4s/step).
         layers = self.layers_per_device[device]
         block_size = self.config.block_size
         num_blocks = self.config.num_blocks
+        # 2 layers per sub-block (sweet spot for L=32 / block_size=4
+        # at the base config; sweep shows it dominates per-block and
+        # per-layer at this L — see docs/gradient_checkpointing.md).
+        # Exposed as an attribute so the sweep harness can vary it
+        # without editing the file.
+        sub_block_size = getattr(self, "sub_block_size", 2)
         for block_idx in range(num_blocks - 1):
             if block_idx > 0:
                 x = attn_res(blocks)
             start = block_idx * block_size
             end = start + block_size
-            block_layers = layers[start:end]
-            x = torch.utils.checkpoint.checkpoint(
-                self._block_forward, block_layers, x, cu_seqlens,
-                use_reentrant=False, preserve_rng_state=False,
-            )
+            for sub_start in range(start, end, sub_block_size):
+                sub_end = min(sub_start + sub_block_size, end)
+                sub_layers = layers[sub_start:sub_end]
+                x = torch.utils.checkpoint.checkpoint(
+                    self._block_forward, sub_layers, x, cu_seqlens,
+                    use_reentrant=True, preserve_rng_state=False,
+                )
             blocks.append(x)
         # Last block: per-layer checkpointing for every layer
         # except the very last one. The first n-1 blocks are
