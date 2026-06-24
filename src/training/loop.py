@@ -587,8 +587,6 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # tied / custom-autograd params.
                 flush_manual_flush_params([muon_opt, adamw_opt])
                 _mb_t_sync_end = time.perf_counter()
-                del loss, outputs, input_ids, labels
-                microbatch_in_cycle += 1
 
                 # Per-microbatch timing log, opt-in via
                 # ``--mb_timing N``. Logs the first N microbatches of
@@ -600,12 +598,32 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 #   fwd_ms   = forward  (model/KDA slow?)
                 #   bwd_ms   = backward (model/KDA slow?)
                 #   sync_ms  = D2H wait + CPU add (DMA/CPU add slow?)
+                #
+                # Must run BEFORE the ``del input_ids/labels`` below
+                # — those ``del``s remove the local binding, and the
+                # log line reads ``input_ids.shape`` / ``cu_seqlens``.
                 mb_timing = getattr(args, "mb_timing", 0)
                 if (
                     rank == 0
                     and mb_timing > 0
                     and microbatch_in_cycle <= mb_timing
                 ):
+                    # FFD packing telemetry: ``n_packs`` is always
+                    # ``batch_size`` by contract (see
+                    # :func:`pack_chunk_aligned`); ``real_docs`` is
+                    # the number of actual docs that landed in the
+                    # packs (``cu_seqlens.numel() - batch_size``, the
+                    # ``batch_size`` term being the per-pack
+                    # boundaries). When ``real_docs == batch_size``
+                    # every pack is exactly one doc (over-split);
+                    # when ``real_docs`` is much smaller than the
+                    # capacity the FFD candidate pool was too small
+                    # — raise ``pack_buffer_size``.
+                    n_real_docs = (
+                        cu_seqlens.numel() - args.batch_size
+                        if cu_seqlens is not None
+                        else -1
+                    )
                     logger.info(
                         f"  [mb-time] step={global_step}"
                         f" mb={microbatch_in_cycle}/{args.gradient_accumulation_steps}"
@@ -613,7 +631,13 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         f" fwd_ms={(_mb_t_fwd_end - _mb_t_data_end) * 1000:6.1f}"
                         f" bwd_ms={(_mb_t_bwd_end - _mb_t_fwd_end) * 1000:6.1f}"
                         f" sync_ms={(_mb_t_sync_end - _mb_t_bwd_end) * 1000:6.1f}"
+                        f" shape={tuple(input_ids.shape)}"
+                        f" cu_seqlens=[{cu_seqlens.tolist() if cu_seqlens is not None else 'None'}]"
+                        f" real_docs={n_real_docs}"
                     )
+
+                del loss, outputs, input_ids, labels
+                microbatch_in_cycle += 1
 
                 if microbatch_in_cycle >= args.gradient_accumulation_steps:
                     # End-of-cycle sync. Already a no-op given the

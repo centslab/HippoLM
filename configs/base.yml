@@ -57,7 +57,7 @@ pack_chunk_size: 0
 # prefetch latency. With default B=1 and pack_buffer_size=8 we only
 # pull 8 docs per window, which under-fills a T=16384 pack; raise
 # to 32-64 if you see sparse packs in the First-batch heartbeat.
-pack_buffer_size: 8
+pack_buffer_size: 128
 
 # Optimizer
 muon_lr: 0.02            # Muon (2D matrices) learning rate
