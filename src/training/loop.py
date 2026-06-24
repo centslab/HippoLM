@@ -176,6 +176,12 @@ def _setup_worker(
     logger.info(f"Worker {rank}/{len(gpus)} starting on cuda:{gpus[rank]}")
 
     # ---- Model config ----
+    # Note: ALL yml-driven fields must be passed here from args,
+    # otherwise :class:`HippoConfig`'s dataclass ``repr`` (logged
+    # below) will show the dataclass default instead of the
+    # actual yml value — a recurring source of "did my yml
+    # change take effect?" confusion. If you add a new yml key,
+    # add the corresponding ``args.<name>=`` line here.
     config = HippoConfig(
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
@@ -196,6 +202,7 @@ def _setup_worker(
         intermediate_size=args.intermediate_size,
         rms_norm_eps=args.rms_norm_eps,
         pack_chunk_size=args.pack_chunk_size,
+        pack_buffer_size=args.pack_buffer_size,
     )
     if rank == 0:
         logger.info(f"Model config: {config}")
