@@ -14,6 +14,7 @@ from src.models.ops._vendored.fla.ops.backends import dispatch
 from src.models.ops._vendored.fla.ops.cp import FLACPContext
 from src.models.ops._vendored.fla.ops.kda.chunk_bwd import chunk_kda_bwd
 from src.models.ops._vendored.fla.ops.kda.chunk_fwd import chunk_kda_fwd
+from src.models.ops._vendored.fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
 from src.models.ops._vendored.fla.ops.utils.index import prepare_chunk_indices
 from src.models.ops._vendored.fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
@@ -44,6 +45,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         return_intermediate_states: bool = False,
         cp_context: FLACPContext | None = None,
         transpose_state_layout: bool = False,
+        skip_aqk_akk_saved: bool = False,
     ):
         chunk_size = 64
 
@@ -86,11 +88,22 @@ class ChunkKDAFunction(torch.autograd.Function):
             assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
             return o.type_as(q), final_state, h
 
-        ctx.save_for_backward(
-            q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
-            w, u, qg, kg, v_new, h,
-            initial_state, cu_seqlens, chunk_indices
-        )
+        # skip_aqk_akk_saved: don't save Aqk/Akk in the fwd; bwd recomputes
+        # them via chunk_kda_fwd_intra. Trades a one-time intra recompute
+        # (small Triton kernel pair) for 32 MiB of saved-tensor memory per
+        # KDA layer (Aqk 16 MiB + Akk 16 MiB at production dims).
+        if skip_aqk_akk_saved:
+            ctx.save_for_backward(
+                q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias,
+                w, u, qg, kg, v_new, h,
+                initial_state, cu_seqlens, chunk_indices
+            )
+        else:
+            ctx.save_for_backward(
+                q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
+                w, u, qg, kg, v_new, h,
+                initial_state, cu_seqlens, chunk_indices
+            )
         ctx.chunk_size = chunk_size
         ctx.safe_gate = safe_gate
         ctx.scale = scale
@@ -100,6 +113,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         ctx.disable_recompute = disable_recompute
         ctx.cp_context = cp_context
         ctx.transpose_state_layout = transpose_state_layout
+        ctx.skip_aqk_akk_saved = skip_aqk_akk_saved
         return o.type_as(q), final_state
 
     @staticmethod
@@ -110,11 +124,64 @@ class ChunkKDAFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
-        (q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
-         w, u, qg, kg, v_new, h,
-         initial_state, cu_seqlens, chunk_indices) = (
-            ctx.saved_tensors
-        )
+        saved = ctx.saved_tensors
+        if getattr(ctx, "skip_aqk_akk_saved", False):
+            # 19 saved (Aqk, Akk not saved). Recompute via intra inside
+            # a no_grad block so the recomputed intermediates are NOT
+            # attached to the autograd graph. Otherwise the bwd would
+            # capture a new subgraph per layer (Aqk + Akk + Akkd +
+            # w/u/qg/kg from the intra recompute), inflating the peak
+            # by hundreds of MiB at production dims.
+            (q, q_rstd, k, k_rstd, v, g_cumsum_saved, g_input, beta, A_log, dt_bias,
+             w, u, qg, kg, v_new, h,
+             initial_state, cu_seqlens, chunk_indices) = saved
+            with torch.no_grad():
+                # g_cumsum is None in the saved list when
+                # use_gate_in_kernel=True (chunk_kda_fwd sets it to
+                # None at return, expecting bwd to recompute from
+                # g_input via kda_gate_chunk_cumsum). For
+                # use_gate_in_kernel=False, g_cumsum is the saved
+                # cumsum (it is not None-ed out).
+                if ctx.use_gate_in_kernel:
+                    from src.models.ops._vendored.fla.ops.kda.gate import (
+                        kda_gate_chunk_cumsum,
+                    )
+                    from src.models.ops._vendored.fla.ops.utils.constant import (
+                        RCP_LN2,
+                    )
+                    g_cumsum = kda_gate_chunk_cumsum(
+                        g=g_input,
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        scale=RCP_LN2,
+                        chunk_size=ctx.chunk_size,
+                        cu_seqlens=cu_seqlens,
+                        chunk_indices=chunk_indices,
+                        lower_bound=ctx.lower_bound,
+                    )
+                else:
+                    g_cumsum = g_cumsum_saved
+                # chunk_kda_fwd_intra returns (w, u, qg, kg, Aqk, Akk).
+                # We only need Aqk, Akk here — the bwd will recompute
+                # w/u/qg/kg itself (via the disable_recompute=False
+                # branch in chunk_kda_bwd).
+                _, _, _, _, Aqk, Akk = chunk_kda_fwd_intra(
+                    q=q,
+                    k=k,
+                    v=v,
+                    gk=g_cumsum,
+                    beta=beta,
+                    scale=ctx.scale,
+                    cu_seqlens=cu_seqlens,
+                    chunk_size=ctx.chunk_size,
+                    chunk_indices=chunk_indices,
+                    safe_gate=ctx.safe_gate,
+                    disable_recompute=ctx.disable_recompute,
+                )
+        else:
+            (q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta, A_log, dt_bias, Aqk, Akk,
+             w, u, qg, kg, v_new, h,
+             initial_state, cu_seqlens, chunk_indices) = saved
 
         dq, dk, dv, db, dg, dh0, dA, dbias = chunk_kda_bwd(
             q=q,
@@ -145,7 +212,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             dk = l2norm_bwd(k, k_rstd, dk)
 
         return (dq.to(q), dk.to(k), dv.to(v), dg.to(g_input), db.to(beta), dA, dbias, None, dh0,
-                None, None, None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, None, None, None)
 
 
 @dispatch('kda')
@@ -169,6 +236,7 @@ def chunk_kda(
     return_intermediate_states: bool = False,
     cp_context: FLACPContext = None,
     transpose_state_layout: bool = False,
+    skip_aqk_akk_saved: bool = False,
     **kwargs,
 ):
     r"""
@@ -239,6 +307,14 @@ def chunk_kda(
         transpose_state_layout (Optional[bool]):
             Whether to use the transposed state layout for the hidden state.
             Default: ``False``.
+        skip_aqk_akk_saved (bool):
+            Skip saving the per-chunk attention statistics ``Aqk`` and ``Akk``
+            in the forward pass; recompute them in the backward pass via
+            :func:`chunk_kda_fwd_intra`. Trades a one-time intra recompute
+            (small Triton kernel pair) for 32 MiB of saved-tensor memory per
+            KDA layer (``Aqk`` 16 MiB + ``Akk`` 16 MiB at production dims).
+            Use when the autograd-graph memory is the bottleneck and you
+            have ~10% of bwd time to spare. Default: ``False``.
 
     Returns:
         - Normal mode (return_intermediate_states=False): A tuple (o, final_state)
@@ -382,4 +458,5 @@ def chunk_kda(
         return_intermediate_states,
         cp_context,
         transpose_state_layout,
+        skip_aqk_akk_saved,
     )

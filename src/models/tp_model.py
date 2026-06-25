@@ -680,6 +680,9 @@ class TPKDA(nn.Module):
         self.lower_bound = config.lower_bound
         self.layer_idx = layer_idx
         self.norm_eps = config.rms_norm_eps
+        # KDA bwd saved-tensor optimization: skip saving Aqk + Akk
+        # in fwd, recompute in bwd via chunk_kda_fwd_intra.
+        self.skip_aqk_akk_saved = getattr(config, "kda_skip_aqk_akk_saved", False)
 
         # ---- Fused QKV projection (column-parallel) ---- #
         # One ColumnParallelLinear with output = 2*key_dim + value_dim.
@@ -862,6 +865,7 @@ class TPKDA(nn.Module):
             safe_gate=self.safe_gate,
             lower_bound=self.lower_bound,
             cu_seqlens=cu_seqlens,
+            skip_aqk_akk_saved=self.skip_aqk_akk_saved,
         )
 
         # o has shape ``x_in.shape[:-1] + (hpp, head_v_dim)``.

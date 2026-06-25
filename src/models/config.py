@@ -58,6 +58,17 @@ class HippoConfig:
     # more candidates) at the cost of one window's latency.
     pack_buffer_size: int = 8
 
+    # KDA backward saved-tensor optimization. When True, the KDA
+    # kernel does NOT save the per-chunk attention statistics
+    # ``Aqk`` / ``Akk`` in the forward pass; instead, the backward
+    # pass recomputes them via ``chunk_kda_fwd_intra``. Trades a
+    # one-time intra recompute (small Triton kernel pair) for
+    # 32 MiB of saved-tensor memory per KDA layer (Aqk 16 MiB +
+    # Akk 16 MiB at production dims). With 30 layers in scope,
+    # this saves ~1 GB of fwd peak at the cost of a few percent
+    # of bwd wall-clock. Default False (legacy behavior).
+    kda_skip_aqk_akk_saved: bool = False
+
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
             f"num_layers ({self.num_layers}) must be divisible by num_blocks ({self.num_blocks})"

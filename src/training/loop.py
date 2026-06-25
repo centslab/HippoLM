@@ -203,6 +203,7 @@ def _setup_worker(
         rms_norm_eps=args.rms_norm_eps,
         pack_chunk_size=args.pack_chunk_size,
         pack_buffer_size=args.pack_buffer_size,
+        kda_skip_aqk_akk_saved=getattr(args, "kda_skip_aqk_akk_saved", False),
     )
     if rank == 0:
         logger.info(f"Model config: {config}")
@@ -586,6 +587,21 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # the *complete* grad. No-op for any model without
                 # tied / custom-autograd params.
                 flush_manual_flush_params([muon_opt, adamw_opt])
+
+                # Release the caching-allocator slack pool back to the
+                # driver. The PyTorch caching allocator does not shrink
+                # the pool between microbatches (avoids cudaFree/
+                # cudaMalloc thrash), but on the 16 GB 5060 Ti this
+                # leaves ~4 GB of pool locked at the high-water mark.
+                # Production measurements: empty_cache here drops
+                # reserved from 8.05 GB to 4.09 GB (+4.16 GB free
+                # driver memory) at a cost of ~24 ms/mb (+0.7%
+                # wall-clock). The next fwd re-allocates from the
+                # shrunken pool; the realloc cost is hidden by the
+                # matmul/concat work in the fwd itself.
+                if getattr(args, "empty_cache_between_mb", True):
+                    torch.cuda.empty_cache()
+
                 _mb_t_sync_end = time.perf_counter()
 
                 # Per-microbatch timing log, opt-in via

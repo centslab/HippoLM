@@ -153,6 +153,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "(data_ms / h2d_ms / fwd_ms / bwd_ms / sync_ms) for "
                         "the first N microbatches of every step. Use to "
                         "localize which phase of a microbatch is slow.")
+    p.add_argument("--empty_cache_between_mb", type=bool, default=True,
+                   help="Call torch.cuda.empty_cache() after each microbatch "
+                        "(after flush_manual_flush_params) to release the "
+                        "caching-allocator slack pool back to the driver. "
+                        "Frees ~4 GB of pool on 16 GB production config at "
+                        "the cost of ~24 ms/mb (+0.7% wall-clock). Disable "
+                        "only if benchmarking the raw allocator behavior.")
     p.add_argument(
         "--shuffle", type=bool, default=True,
         help="Shuffle the streaming dataset. Disable (--shuffle false) for "
@@ -175,6 +182,14 @@ def build_parser() -> argparse.ArgumentParser:
              "packing window. Higher = denser FFD packs at the cost of "
              "one window's latency. Each window produces batch_size "
              "packed rows.",
+    )
+    p.add_argument(
+        "--kda_skip_aqk_akk_saved", type=bool, default=False,
+        help="Skip saving the KDA per-chunk attention statistics Aqk + "
+             "Akk in the forward pass; recompute them in the backward "
+             "pass via chunk_kda_fwd_intra. Trades a small bwd time "
+             "increase for ~32 MiB of saved-tensor memory per KDA layer "
+             "(~1 GB at 30 layers). Default False.",
     )
 
     # ---- GPU ----
