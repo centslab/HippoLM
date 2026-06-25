@@ -13,10 +13,14 @@ This test:
   2. Installs the production offload hooks.
   3. Runs 4 microbatches of (loss/4).backward() with different
      inputs.
-  4. Asserts ``||s.accum||_2`` is in a sane range (NOT ~16x
+  4. Asserts ``||s.m||_2`` is in a sane range (NOT ~16x
      ``||p.data||_2``, which is what the bug would produce).
-  5. Spot-checks a param: assert ``||s.accum||`` is much closer
-     to ``||real p.grad||`` than to ``||p.data||``.
+     Note: in the merged-accumulator design, ``s.m`` doubles as
+     both the grad accumulator and AdamW's first moment — there
+     is no separate ``s.accum``. After 4 microbatches, ``s.m``
+     holds ``sum(g_mb)`` (mu=1 accumulation).
+  5. Spot-checks a param: assert ``||s.m||`` is much closer to
+     ``||real p.grad||`` than to ``||p.data||``.
 
 If this test fails, the offload path is back to streaming param
 values to CPU and training will silently flatline.
@@ -90,11 +94,14 @@ def test_grad_offload_hook_uses_real_grad_not_param():
         # No manual-flush params in this test; call is a no-op.
         flush_manual_flush_params([opt])
 
-    # Check: s.accum should hold 4 × (grad/4) = mean(grad) ≈
-    # the true grad. Its L2 norm should be in the same order of
-    # magnitude as the true grad, NOT 4× the param's L2 norm.
+    # Check: s.m should hold 4 × (grad/4) = mean(grad) ≈ the
+    # true grad (the 4 microbatches with different randn
+    # inputs don't accumulate to exactly the true grad, but
+    # they're of the same magnitude). Its L2 norm should be
+    # in the same order of magnitude as the true grad, NOT
+    # 4× the param's L2 norm.
     s = list(opt.state.values())[0]
-    accum_norm = s.accum.float().norm().item()
+    accum_norm = s.m.float().norm().item()
     print(f"\ntrue_grad_norm={true_grad_norm:.4e}  p_data_norm={p_data_norm:.4e}"
           f"  accum_norm={accum_norm:.4e}")
 

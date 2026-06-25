@@ -70,17 +70,22 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     the given optimizers, all-reduce across the TP world, and
     clip in place.
 
-    Mirrors the pre-refactor helper that lived in
-    ``scripts/train.py``. Scales each ``s.accum`` by
-    ``clip_coef = max_norm / (total_norm + 1e-6)`` only when the
-    norm exceeds the cap, so well-behaved steps are no-ops.
+    In the merged-accumulator design, the "accumulator" is
+    ``s.m`` for AdamW and ``s.mom_buf`` for Muon — there is no
+    separate ``s.accum``. We clip in place on whichever tensor
+    holds the sum-of-microbatch-grads for that param. Scales
+    the accumulator by ``clip_coef = max_norm / (total_norm +
+    1e-6)`` only when the norm exceeds the cap, so well-behaved
+    steps are no-ops.
     """
     import torch.distributed as dist
 
     local_sq = torch.zeros(1)
     for opt in opts:
         for s in opt.state.values():
-            local_sq += s.accum.detach().float().pow(2).sum()
+            # The merged-accumulator: m for AdamW, mom_buf for Muon.
+            accum = s.m if s.kind == "adamw" else s.mom_buf
+            local_sq += accum.detach().float().pow(2).sum()
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
     total_norm = local_sq.sqrt().item()
@@ -95,7 +100,8 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
         clip_coef = max_norm / (total_norm + 1e-6)
         for opt in opts:
             for s in opt.state.values():
-                s.accum.mul_(clip_coef)
+                accum = s.m if s.kind == "adamw" else s.mom_buf
+                accum.mul_(clip_coef)
     return total_norm
 
 
@@ -395,17 +401,21 @@ def _setup_worker(
     n_muon_rows = sum(s.shape[0] for s in muon_opt.state.values())
     # Per-param byte breakdown, kept in named variables so the log
     # line below (and any future debugger) can see the components
-    # separately. The big one is always the ``accum`` (BF16, one
-    # element per param) — it's the grad accumulator for
-    # ``gradient_accumulation_steps`` and is the bulk of the
-    # state.
+    # separately.
+    #
+    # In the merged-accumulator design there is no separate
+    # ``accum`` buffer: ``s.m`` (AdamW) and ``s.mom_buf`` (Muon)
+    # double as the grad accumulator AND the optimizer's
+    # first-moment / momentum feed. The byte savings vs the
+    # prior design is exactly 2 bytes/elt (one BF16 buffer's
+    # worth) on every trainable param.
     #
     # Muon's momentum storage dtype is configurable
     # (``precision.muon_momentum``): int8 with a BF16 per-row
-    # scale (canonical), or full-precision bf16/fp16/fp32 (no
-    # scale). We read the actual dtype off the first state
-    # entry rather than hardcoding, so the log message reflects
-    # whatever the user configured.
+    # scale, or full-precision bf16/fp16/fp32 (no scale). We
+    # read the actual dtype off the first state entry rather
+    # than hardcoding, so the log message reflects whatever the
+    # user configured.
     muon_states = list(muon_opt.state.values())
     if muon_states:
         muon_mom_dtype = muon_states[0].mom_buf.dtype
@@ -418,12 +428,10 @@ def _setup_worker(
         muon_has_scale = False
     muon_mom = n_muon * muon_mom_bytes_per_elt
     muon_scale = (n_muon_rows * 2) if muon_has_scale else 0
-    muon_accum = n_muon * 2  # BF16 accum (precision.gradients)
     adamw_m = n_adamw * 2
     adamw_v = n_adamw * 2
-    adamw_accum = n_adamw * 2
-    muon_bytes = muon_mom + muon_scale + muon_accum
-    adamw_bytes = adamw_m + adamw_v + adamw_accum
+    muon_bytes = muon_mom + muon_scale
+    adamw_bytes = adamw_m + adamw_v
     muon_mom_label = (
         f"{str(muon_mom_dtype).replace('torch.', '')}_mom"
     )
@@ -435,13 +443,12 @@ def _setup_worker(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
         f" ({muon_bytes / 1024**3:.2f} GB total:"
         f" {muon_mom_label}={muon_mom / 1024**3:.3f} GB"
-        f"{muon_scale_str}"
-        f" + bf16_accum={muon_accum / 1024**3:.3f} GB),"
+        f"{muon_scale_str}),"
         f" AdamW params={n_adamw:,}"
         f" ({adamw_bytes / 1024**3:.2f} GB total:"
         f" bf16_m={adamw_m / 1024**3:.3f} GB"
-        f" + bf16_v={adamw_v / 1024**3:.3f} GB"
-        f" + bf16_accum={adamw_accum / 1024**3:.3f} GB)."
+        f" + bf16_v={adamw_v / 1024**3:.3f} GB)"
+        f" [merged-accumulator: no separate grad buffer]."
     )
 
     return {
@@ -562,8 +569,10 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # Per-microbatch flush. The per-param post-accumulate-grad
                 # hooks (see :func:`register_grad_offload_hooks`) issue
                 # D2H transfers; we sync the current device's stream and
-                # fold the CPU src tensors into ``s.accum`` so the
-                # pending list does NOT grow across microbatches.
+                # fold the CPU src tensors into the per-param accumulator
+                # (``s.m`` for AdamW, ``s.mom_buf`` for Muon — the
+                # merged accumulator) so the pending list does NOT grow
+                # across microbatches.
                 #
                 # Why not defer the sync to the end of the cycle?
                 # The DMAs each carry a pinned CPU source buffer. With
@@ -664,13 +673,16 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     # (e.g. amortized over K microbatches).
                     flush_pending_grads(sync_device=gpus[rank])
                     # Inf/nan check on the accumulated CPU grads.
+                    # The merged accumulator is s.m for AdamW and
+                    # s.mom_buf for Muon.
                     found_inf = False
                     nan_opt_name = None
                     nan_s_id = None
                     n_nan_accum_total = 0
                     for opt_name, opt in (("muon", muon_opt), ("adamw", adamw_opt)):
                         for sid, s in opt.state.items():
-                            n_nan = (~torch.isfinite(s.accum)).sum().item()
+                            accum = s.m if s.kind == "adamw" else s.mom_buf
+                            n_nan = (~torch.isfinite(accum)).sum().item()
                             n_nan_accum_total += n_nan
                             if n_nan > 0 and not found_inf:
                                 found_inf = True

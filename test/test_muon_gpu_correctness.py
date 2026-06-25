@@ -35,28 +35,29 @@ from src.training.precision_config import PrecisionConfig
 
 def muon_step_gpu(muon_opt: CPUMuon) -> None:
     """Same as in test_muon_gpu_step.py — duplicated here to keep
-    this test independent of that file's edit history."""
-    mom = muon_opt.momentum
+    this test independent of that file's edit history.
+
+    In the merged-accumulator design, ``mom_buf`` doubles as the
+    grad accumulator (mu=1 accumulation). The step just reads
+    mom_buf (dequantized for int8), requantizes, orthogonalizes,
+    applies, and resets mom_buf to zero.
+    """
     lr = muon_opt.lr
     wd = muon_opt.weight_decay
     CHUNK_ROWS = CPUMuon._STREAM_CHUNK_ROWS
     for s in muon_opt.state.values():
-        if s.accum.abs().sum().item() == 0:
+        if s.mom_buf.abs().sum().item() == 0:
             continue
         shape = s.shape
         rows, cols = shape[0], shape[1]
         device = s.param.device
 
         mom_buf_gpu = s.mom_buf.to(device, non_blocking=True)
-        accum_gpu = s.accum.to(device, non_blocking=True)
         scale_gpu = s.mom_scale.to(device, non_blocking=True)
 
         q_2d = mom_buf_gpu.float().view(rows, cols)
         scale_2d = scale_gpu.float().unsqueeze(1)
         m_fp32_gpu = q_2d * scale_2d
-
-        g_2d = accum_gpu.float().view(rows, cols)
-        m_fp32_gpu.mul_(mom).add_(g_2d, alpha=1.0 - mom)
 
         row_max = m_fp32_gpu.abs().amax(dim=1).clamp(min=1e-8)
         new_scale_fp32 = row_max / 127.0
@@ -80,7 +81,7 @@ def muon_step_gpu(muon_opt: CPUMuon) -> None:
             s.param.data[r_start:r_end].add_(update, alpha=-lr)
 
         torch.cuda.current_stream(device).synchronize()
-        s.accum.zero_()
+        s.mom_buf.zero_()
 
 
 def main():
@@ -158,7 +159,6 @@ def main():
         s_b.mom_buf.copy_(s_a.mom_buf)
         s_b.mom_scale.copy_(s_a.mom_scale)
         s_b.param.data.copy_(s_a.param.data)
-        s_b.accum.copy_(s_a.accum)
         s_b.step = s_a.step
 
     # Run CPU step on A, GPU step on B.

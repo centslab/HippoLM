@@ -30,10 +30,15 @@ The six tensor classes (one :class:`TensorPrecision` each):
     KDA, AttnRes, embed, lm_head, RMSNorm). FP16 is the
     default (V100 has FP16 tensor cores; BF16 is also fine on
     5060Ti / H100).
-  - ``gradients``      — the CPU pinned accumulator
-    (``s.accum``) into which the GPU ``.grad`` is DMA'd. BF16
-    is the default (FP32-like exponent range, no overflow on
-    the transfer).
+  - ``gradients``      — **DEPRECATED in the merged-accumulator
+    design.** Previously the dtype of the CPU pinned ``s.accum``
+    grad accumulator. Now there is no separate accumulator:
+    ``s.m`` (AdamW) / ``s.mom_buf`` (Muon) double as the
+    accumulator AND the optimizer's first-moment / momentum
+    feed. The cast target in the offload hook follows the
+    accumulator's storage dtype (``adamw_m`` / ``muon_momentum``)
+    directly. The field is kept in the schema for backwards
+    compatibility with existing yml files.
   - ``activations``    — the dtype used for the per-layer
     forward activations under ``torch.amp.autocast``. FP16 is
     the default (matches the canonical model_weights setting;
@@ -42,11 +47,16 @@ The six tensor classes (one :class:`TensorPrecision` each):
     (autocast is disabled — pure FP32 forward), ``fp16``,
     ``bf16``. Integer dtypes are rejected.
   - ``muon_momentum``  — Muon's SGD momentum (the buffer that
-    feeds Newton-Schulz). int8 + per-channel is the default
-    (halves CPU RAM vs FP16). int4 further halves but loses
-    precision.
-  - ``adamw_m``        — AdamW's first moment. BF16 is the
-    default (magnitude bounded, no precision concern).
+    feeds Newton-Schulz, which now also doubles as the grad
+    accumulator with mu=1 accumulation). int8 + per-channel
+    halves CPU RAM vs FP16 but requires a per-microbatch
+    dequant-add-requant on the CPU (preserves int8
+    quantization precision without a separate accumulator).
+    bf16 / fp16 / fp32 are full-precision storage with no
+    requant. int4 further halves but loses precision.
+  - ``adamw_m``        — AdamW's first moment AND the grad
+    accumulator (merged). BF16 is the default (magnitude
+    bounded, no precision concern).
   - ``adamw_v``        — AdamW's second moment. BF16 is the
     default (BF16's 8-bit exponent keeps ``v = g²`` from
     underflowing for typical grad magnitudes; FP16's 5-bit

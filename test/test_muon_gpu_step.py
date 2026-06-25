@@ -55,28 +55,26 @@ from src.training.precision_config import PrecisionConfig
 def muon_step_cpu(muon_opt: CPUMuon) -> None:
     """Reference implementation of the *pre-optimization* CPU muon
     step. Reuses the same per-param state and the chunked NS +
-    apply pattern; only the dequant / SGD / requant run on the
-    CPU (the bandwidth-bound part that the production path
-    moves to the GPU).
+    apply pattern; only the dequant / requant run on the CPU
+    (the bandwidth-bound part that the production path moves
+    to the GPU).
+
+    In the merged-accumulator design, ``mom_buf`` doubles as the
+    grad accumulator (mu=1 accumulation). The step just reads
+    mom_buf (dequantized), requantizes, orthogonalizes, applies,
+    and resets mom_buf to zero.
     """
-    mom = muon_opt.momentum
     lr = muon_opt.lr
     wd = muon_opt.weight_decay
     CHUNK_ROWS = CPUMuon._STREAM_CHUNK_ROWS
     for s in muon_opt.state.values():
-        if s.accum.abs().sum().item() == 0:
+        if s.mom_buf.abs().sum().item() == 0:
             continue
         rows, cols = s.shape[0], s.shape[1]
         device = s.param.device
 
         # ---- CPU dequant (the bandwidth-bound part) ----
         m_fp32 = muon_opt._dequantize(s)              # [rows, cols] FP32, CPU
-
-        # ---- CPU SGD ----
-        # accum is BF16, on CPU pinned. Promote to FP32 for the
-        # add (matching the GPU path's FP32 momentum math).
-        g_2d = s.accum.float().view(rows, cols)
-        m_fp32.mul_(mom).add_(g_2d, alpha=1.0 - mom)
 
         # ---- CPU requant ----
         muon_opt._requantize(m_fp32, s)
@@ -94,7 +92,7 @@ def muon_step_cpu(muon_opt: CPUMuon) -> None:
             update = update.to(s.param.dtype)
             s.param.data[r_start:r_end].add_(update, alpha=-lr)
 
-        s.accum.zero_()
+        s.mom_buf.zero_()
 
 
 def main():

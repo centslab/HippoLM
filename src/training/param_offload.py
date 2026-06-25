@@ -2,18 +2,20 @@
 
 Implements two optimizer variants used together via param groups:
 
-  - :class:`CPUAdamW`     — AdamW with BF16 m and BF16 v state on
-    CPU pinned memory. The forward / backward happen on the GPU
-    in the param's training dtype (FP16 in this project). After
-    each micro-batch's backward, :func:`accumulate_grads_to_cpu`
-    copies the GPU ``.grad`` to a per-param CPU accumulator
-    (BF16, pinned) and frees the GPU copy. On ``step()`` the
-    accumulator is consumed: m, v are updated in place on the
-    CPU (BF16); the per-element update factor is computed in
-    FP32 (to recover precision after the BF16 v sqrt), then
-    cast to FP16 and streamed chunk-wise to the GPU param and
-    applied in place. This is the DeepSpeed ZeRO-Offload
-    pattern with BF16 state.
+  - :class:`CPUAdamW`     — AdamW with BF16 m (which doubles as the
+    grad accumulator) and BF16 v state on CPU pinned memory. The
+    forward / backward happen on the GPU in the param's training
+    dtype (FP16 in this project). After each micro-batch's
+    backward, the per-param post-accumulate-grad hook DMA's the
+    GPU ``.grad`` (cast to ``m.dtype``) and folds it into ``m``
+    in place on the CPU (BF16, pinned). On ``step()`` ``m``
+    holds the sum of microbatch grads (``mu=1`` accumulation —
+    no cross-step β1 EMA), ``v`` is updated in place (BF16, with
+    β2 EMA), and the per-element update factor ``m / (sqrt(v) + eps)``
+    is computed in FP32 (to recover precision after the BF16 v
+    sqrt), then cast to FP16 and streamed chunk-wise to the GPU
+    param and applied in place. ``m`` is then reset to zero for
+    the next accumulation cycle.
     Grad dtype is BF16 throughout (matches the new 5060Ti
     hardware; BF16 has FP32-like dynamic range, so no overflow
     on the grad transfer or the m update, and v can stay BF16
@@ -23,21 +25,30 @@ Implements two optimizer variants used together via param groups:
     of ~1.18e-38).
 
   - :class:`CPUMuon`      — Muon (Newton-Schulz orthogonalization
-    of the momentum matrix). Momentum storage is configurable
-    via ``precision.muon_momentum``:
+    of the momentum matrix). ``mom_buf`` doubles as the grad
+    accumulator and the momentum feed for NS — ``mu=1``
+    accumulation (just ``mom_buf += g`` per microbatch). On
+    ``step()`` ``mom_buf`` is consumed (orthogonalized + applied
+    + reset to zero). Momentum storage is configurable via
+    ``precision.muon_momentum``:
 
-      * ``int8`` (default) + **BF16 per-row scale**: 1 byte/elt
-        momentum + a tiny ``rows``-sized BF16 scale tensor.
-        The dequantize + SGD update + requantize cycle runs on
-        the CPU (one full pass per param per step; the NS
-        iteration is the only GPU step and is streamed over
-        rows in 4096-row chunks).
+      * ``int8`` + **BF16 per-row scale**: 1 byte/elt momentum
+        + a tiny ``rows``-sized BF16 scale tensor. Because the
+        per-row scale is data-dependent (the row's max-abs),
+        each microbatch's accumulate requires a
+        **dequant → add → requant** pass on the CPU (this is
+        the cost of preserving int8 precision without an
+        extra accumulator buffer). The NS iteration is the
+        only GPU step and is streamed over rows in 4096-row
+        chunks.
       * ``bf16`` / ``fp16`` / ``fp32``: full-precision
-        momentum, no quantization. Doubles / quadruples the
-        Muon CPU RAM vs int8 (no scale tensor needed).
-        The NS iteration is unaffected (it orthogonalizes the
-        dequantized / raw momentum in FP32 on the GPU
-        regardless of storage precision).
+        momentum, no quantization. ``mom_buf`` is the
+        accumulator directly; the add is just a tensor add
+        in the storage dtype (no requant). Halves the Muon
+        CPU RAM vs the prior design (which had a separate
+        ``accum`` BF16 buffer alongside ``mom_buf``). The NS
+        iteration is unaffected (it orthogonalizes the
+        raw momentum in FP32 on the GPU regardless).
 
 Both optimizers follow the same API surface as ``torch.optim.Optimizer``
 minimally — ``step()`` consumes whatever gradients are present on
@@ -52,18 +63,24 @@ Conventions
 -----------
 - Param ``.data`` lives on the GPU (FP16).
 - ``.grad`` is materialised on the GPU only during ``backward()``;
-  immediately after, the training loop calls
-  :func:`accumulate_grads_to_cpu` which copies ``.grad`` to the
-  per-param CPU accumulator and frees the GPU copy. So between
-  micro-batches the GPU holds zero gradient memory.
+  immediately after, the training loop calls the per-param
+  post-accumulate-grad hook (registered via
+  :func:`register_grad_offload_hooks`) which copies ``.grad``
+  into the per-param CPU accumulator and frees the GPU copy.
+  So between micro-batches the GPU holds zero gradient memory.
 - Optimizer state on CPU pinned memory:
-    AdamW: m (BF16, numel) + v (BF16, numel) + accum (BF16, numel)
+    AdamW: m (BF16, numel) + v (BF16, numel)
     Muon:  mom_buf (cfg.dtype, numel)
            + mom_scale (BF16, rows)  [int8 only; None for fp*]
-           + accum (BF16, numel)
-- For ~624 M params: AdamW ≈ 6 × 624 M = 3.7 GB CPU RAM
-  (m BF16 + v BF16 + accum BF16, all 2 bytes/elt).
-  Muon: 0.6 GB (int8), 1.2 GB (fp16/bf16), 2.5 GB (fp32).
+  No separate accumulator buffer. ``m`` / ``mom_buf`` are the
+  accumulator AND the optimizer's first-moment / momentum feed
+  (mu=1 accumulation).
+- For ~624 M params: AdamW ≈ 4 × 624 M = 2.5 GB CPU RAM
+  (m BF16 + v BF16, both 2 bytes/elt).
+  Muon: 0.3 GB (int8, mom_buf only) / 0.6 GB (fp16/bf16) /
+  1.2 GB (fp32). vs. the prior design AdamW was 3.7 GB and
+  Muon was 0.6 / 1.2 / 2.5 GB respectively — the merged-
+  accumulator design saves 2 bytes/elt on every param.
 """
 from __future__ import annotations
 
@@ -84,29 +101,33 @@ class _ParamState:
     """Per-parameter CPU-side state for either AdamW or Muon."""
 
     param: nn.Parameter
-    # The CPU accumulator (BF16). For both AdamW and Muon this is
-    # the destination of :func:`accumulate_grads_to_cpu`: each
-    # micro-batch's ``.grad`` (cast to BF16 before the DMA) is
-    # added in here on the CPU, and the training loop's
-    # :func:`zero_cpu_grad_accum` zeros it out at the end of the
-    # accumulation cycle.
-    accum: torch.Tensor
     # AdamW-specific state (set when ``kind == 'adamw'``).
-    # m and v are both BF16: the new 5060Ti hardware supports
-    # BF16 natively and BF16's 8-bit exponent keeps ``v = g²``
-    # from underflowing for typical grad magnitudes. (The
-    # previous FP32 v was a holdover from the FP16 era, where
-    # FP16's 5-bit exponent would underflow ``g²`` to 0 for
-    # grad magnitudes ~1e-4 to 1e-3 — that was the original
-    # justification. BF16 doesn't have this problem.)
+    # m doubles as the grad accumulator and the optimizer's
+    # first moment: each microbatch's ``.grad`` is added to
+    # ``m`` in place (mu=1 accumulation — no cross-step β1
+    # EMA), and at ``step()`` time ``m`` is consumed as the
+    # "gradient" estimate in the AdamW update:
+    #     v = β2*v + (1-β2)*m²
+    #     update = m / (sqrt(v) + eps)
+    # (no β1 division; the bias-correction on m is unnecessary
+    # because m is unbiased — it's the raw sum of microbatch
+    # grads).
+    # ``m`` is BF16 by default: the new 5060Ti hardware
+    # supports BF16 natively and BF16's 8-bit exponent keeps
+    # ``v = g²`` from underflowing for typical grad magnitudes.
     m: torch.Tensor | None = None
     exp_avg_sq: torch.Tensor | None = None
     # Muon-specific state (set when ``kind == 'muon'``). The
-    # momentum matrix ``m`` lives in ``mom_buf`` (any storage
-    # dtype: int8 with a BF16 per-row scale, or a raw fp16/bf16/
-    # fp32 tensor with no scale). Field names are dtype-agnostic
-    # so the ``step()`` and ``loop.py`` byte-breakdown code
-    # works regardless of the configured storage dtype.
+    # momentum matrix lives in ``mom_buf`` (any storage dtype:
+    # int8 with a BF16 per-row scale, or a raw fp16/bf16/fp32
+    # tensor with no scale). ``mom_buf`` also doubles as the
+    # grad accumulator (mu=1 accumulation). At ``step()`` time
+    # ``mom_buf`` is read (dequantized for int8), orthogonalized
+    # via Newton-Schulz, applied to the GPU param, then reset
+    # to zero for the next accumulation cycle. Field names are
+    # dtype-agnostic so the ``step()`` and ``loop.py``
+    # byte-breakdown code works regardless of the configured
+    # storage dtype.
     mom_buf: torch.Tensor | None = None
     mom_scale: torch.Tensor | None = None
     # Cached for Muon: original param shape for reshape on GPU.
@@ -142,17 +163,18 @@ class OptimizerState(Protocol):
     - ``param`` is the GPU-side trainable parameter the entry
       belongs to. Used to read ``.data`` (post-step) for the
       "is the param finite" check.
-    - ``accum`` is the CPU pinned BF16 grad accumulator
-      (destination of :func:`accumulate_grads_to_cpu`).
     - ``kind`` is ``"adamw"`` or ``"muon"``; diagnostics branch
       on it to pick which state tensors to read.
     - ``m`` / ``exp_avg_sq`` are AdamW's first / second moment
-      (both BF16 CPU pinned). For Muon both are ``None``.
-    - ``mom_buf`` / ``mom_scale`` are Muon's momentum storage.
-      ``mom_buf`` is the EMA buffer at the configured storage
-      dtype (int8 with per-row symmetric quantization + BF16
-      ``mom_scale``, OR a raw fp16/bf16/fp32 tensor with
-      ``mom_scale=None``). For AdamW both are ``None``.
+      (both CPU pinned; ``m`` doubles as the grad accumulator
+      in the mu=1 accumulation scheme). For Muon both are
+      ``None``.
+    - ``mom_buf`` / ``mom_scale`` are Muon's momentum storage
+      (which doubles as the grad accumulator). ``mom_buf`` is
+      at the configured storage dtype (int8 with per-row
+      symmetric quantization + BF16 ``mom_scale``, OR a raw
+      fp16/bf16/fp32 tensor with ``mom_scale=None``). For
+      AdamW both are ``None``.
     - ``shape`` is cached for Muon (the original param shape
       before flatten) so diagnostics can report the failing
       param's full shape on NaN/Inf.
@@ -161,7 +183,6 @@ class OptimizerState(Protocol):
     """
 
     param: nn.Parameter
-    accum: torch.Tensor
     kind: str
     m: Optional[torch.Tensor]
     exp_avg_sq: Optional[torch.Tensor]
@@ -176,24 +197,31 @@ class OptimizerState(Protocol):
 # --------------------------------------------------------------------------- #
 class CPUAdamW:
     """AdamW with CPU-side m (BF16) and v (BF16) state, GPU-side
-    params.
+    params. ``m`` doubles as the grad accumulator (mu=1
+    accumulation — each microbatch's grad is added to ``m``
+    in place, no cross-step β1 EMA).
 
     Memory layout per trainable param:
-        CPU pinned: m (BF16, numel), v (BF16, numel), accum (BF16, numel)
+        CPU pinned: m (BF16, numel), v (BF16, numel)
         GPU:         param (training dtype, e.g. FP16), .grad (transient)
 
+    No separate accumulator buffer: ``m`` IS the accumulator.
     On :meth:`step`:
-        1. Read the latest accumulated grad (CPU pinned, BF16).
-        2. Update m, v in place (BF16 / BF16).
-        3. Compute the update factor in FP32 (to recover the
-           mantissa precision lost to the BF16 v sqrt), then
-           cast to FP16 (chunked, streamed to the GPU).
+        1. ``m`` holds the sum of microbatch grads (raw, no β1
+           EMA across steps).
+        2. Update ``v`` in place (BF16): ``v = β2*v + (1-β2)*m²``.
+        3. Compute the update factor ``m / (sqrt(v) + eps)`` in
+           FP32 (to recover the mantissa precision lost to the
+           BF16 v sqrt), then cast to FP16 (chunked, streamed
+           to the GPU).
         4. Apply ``p -= lr * factor`` in place on the GPU.
+        5. Reset ``m`` to zero for the next accumulation cycle.
 
-    The training loop is expected to call
-    :func:`accumulate_grads_to_cpu` after each micro-batch's
-    backward() to copy ``.grad`` into ``accum`` and free the GPU
-    copy. :meth:`step` then sees the accumulated grad on CPU.
+    The training loop is expected to fold each micro-batch's
+    ``.grad`` into ``m`` via the post-accumulate-grad hook
+    (see :func:`register_grad_offload_hooks`) or the manual
+    :func:`accumulate_grads_to_cpu`. :meth:`step` then sees
+    the accumulated grad already on CPU in ``m``.
     """
 
     def __init__(
@@ -209,12 +237,17 @@ class CPUAdamW:
 
         ``precision`` controls the storage dtypes of:
 
-        - ``s.accum``   (the grad accumulator)  ← ``precision.gradients``
-        - ``s.m``       (1st moment)            ← ``precision.adamw_m``
-        - ``s.exp_avg_sq`` (2nd moment)         ← ``precision.adamw_v``
+        - ``s.m``       (1st moment + grad accumulator) ← ``precision.adamw_m``
+        - ``s.exp_avg_sq`` (2nd moment)                 ← ``precision.adamw_v``
+
+        The grad accumulator dtype is implicit in ``adamw_m``
+        (m doubles as the accumulator; we don't have a separate
+        ``gradients`` accumulator anymore — saving 2 bytes/elt
+        per param). The cast target in the offload hook is
+        ``s.m.dtype`` (typically BF16).
 
         Defaults (when ``precision`` is ``None``) match the canonical
-        yml: BF16 for all three. The :meth:`step` algorithm is
+        yml: BF16 for both. The :meth:`step` algorithm is
         dtype-agnostic — it always promotes to FP32 for the
         divisor / factor math — so any combination of these
         dtypes produces the same numerical answer up to casting
@@ -229,7 +262,6 @@ class CPUAdamW:
         precision = precision or PrecisionConfig()
 
         # Resolve dtypes once (avoids per-param .to_torch() calls).
-        accum_dtype = precision.gradients.dtype.to_torch()
         m_dtype = precision.adamw_m.dtype.to_torch()
         v_dtype = precision.adamw_v.dtype.to_torch()
         # Quantized m / v are not supported (AdamW's m and v are
@@ -268,7 +300,6 @@ class CPUAdamW:
             n = p.numel()
             self.state[id(p)] = _ParamState(
                 param=p,
-                accum=torch.zeros(n, dtype=accum_dtype, device="cpu").pin_memory(),
                 exp_avg_sq=torch.zeros(n, dtype=v_dtype, device="cpu").pin_memory(),
                 m=torch.zeros(n, dtype=m_dtype, device="cpu").pin_memory(),
                 kind="adamw",
@@ -278,10 +309,11 @@ class CPUAdamW:
     def zero_grad(self, set_to_none: bool = True) -> None:
         for s in self.state.values():
             s.param.grad = None
-            # NOTE: do NOT zero accum here — that would discard
-            # the user's gradient accumulation across micro-batches.
-            # The training loop is responsible for resetting accum
-            # at the start of each accumulation cycle (via
+            # NOTE: do NOT zero ``m`` here — that would discard
+            # the user's gradient accumulation across micro-batches
+            # (``m`` doubles as the accumulator). The training
+            # loop is responsible for resetting ``m`` at the
+            # start of each accumulation cycle (via
             # :func:`zero_cpu_grad_accum`).
 
     # Per-chunk size for the streaming factor / update path.
@@ -292,30 +324,30 @@ class CPUAdamW:
     _STREAM_CHUNK_NUMEL = 4 * 1024 * 1024
 
     def step(self) -> None:
-        beta1, beta2 = self.beta1, self.beta2
+        beta2 = self.beta2
         lr = self.lr
         eps = self.eps
         wd = self.weight_decay
         CHUNK = self._STREAM_CHUNK_NUMEL
         for s in self.state.values():
-            if s.accum.abs().sum().item() == 0:
+            g = s.m
+            if g.abs().sum().item() == 0:
                 # No accumulated grad (shouldn't happen if the
                 # training loop is correct, but guard against
                 # unnecessary work).
                 continue
             s.step += 1
             step = s.step
-            bc1 = 1.0 - beta1 ** step
             bc2 = 1.0 - beta2 ** step
-            g = s.accum
-            m = s.m
             v = s.exp_avg_sq
-            # Update m (BF16, in place) and v (BF16, in place).
-            # The dedicated ``m`` buffer keeps ``m`` and ``g``
-            # (which is ``s.accum``) aliased-free: the chained
-            # ``m.mul_(beta1).add_(g, ...)`` would otherwise
-            # mutate ``g`` mid-chain and produce the wrong
-            # update on every step.
+            # ``g`` (= s.m) is the sum of microbatch grads.
+            # No β1 EMA: in the merged-accumulator design, m IS
+            # the accumulator, so its value across steps is the
+            # raw sum of one accumulation cycle's grads. β1 was
+            # only ever smoothing the cross-step accumulator-to-
+            # accumulator transition; in this design the
+            # accumulator resets to zero at the end of every
+            # step, so β1 smoothing has nothing to smooth.
             #
             # ``addcmul_`` on BF16: BF16 has FP32 exponent range
             # so ``g*g`` (for g ~ 1e-3) is ~1e-6, well above the
@@ -323,7 +355,6 @@ class CPUAdamW:
             # is the precision bottleneck — but we recover
             # precision in the per-element factor by promoting
             # to FP32 below before the sqrt.
-            m.mul_(beta1).add_(g, alpha=1.0 - beta1)
             v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
             # Decoupled weight decay: applied in place on the GPU
             # once, before the streaming factor / apply loop.
@@ -339,7 +370,7 @@ class CPUAdamW:
             # element-wise.
             #
             # Numerics: do the divisor math in FP32 even though
-            # ``g``, ``m``, and ``v`` are all BF16. Promoting
+            # ``g`` and ``v`` are both BF16. Promoting
             # v_chunk to FP32 before the sqrt recovers the
             # 7-bit BF16 mantissa precision for the divisor,
             # which is what ``1/sqrt(v/bc2)`` is most sensitive
@@ -348,13 +379,17 @@ class CPUAdamW:
             # cast back to FP16 for the GPU apply — that
             # final cast is the precision bottleneck, not the
             # v promotion.
+            #
+            # No β1 division on the numerator (g is unbiased —
+            # it's the raw sum, not an EMA), but v still has
+            # its bias-correction bc2.
             p_flat = s.param.data.view(-1)
             n = p_flat.numel()
             for start in range(0, n, CHUNK):
                 end = min(start + CHUNK, n)
                 v_chunk_fp32 = v[start:end].float()
                 denom = (v_chunk_fp32 / bc2).sqrt_().add_(eps)  # FP32, chunk
-                factor = (m[start:end].float() / bc1) / denom   # FP32, chunk
+                factor = g[start:end].float() / denom           # FP32, chunk
                 # Stream the FP32 factor to the GPU as the param
                 # dtype (FP16) and apply in place.
                 p_flat[start:end].add_(
@@ -364,8 +399,11 @@ class CPUAdamW:
                     ),
                     alpha=-lr,
                 )
-            # Reset accum to zero for the next accumulation cycle.
-            s.accum.zero_()
+            # Reset m to zero for the next accumulation cycle.
+            # ``m`` doubles as the accumulator; this is the only
+            # point in the cycle where the accumulation result
+            # is consumed.
+            s.m.zero_()
 
 
 # --------------------------------------------------------------------------- #
@@ -376,9 +414,17 @@ class CPUMuon:
 
     State per param:
         CPU pinned: mom_buf (cfg dtype, numel),
-                    mom_scale (BF16, rows or None),
-                    accum (BF16, numel)
+                    mom_scale (BF16, rows or None)
         GPU:         param (FP16), .grad (transient)
+
+    No separate accumulator buffer: ``mom_buf`` doubles as the
+    grad accumulator (mu=1 accumulation — each microbatch's grad
+    is added to ``mom_buf`` in place). At ``step()`` time
+    ``mom_buf`` is read (dequantized for int8), orthogonalized
+    via Newton-Schulz, applied to the GPU param, then reset to
+    zero for the next accumulation cycle. The cross-step μ
+    momentum smoothing has nothing to smooth across cycles
+    (the buffer resets at every step).
 
     Storage dtype is ``precision.muon_momentum.dtype``:
 
@@ -435,13 +481,17 @@ class CPUMuon:
 
         ``precision`` controls:
 
-        - ``s.accum``     (grad accumulator)     ← ``precision.gradients``
-        - ``s.mom_buf``   (momentum storage)     ← ``precision.muon_momentum``
-          (int8 with per-row quantization, or raw fp16/bf16/fp32)
+        - ``s.mom_buf``   (momentum + grad accumulator, merged)
+          ← ``precision.muon_momentum`` (int8 with per-row
+          quantization, or raw fp16/bf16/fp32). ``mom_buf``
+          doubles as the accumulator (mu=1 accumulation).
         - ``s.mom_scale`` (per-row scale)        ← only set for int8
           storage (BF16 — the scale needs FP32-like dynamic range
           to avoid underflow on quiet rows; BF16 is the cheapest
           dtype that guarantees this). ``None`` for fp* storage.
+
+        The ``gradients`` precision config is no longer used
+        (there is no separate accumulator buffer).
 
         Supported momentum dtypes: ``int8`` (default),
         ``bf16`` / ``fp16`` / ``fp32`` (full-precision storage,
@@ -455,11 +505,13 @@ class CPUMuon:
         self.weight_decay = weight_decay
         precision = precision or PrecisionConfig()
 
-        accum_dtype = precision.gradients.dtype.to_torch()
         # Resolve momentum storage. int8 is the only fully-supported
         # quantized storage; int4 is on the roadmap but not yet
         # implemented (the mom_buf would need to pack 2 elements
         # per byte and the dequant path would need to unpack).
+        # The ``gradients`` precision config is no longer used
+        # (no separate accumulator buffer — mom_buf doubles as
+        # the accumulator).
         mom_dtype_cfg = precision.muon_momentum.dtype
         if mom_dtype_cfg == DType.INT4:
             raise NotImplementedError(
@@ -496,9 +548,12 @@ class CPUMuon:
                 torch.zeros(shape[0], dtype=scale_dtype, device="cpu").pin_memory()
                 if scale_dtype is not None else None
             )
+            # No separate accumulator buffer in the merged-
+            # accumulator design. ``mom_buf`` doubles as the
+            # grad accumulator (mu=1 accumulation) — see the
+            # module docstring.
             st = _ParamState(
                 param=p,
-                accum=torch.zeros(n, dtype=accum_dtype, device="cpu").pin_memory(),
                 mom_buf=torch.zeros(n, dtype=mom_storage_dtype, device="cpu").pin_memory(),
                 mom_scale=mom_scale,
                 kind="muon",
@@ -595,36 +650,47 @@ class CPUMuon:
         """One Muon step across every trainable param in this
         optimizer's state.
 
+        ``mom_buf`` doubles as the grad accumulator (mu=1
+        accumulation): it already holds the sum of microbatch
+        grads at the start of step(). We H2D it, do the SGD
+        math in FP32 on the GPU, requantize/recast back to the
+        configured storage dtype, D2H the new storage, then
+        stream Newton-Schulz over rows to produce the update.
+
         Two storage paths share the same scaffolding (H2D state,
         SGD in FP32, D2H new state, then stream NS over rows):
 
         * **Quantized** (``s.mom_scale is not None``, i.e.
           ``int8`` + BF16 scale): dequant to FP32 on the GPU,
-          SGD in FP32, requant to int8 + BF16 scale, D2H the
-          new storage.
+          requant to int8 + BF16 scale, D2H the new storage.
         * **Full-precision** (``s.mom_scale is None``, i.e.
           ``fp16``/``bf16``/``fp32``): H2D the raw momentum,
-          SGD in FP32, cast back to the storage dtype, D2H.
-          No dequant / requant.
+          cast back to the storage dtype, D2H. No dequant /
+          requant.
 
-        Both paths run the EMA + NS work on the GPU HBM
-        (bandwidth-bound, ~50x faster than CPU DRAM). State
-        stays on CPU pinned memory; the per-mb VRAM peak is one
-        param's worth of buffers (~21 MB for a 1024×3072
-        down_proj) regardless of storage dtype.
+        No cross-step μ momentum smoothing is applied here —
+        ``mom_buf`` resets to zero at the end of every step,
+        so the smoothing has nothing to smooth across cycles.
+        The momentum-smoothing benefit was the only reason for
+        the μ coefficient in the original SGD-momentum design;
+        with mu=1 accumulation the same effect is achieved
+        trivially by the per-cycle sum.
+
+        State stays on CPU pinned memory; the per-mb VRAM peak
+        is one param's worth of buffers (~21 MB for a
+        1024×3072 down_proj) regardless of storage dtype.
 
         See :file:`test/_tmp/test_muon_gpu_step.py` for the
         timing comparison (76% muon step reduction at production
         scale, ~903 ms saved per step on a 1024-hidden,
         3072-intermediate model).
         """
-        mom = self.momentum
         lr = self.lr
         wd = self.weight_decay
-        nesterov = self.nesterov
         CHUNK_ROWS = self._STREAM_CHUNK_ROWS
         for s in self.state.values():
-            if s.accum.abs().sum().item() == 0:
+            g_buf = s.mom_buf
+            if g_buf.abs().sum().item() == 0:
                 continue
             shape = s.shape
             rows, cols = shape[0], shape[1]
@@ -633,8 +699,7 @@ class CPUMuon:
 
             # ---- H2D state to GPU (async; pinned host memory →
             # real async DMA with non_blocking=True) ----
-            mom_buf_gpu = s.mom_buf.to(device, non_blocking=True)
-            accum_gpu = s.accum.to(device, non_blocking=True)
+            mom_buf_gpu = g_buf.to(device, non_blocking=True)
 
             # ---- Get the SGD input as FP32 [rows, cols] on GPU.
             # Quantized path: dequant int8 with the BF16 per-row
@@ -649,12 +714,8 @@ class CPUMuon:
             else:
                 m_fp32_gpu = mom_buf_gpu.float().view(rows, cols)
 
-            # ---- GPU SGD: m = beta*m + (1-beta)*grad ----
-            # accum is BF16; cast to FP32 for the add (matches
-            # the CPU path's behavior; BF16 add would lose
-            # precision on the EMA).
-            g_2d = accum_gpu.float().view(rows, cols)
-            m_fp32_gpu.mul_(mom).add_(g_2d, alpha=1.0 - mom)
+            # ---- No SGD update here: mom_buf is already the
+            # accumulated grad (mu=1). We orthogonalize it as-is. ----
 
             # ---- Requant (quantized) or recast (full-precision)
             # + D2H the new momentum storage. ----
@@ -669,14 +730,23 @@ class CPUMuon:
                 # s.mom_buf's storage.
                 s.mom_buf.copy_(q_int8_gpu.view(-1), non_blocking=True)
                 s.mom_scale.copy_(new_scale_bf16, non_blocking=True)
+                # The requantized m_fp32_gpu is now redundant —
+                # orthogonalize from the original dequantized
+                # buffer (m_fp32_gpu still holds the pre-quant
+                # FP32 values from above).
+                orth_input = m_fp32_gpu
             else:
                 # Cast FP32 back to the configured storage dtype
-                # (the SGD is in FP32; the round-trip through the
-                # narrower dtype is the only precision loss the
-                # full-precision path incurs, vs the quantized
-                # path's per-row int8 quantization).
+                # (the round-trip through the narrower dtype is
+                # the only precision loss the full-precision
+                # path incurs, vs the quantized path's per-row
+                # int8 quantization).
                 new_mom = m_fp32_gpu.to(s.mom_buf.dtype).view(-1)
                 s.mom_buf.copy_(new_mom, non_blocking=True)
+                # Orthogonalize from the FP32 buffer (cleaner
+                # numerics than re-reading the cast-back fp*
+                # storage).
+                orth_input = m_fp32_gpu
 
             # ---- Decoupled weight decay: applied once to the
             # full GPU param (in place), before the streaming
@@ -684,11 +754,11 @@ class CPUMuon:
             if wd != 0.0:
                 s.param.data.mul_(1.0 - lr * wd)
 
-            # ---- Stream NS over rows; m_fp32_gpu is already on
+            # ---- Stream NS over rows; orth_input is already on
             # GPU so no per-chunk H2D is needed (vs the prior
             # CPU-path design which H2D'd each chunk's FP32
             # slice). ----
-            m_fp16 = m_fp32_gpu.to(torch.float16)
+            m_fp16 = orth_input.to(torch.float16)
             for r_start in range(0, rows, CHUNK_ROWS):
                 r_end = min(r_start + CHUNK_ROWS, rows)
                 m_chunk = m_fp16[r_start:r_end]
@@ -702,13 +772,45 @@ class CPUMuon:
             # this DMA landed. ----
             torch.cuda.current_stream(device).synchronize()
 
-            # Reset grad accumulator for next accumulation cycle.
-            s.accum.zero_()
+            # Reset mom_buf to zero for the next accumulation cycle.
+            # ``mom_buf`` doubles as the accumulator; this is the
+            # only point in the cycle where the accumulation
+            # result is consumed.
+            s.mom_buf.zero_()
 
 
 # --------------------------------------------------------------------------- #
 # Public API: stream grads to CPU and reset                                   #
 # --------------------------------------------------------------------------- #
+def _accumulator_target(s: _ParamState) -> Tuple[torch.Tensor, torch.dtype]:
+    """Return ``(target_tensor, cast_dtype)`` for the offload path.
+
+    ``target_tensor`` is the CPU-side tensor that the per-microbatch
+    grad should be folded into (mu=1 accumulation). For AdamW it's
+    ``s.m``; for Muon it's ``s.mom_buf``.
+
+    ``cast_dtype`` is the dtype to cast the GPU grad to before
+    the DMA. Normally this is the storage dtype of the
+    accumulator (so the DMA carries the same bytes as storage).
+    The exception is int8 Muon, where we cast to BF16 instead:
+    the dequant-add-requant path on the flush side needs a
+    floating-point src tensor to add into the dequantized
+    FP32 momentum without losing the bf16 grad's mantissa.
+    """
+    if s.kind == "adamw":
+        return s.m, s.m.dtype
+    # muon
+    if s.mom_scale is not None:
+        # int8 storage: use bf16 as the cast target so the
+        # dequant-add-requant path can add the src to the
+        # dequantized FP32 momentum without further precision
+        # loss. (Casting to int8 directly would round the bf16
+        # grad to ±127/scale which is meaningless without the
+        # scale's full dynamic range.)
+        return s.mom_buf, torch.bfloat16
+    return s.mom_buf, s.mom_buf.dtype
+
+
 def accumulate_grads_to_cpu(
     optimizers: List,
     sync_device: int | None = None,
@@ -722,42 +824,47 @@ def accumulate_grads_to_cpu(
     hooks via :func:`register_grad_offload_hooks`). The training
     loop uses the streaming path.
 
+    The accumulator is ``s.m`` (AdamW) or ``s.mom_buf`` (Muon) —
+    no separate ``accum`` buffer. The cast target follows the
+    accumulator's storage dtype; for int8 Muon the cast target
+    is BF16 instead (see :func:`_accumulator_target`).
+
     The async ``.to("cpu")`` is issued first (with a flattened
     view of the grad, so the resulting ``src_cpu`` matches the
-    1-D ``accum`` tensor), then we sync the current CUDA device
+    1-D accumulator tensor), then we sync the current CUDA device
     (or ``sync_device`` if given) before performing the in-place
-    CPU add. This avoids the race where ``s.accum.add_(src)`` runs
+    CPU add. This avoids the race where the accumulator add runs
     on the CPU before the DMA copy populates ``src``.
 
-    The cast target is read from ``s.accum.dtype`` (the
-    ``gradients`` precision in :class:`PrecisionConfig`). BF16 is
-    the default; FP16 / FP32 also work, and integer dtypes
-    (int8 / int4) cast the rounded-integer grad into the
-    accumulator's storage — but in practice the training loop
-    uses a floating dtype for ``gradients`` because the
-    grad-to-accumulator add is an FP add, not an int add.
+    For int8 Muon, the post-sync apply runs the dequant-add-requant
+    on the CPU (so the per-row scale tracks the new row max after
+    each microbatch — this is the precision-preserving way to
+    accumulate into a per-row-quantized buffer without an
+    intermediate accumulator).
 
     The cast happens BEFORE the DMA so the transfer itself
-    matches the storage dtype. We do the cast on the GPU first,
-    then the DMA, so the PCIe transfer is already in the
-    target dtype.
+    matches the cast dtype.
     """
-    pending: list[tuple[torch.Tensor, torch.Tensor]] = []
+    pending: list = []  # (kind, ...) — see below
     for opt in optimizers:
         for s in opt.state.values():
             g = s.param.grad
             if g is None:
                 continue
-            # Cast on the GPU first (matches s.accum's dtype;
-            # no FP16 overflow on the DMA if accum is BF16), then
-            # flatten, then DMA.
+            target, cast_dtype = _accumulator_target(s)
+            # Cast on the GPU first (so DMA carries the cast
+            # dtype), flatten to match the 1-D accumulator, then
+            # issue the async D2H.
             src_cpu = (
                 g.detach()
-                .to(s.accum.dtype)
+                .to(cast_dtype)
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
             )
-            pending.append((s.accum, src_cpu))
+            if s.kind == "muon" and s.mom_scale is not None:
+                pending.append(("int8_muon", s, src_cpu))
+            else:
+                pending.append(("add", target, src_cpu))
             # Free GPU grad immediately so the GPU memory is
             # available for the next micro-batch's forward.
             s.param.grad = None
@@ -767,18 +874,74 @@ def accumulate_grads_to_cpu(
     else:
         torch.cuda.synchronize()
 
-    for target, src in pending:
-        target.add_(src)
+    for entry in pending:
+        if entry[0] == "add":
+            _, target, src = entry
+            target.add_(src)
+        else:
+            # int8_muon: dequant-add-requant per microbatch so
+            # the per-row scale tracks the row's growing max-abs
+            # across accumulation (otherwise small grad updates
+            # would round to zero and the scale would never
+            # re-adjust).
+            _, s, src = entry
+            _int8_muon_accumulate(s, src)
+
+
+def _int8_muon_accumulate(s: _ParamState, src: torch.Tensor) -> None:
+    """Dequant → add → requant for one microbatch's int8-Muon grad.
+
+    ``s.mom_buf`` stores int8 quantized values
+    (``q = round(m / scale)``) and ``s.mom_scale`` stores the
+    per-row BF16 scale. To add a new bf16 grad ``src`` (cast
+    to BF16 by the caller) without losing precision, we:
+
+      1. Dequant mom_buf to FP32 ``[rows, cols]``.
+      2. Reshape and cast src to FP32 ``[rows, cols]``.
+      3. Add in FP32.
+      4. Requantize: compute new per-row max-abs, new scale
+         (clamped to 1e-8 to avoid divide-by-zero on dead rows),
+         quantize to int8, copy back to ``s.mom_buf`` /
+         ``s.mom_scale``.
+
+    This is the per-microbatch cost of preserving int8
+    quantization precision without an extra accumulator
+    buffer. For the canonical bf16 muon_momentum config this
+    branch is never taken.
+
+    Runs on the CPU. The 2D reshape views share storage with the
+    1D tensors, so the FP32 work is the only allocation.
+    """
+    rows, cols = s.shape[0], s.shape[1]
+    # Dequant (FP32 [rows, cols]). Use the same arithmetic as
+    # the step()-side dequant path so the per-row scales stay
+    # consistent across the cycle.
+    m_fp32 = s.mom_buf.view(rows, cols).float() * s.mom_scale.float().unsqueeze(1)
+    m_fp32.add_(src.view(rows, cols).float())
+    # Requantize (in place on s.mom_buf / s.mom_scale).
+    row_max = m_fp32.abs().amax(dim=1).clamp(min=1e-8)
+    new_scale_fp32 = row_max / 127.0
+    new_scale_bf16 = new_scale_fp32.to(torch.bfloat16)
+    scale_2d = new_scale_bf16.float().unsqueeze(1)
+    q_int8 = (m_fp32 / scale_2d).round().clamp(-128, 127).to(torch.int8)
+    s.mom_buf.copy_(q_int8.view(-1))
+    s.mom_scale.copy_(new_scale_bf16)
 
 
 # --------------------------------------------------------------------------- #
 # Streaming per-param D2H via post-accumulate-grad hooks.                      #
 # --------------------------------------------------------------------------- #
 # Module-level queue for in-flight D2H transfers issued by the
-# hooks. Each entry is ``(accum, src_cpu)`` where ``src_cpu`` is
-# a CPU tensor whose data is being DMA'd in asynchronously.
-# :func:`flush_pending_grads` syncs CUDA and applies the adds.
-_pending_grads: list[tuple[torch.Tensor, torch.Tensor]] = []
+# hooks. Each entry is one of:
+#   - ``("add", target_tensor, src_cpu)`` for the common case
+#     (AdamW or fp* Muon): ``src_cpu`` is added in place into
+#     ``target_tensor`` (``s.m`` or ``s.mom_buf``).
+#   - ``("int8_muon", state, src_cpu)`` for int8 Muon: the
+#     dequant-add-requant path runs on the state instead of a
+#     plain tensor add.
+# :func:`flush_pending_grads` syncs CUDA and applies the
+# accumulated operations.
+_pending_grads: list = []
 
 # Module-level set of param ``id(p)`` for params that need a
 # *post-backward* manual flush instead of (or in addition to) the
@@ -827,12 +990,10 @@ def register_grad_offload_hooks(
     "return None leaves .grad as-is" semantics mean our explicit
     clear is the source of truth.
 
-    The cast target is ``s.accum.dtype`` (the
-    ``gradients`` precision in :class:`PrecisionConfig`). BF16 is
-    the default and matches the PCIe bandwidth: BF16 and FP16
-    are both 2 bytes/elt so the DMA size is the same, but the
-    BF16 accumulator matches the BF16 m/v storage in the
-    AdamW path so no further cast is needed at step() time.
+    The cast target follows the accumulator's storage dtype
+    (``s.m.dtype`` for AdamW, ``s.mom_buf.dtype`` for fp* Muon,
+    BF16 for int8 Muon). See :func:`_accumulator_target` for the
+    resolution rules.
 
     ``manual_flush_params`` (optional): list of params whose
     grad arrives via a custom autograd Function that fires
@@ -884,8 +1045,8 @@ def _make_offload_hook(s: _ParamState):
     decreasing" incident. Always read ``p.grad`` here.
     """
     p = s.param
-    accum = s.accum
-    target_dtype = accum.dtype
+    target, target_dtype = _accumulator_target(s)
+    is_int8_muon = (s.kind == "muon" and s.mom_scale is not None)
 
     def hook(g: torch.Tensor | None) -> None:
         # ``g`` is the leaf param per the PyTorch API contract.
@@ -896,9 +1057,9 @@ def _make_offload_hook(s: _ParamState):
             # The param had no grad this backward (e.g. it was
             # in a no-grad branch). Nothing to offload.
             return None
-        # Cast on the GPU (so the DMA carries the accum dtype,
+        # Cast on the GPU (so the DMA carries the cast dtype,
         # not the param's training dtype), flatten to match the
-        # 1-D ``accum`` shape, then issue the async D2H. The
+        # 1-D accumulator shape, then issue the async D2H. The
         # .detach() prevents the resulting CPU tensor from
         # carrying autograd metadata (we never want to backprop
         # through a grad-DMA).
@@ -908,7 +1069,10 @@ def _make_offload_hook(s: _ParamState):
             .reshape(-1)
             .to("cpu", non_blocking=True)
         )
-        _pending_grads.append((accum, src))
+        if is_int8_muon:
+            _pending_grads.append(("int8_muon", s, src))
+        else:
+            _pending_grads.append(("add", target, src))
         # Free the GPU grad right now so the memory is available
         # for the next param's backward. The hook return value
         # replaces .grad per PyTorch's contract; returning None
@@ -943,7 +1107,7 @@ def flush_manual_flush_params(optimizers: List) -> None:
     """
     if not _manual_flush_param_ids:
         return
-    pending: list[tuple[torch.Tensor, torch.Tensor]] = []
+    pending: list = []
     seen: set[int] = set()
     for opt in optimizers:
         for s in opt.state.values():
@@ -956,19 +1120,28 @@ def flush_manual_flush_params(optimizers: List) -> None:
             g = p.grad
             if g is None:
                 continue
+            target, cast_dtype = _accumulator_target(s)
             src_cpu = (
                 g.detach()
-                .to(s.accum.dtype)
+                .to(cast_dtype)
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
             )
-            pending.append((s.accum, src_cpu))
+            if s.kind == "muon" and s.mom_scale is not None:
+                pending.append(("int8_muon", s, src_cpu))
+            else:
+                pending.append(("add", target, src_cpu))
             p.grad = None
     if not pending:
         return
     torch.cuda.synchronize()
-    for target, src in pending:
-        target.add_(src)
+    for entry in pending:
+        if entry[0] == "add":
+            _, target, src = entry
+            target.add_(src)
+        else:
+            _, s, src = entry
+            _int8_muon_accumulate(s, src)
 
 
 def flush_pending_grads(sync_device: int | None = None) -> None:
@@ -1003,19 +1176,44 @@ def flush_pending_grads(sync_device: int | None = None) -> None:
         torch.cuda.synchronize(sync_device)
     else:
         torch.cuda.synchronize()
-    # apply_ in place; order doesn't matter for the add.
-    for target, src in _pending_grads:
-        target.add_(src)
+    for entry in _pending_grads:
+        if entry[0] == "add":
+            _, target, src = entry
+            target.add_(src)
+        else:
+            # int8_muon: dequant-add-requant per microbatch so
+            # the per-row scale tracks the row's growing max-abs
+            # across accumulation.
+            _, s, src = entry
+            _int8_muon_accumulate(s, src)
     _pending_grads.clear()
 
 
 def zero_cpu_grad_accum(optimizers: List) -> None:
     """Reset CPU accumulators (call this AFTER step() to start the
     next accumulation cycle).
+
+    In the merged-accumulator design there is no separate
+    ``accum`` buffer: the accumulator IS ``s.m`` (AdamW) or
+    ``s.mom_buf`` (Muon), and the optimizer's ``step()``
+    already zeros them at the end of the step. This function is
+    kept as a defensive zero (e.g. for the case where
+    ``found_inf`` is detected and the optimizers are NOT
+    stepped — we still want to clear the accumulated grads
+    before the next cycle).
     """
     for opt in optimizers:
         for s in opt.state.values():
-            s.accum.zero_()
+            if s.kind == "adamw":
+                s.m.zero_()
+            else:
+                # muon: zeroing mom_buf also works for int8
+                # (it sets the int8 storage to zero without
+                # touching the scale — the scale was last
+                # set by the requant on the most recent
+                # microbatch, which is the right starting point
+                # for the next cycle's accumulation).
+                s.mom_buf.zero_()
 
 
 def build_param_groups(
