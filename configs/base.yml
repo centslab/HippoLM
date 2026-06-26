@@ -133,3 +133,17 @@ min_gpu_memory_mb: 10240
 # paths without owning N physical GPUs. Much slower than NVLink NCCL.
 tp_sim: false
 tp_size: 2
+
+# Per-microbatch timing breakdown (see scripts/cli.py). 0 disables.
+# When > 0, logs data_ms / h2d_ms / fwd_ms / bwd_ms / sync_ms for
+# the first N microbatches of every step.
+mb_timing: 0
+# Release the caching-allocator slack pool back to the driver after
+# each microbatch. Frees ~4 GB of pool on the 16 GB production config
+# at the cost of ~24 ms/mb (+0.7% wall-clock).
+empty_cache_between_mb: true
+# Skip saving the KDA per-chunk attention statistics Aqk + Akk in
+# the forward pass; recompute them in the backward pass via
+# chunk_kda_fwd_intra. Trades a small bwd time increase for ~32 MiB
+# of saved-tensor memory per KDA layer (~1 GB at 30 layers).
+kda_skip_aqk_akk_saved: false
