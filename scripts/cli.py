@@ -110,6 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint_interval", type=int, default=100,
                    help="Save a checkpoint every N steps. Set <= 0 "
                         "to disable periodic save (e.g. for short smoke runs).")
+    p.add_argument("--checkpoint_keep_last_n", type=int, default=None,
+                   help="After each checkpoint save, prune older "
+                        "checkpoint_step_*.pt files so at most N "
+                        "remain (newest N kept). Default: keep all. "
+                        "Use 0 to keep only the just-saved file.")
 
     # ---- Output ----
     p.add_argument("--output_dir", type=str, default="output")

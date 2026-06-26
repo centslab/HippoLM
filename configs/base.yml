@@ -125,7 +125,11 @@ use_dummy_data: false
 # Output
 output_dir: output
 log_interval: 1
-checkpoint_interval: 100
+checkpoint_interval: 1
+# After each save, prune older checkpoint_step_*.pt files so at most
+# N remain (newest N kept). null/None keeps all. Set to 0 to keep
+# only the just-saved file.
+checkpoint_keep_last_n: 3
 
 # GPU
 min_gpu_memory_mb: 10240

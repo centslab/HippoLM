@@ -864,6 +864,7 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                                 step=global_step,
                                 loss=avg_loss,
                                 checkpoint_dir=run_dir / "checkpoints",
+                                keep_last_n=args.checkpoint_keep_last_n,
                             )
                             logger.info(f"  checkpoint saved: {ckpt_path}")
                         except Exception as ckpt_err:

@@ -405,6 +405,77 @@ class CPUAdamW:
             # is consumed.
             s.m.zero_()
 
+    # ------------------------------------------------------------------ #
+    # Checkpoint save/load (resume).                                     #
+    # ------------------------------------------------------------------ #
+    # The training loop periodically calls ``save_checkpoint`` (see
+    # :mod:`src.training.checkpoint`) which in turn calls
+    # ``opt.state_dict()`` on each optimizer. The CPU-offloaded
+    # design does not subclass :class:`torch.optim.Optimizer`, so the
+    # stock ``state_dict`` is unavailable — we serialize the per-param
+    # state (CPU pinned tensors + scalar metadata) ourselves.
+    #
+    # Per-param entries are emitted as a list in ``self.state``'s
+    # insertion order, which is the order :func:`build_param_groups`
+    # added params in (i.e. the model's parameter iteration order).
+    # That order is deterministic across save/load, so
+    # ``load_state_dict`` can match the i-th saved entry to the
+    # i-th current entry without a stable id key (Python ``id(p)``
+    # does not survive a process restart). The matching tensors are
+    # copied in place — the per-param buffers already exist on the
+    # freshly-constructed optimizer, only their contents are
+    # restored.
+    def state_dict(self) -> dict:
+        return {
+            "lr": self.lr,
+            "beta1": self.beta1,
+            "beta2": self.beta2,
+            "eps": self.eps,
+            "weight_decay": self.weight_decay,
+            "state": [
+                {
+                    "shape": list(s.shape),
+                    "step": s.step,
+                    "kind": s.kind,
+                    "m": s.m,
+                    "exp_avg_sq": s.exp_avg_sq,
+                }
+                for s in self.state.values()
+            ],
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.lr = float(state_dict["lr"])
+        self.beta1 = float(state_dict["beta1"])
+        self.beta2 = float(state_dict["beta2"])
+        self.eps = float(state_dict["eps"])
+        self.weight_decay = float(state_dict["weight_decay"])
+        saved = state_dict.get("state", [])
+        current = list(self.state.values())
+        if len(saved) != len(current):
+            raise ValueError(
+                f"CPUAdamW.load_state_dict: param count mismatch "
+                f"(file has {len(saved)} entries, current optimizer "
+                f"has {len(current)}). The model architecture likely "
+                f"changed since this checkpoint was written."
+            )
+        for cur, sav in zip(current, saved):
+            cur.step = int(sav.get("step", 0))
+            # Shape sanity check: the param shapes must match (the
+            # current optimizer's buffers were allocated from the
+            # current model's params).
+            if tuple(sav.get("shape", ())) != tuple(cur.shape):
+                raise ValueError(
+                    f"CPUAdamW.load_state_dict: shape mismatch at "
+                    f"param index {current.index(cur)}: file="
+                    f"{tuple(sav.get('shape', ()))} current="
+                    f"{tuple(cur.shape)}."
+                )
+            if sav.get("m") is not None:
+                cur.m.copy_(sav["m"])
+            if sav.get("exp_avg_sq") is not None:
+                cur.exp_avg_sq.copy_(sav["exp_avg_sq"])
+
 
 # --------------------------------------------------------------------------- #
 # CPU Muon                                                                    #
@@ -777,6 +848,63 @@ class CPUMuon:
             # only point in the cycle where the accumulation
             # result is consumed.
             s.mom_buf.zero_()
+
+    # ------------------------------------------------------------------ #
+    # Checkpoint save/load (resume).                                     #
+    # ------------------------------------------------------------------ #
+    # See the equivalent block on :class:`CPUAdamW` for the design.
+    # Both quantised (``mom_scale is not None``) and full-precision
+    # storage are handled uniformly: the saved entry contains
+    # whichever of ``mom_buf`` / ``mom_scale`` is non-None, and
+    # ``load_state_dict`` restores them in place into the current
+    # optimizer's pre-allocated buffers.
+    def state_dict(self) -> dict:
+        return {
+            "lr": self.lr,
+            "momentum": self.momentum,
+            "nesterov": self.nesterov,
+            "ns_steps": self.ns_steps,
+            "weight_decay": self.weight_decay,
+            "state": [
+                {
+                    "shape": list(s.shape),
+                    "step": s.step,
+                    "kind": s.kind,
+                    "mom_buf": s.mom_buf,
+                    "mom_scale": s.mom_scale,
+                }
+                for s in self.state.values()
+            ],
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.lr = float(state_dict["lr"])
+        self.momentum = float(state_dict["momentum"])
+        self.nesterov = bool(state_dict["nesterov"])
+        self.ns_steps = int(state_dict["ns_steps"])
+        self.weight_decay = float(state_dict["weight_decay"])
+        saved = state_dict.get("state", [])
+        current = list(self.state.values())
+        if len(saved) != len(current):
+            raise ValueError(
+                f"CPUMuon.load_state_dict: param count mismatch "
+                f"(file has {len(saved)} entries, current optimizer "
+                f"has {len(current)}). The model architecture likely "
+                f"changed since this checkpoint was written."
+            )
+        for cur, sav in zip(current, saved):
+            cur.step = int(sav.get("step", 0))
+            if tuple(sav.get("shape", ())) != tuple(cur.shape):
+                raise ValueError(
+                    f"CPUMuon.load_state_dict: shape mismatch at "
+                    f"param index {current.index(cur)}: file="
+                    f"{tuple(sav.get('shape', ()))} current="
+                    f"{tuple(cur.shape)}."
+                )
+            if sav.get("mom_buf") is not None:
+                cur.mom_buf.copy_(sav["mom_buf"])
+            if sav.get("mom_scale") is not None:
+                cur.mom_scale.copy_(sav["mom_scale"])
 
 
 # --------------------------------------------------------------------------- #

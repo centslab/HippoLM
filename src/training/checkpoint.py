@@ -38,6 +38,7 @@ def save_checkpoint(
     step: int,
     loss: float,
     checkpoint_dir: Path,
+    keep_last_n: Optional[int] = None,
 ) -> Path:
     """Persist model + per-optimizer state to ``checkpoint_dir``.
 
@@ -50,6 +51,18 @@ def save_checkpoint(
     compatibility — when AMP is disabled the entry point passes
     a no-op ``GradScaler(enabled=False)`` and we save its (empty)
     state dict.
+
+    ``keep_last_n`` (optional): when set, prune older
+    ``checkpoint_step_*.pt`` files in ``checkpoint_dir`` after the
+    new save so at most ``keep_last_n`` files remain (newest
+    first). ``None`` (default) keeps all files — useful when
+    callers want to manage retention themselves (e.g. a separate
+    "best" tracker that symlinks to a permanent location).
+    ``0`` deletes every existing checkpoint including the one
+    just written (use ``1`` to keep only the just-saved file).
+    A negative value is a no-op. Pruning happens AFTER
+    ``torch.save`` succeeds, so a save failure cannot delete
+    existing files.
     """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -68,7 +81,54 @@ def save_checkpoint(
         payload["scaler_state_dict"] = scaler.state_dict()
     torch.save(payload, path)
     log.info("checkpoint saved: step=%d loss=%.4e path=%s", step, loss, path)
+    if keep_last_n is not None:
+        prune_old_checkpoints(checkpoint_dir, keep_last_n)
     return path
+
+
+def prune_old_checkpoints(
+    checkpoint_dir: Path,
+    keep_last_n: int,
+) -> int:
+    """Delete ``checkpoint_step_*.pt`` files in ``checkpoint_dir``
+    beyond the newest ``keep_last_n``, returning the number of
+    files removed.
+
+    Sort key is the step number parsed from the filename
+    (``checkpoint_step_{N}.pt``), NOT mtime — wall-clock skew
+    between the training process and the filesystem could
+    otherwise reorder saves incorrectly (e.g. on a network
+    filesystem that lags writes). Files whose names don't match
+    the pattern (e.g. ``best.pt``, ``latest.pt`` symlinks, an
+    external crash dump) are left untouched.
+
+    Negative ``keep_last_n`` is a no-op. ``0`` deletes every
+    existing file (the just-saved one is in the same directory,
+    so it IS counted as the newest and preserved; this matches
+    the docstring on :func:`save_checkpoint`).
+    """
+    if keep_last_n < 0:
+        return 0
+    candidates: list[tuple[int, Path]] = []
+    for p in checkpoint_dir.glob("checkpoint_step_*.pt"):
+        try:
+            # stem is "checkpoint_step_42"; split off the last "_42"
+            step_num = int(p.stem.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            log.debug("ignoring non-conforming checkpoint name: %s", p)
+            continue
+        candidates.append((step_num, p))
+    # Newest first; keep the first keep_last_n, delete the rest.
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    removed = 0
+    for _, p in candidates[keep_last_n:]:
+        try:
+            p.unlink()
+            removed += 1
+            log.info("checkpoint pruned (keep_last_n=%d): %s", keep_last_n, p)
+        except OSError as e:
+            log.warning("failed to prune old checkpoint %s: %r", p, e)
+    return removed
 
 
 def load_checkpoint(
