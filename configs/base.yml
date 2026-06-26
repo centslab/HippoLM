@@ -2,12 +2,12 @@
 
 # Model Architecture
 vocab_size: 248320
-hidden_size: 1024
+hidden_size: 1536
 tie_word_embeddings: true
 use_bias: false
 
 # KDA (Kimi Delta Attention)
-num_heads: 8
+num_heads: 12
 head_dim: 128
 expand_v: 1.0
 kda_mode: chunk            # chunk for training, fused_recurrent for inference
@@ -26,7 +26,7 @@ num_layers: 32
 num_blocks: 8
 
 # FFN (SwiGLU)
-intermediate_size: 3072
+intermediate_size: 4096
 
 # Normalization
 rms_norm_eps: 0.000001

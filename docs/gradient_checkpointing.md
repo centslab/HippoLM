@@ -8,6 +8,23 @@ It is intended as the reference the next optimizer reads before touching
 `sub_block_size` or switching `use_reentrant` mode, and as the
 contract for the L-dependent tuning of `sub_block_size`.
 
+> **Config declaration (this doc is valid for):**
+>
+> All per-layer / per-component numbers in this doc were measured at
+> **`32 layers × 1024 hidden × 8 heads × head_dim=128 × 3072 FFN ×
+> seq_len=16384 × batch_size=1 × BF16 × TP=1`** (the base.yml config
+> at the time this doc was written).
+>
+> If `configs/base.yml` is changed (e.g., 2026-06-26 bump to
+> `hidden_size=1536 / num_heads=12 / intermediate_size=4096`), the
+> absolute numbers here **do not apply**. The structure (ckpt
+> placement, use_reentrant=True, sub_block_size=2 sweet spot at
+> L=24..64, the FWD-tail-vs-BWD peak distinction, the empty_cache
+> trade-off) still holds; only the byte counts change.
+>
+> Re-measure with the methodology at the end of this doc before
+> quoting any number from a "Per-component breakdown" table.
+
 ## The constraint
 
 Production config: `32 layers × 1024 hidden × 8 heads × 16384 seq ×
@@ -162,6 +179,12 @@ reverted in isolation without breaking the other.
 
 ## Production VRAM profile (TP=1, 32L × 1024H × 8H × 16384seq, cu_seqlens path)
 
+> **Numbers below are for `32 layers × 1024 hidden × 8 heads × 3072
+> FFN × seq_len=16384` (base.yml as of the doc write date).
+> For the current `hidden_size=1536 / num_heads=12 / intermediate_size=4096`
+> base.yml, the absolute MB values shift; see the config declaration
+> at the top of this doc.**
+
 Measured with the real `scripts/train.py` contract: per-2-layer ckpt,
 FLCE `num_chunks=64` (BF16 `dw`), cu_seqlens via FFD packing, no
 pre-allocated `.grad` tensors (grads are D2H to CPU pinned per-mb by
@@ -239,6 +262,19 @@ not a leak:
 3. The next mb's fwd reuses these blocks. That's why mb 1 fwd only
    needs ~4.12 GB of new alloc (reaching 2.66 + 4.96 = 7.62 GB peak)
    rather than the ~5.45 GB mb 0 needed.
+
+**In the default config this residue IS cleaned up**: with
+`--empty_cache_between_mb true` (default; see `src/training/loop.py:611`),
+the training loop calls `torch.cuda.empty_cache()` immediately after
+each mb's `flush_manual_flush_params`. `empty_cache()` returns the
+free pool back to the driver; mb 1+ post-fwd `memory_reserved` drops
+from **8.02 GB → 4.09 GB** (driver view 8.23 → 4.2 GB). The 1.34 GB
+residue is part of that 4 GB slack pool that gets released. See
+"With `--empty_cache_between_mb true`" table above for the per-phase
+numbers. The 1.34 GB figure quoted here is the *without-empty_cache*
+steady-state residue; with `empty_cache_between_mb=true` it gets
+returned to the driver between mbs and re-allocated on the next fwd.
+Cost of the cleanup: +24 ms/mb (+0.7% wall-clock).
 
 **Verification** (`test/_tmp/post_bwd_introspect.py`, walks `gc.get_objects()`):
 
@@ -408,15 +444,48 @@ fragmentation" bucket was a mis-accounting — the real largest
 unaccounted items are the KDA bwd saved tensors above, which were
 undercounted in the previous doc.
 
-**Sum check** (mb 1+ peak = 7.62 GB):
+**Sum check** (mb 1+ peak = 7.62 GB, no `empty_cache_between_mb`):
 - Pre-mb alloc: 1.32 GB params + 1.34 GB caching residue = **2.66 GB**
-- New alloc for fwd: 2.66 → 5.60 = **+2.94 GB**
-  - KDA saved (sub-block inner sub-graphs + eager last): ~2.24 GB
-  - FLCE autograd hold: ~0.49 GB
-  - 27 × [B, T, H] activations: 0.86 GB
-  - FFN intermediates: 0.48 GB
-  - Other (cuDNN/cuBLAS): 0.15 GB
-  - (offsets sum to ~4.22 GB — slight over-count, GC walk over-reports)
+- New alloc for fwd: 2.66 → 7.62 = **+4.96 GB**
+  - **ckpt inputs (outer graph)**: 17 × [B,T,H] = **544 MB**
+  - **KDA inner-saved [B,T,H]** (q/k/v/g_input of in-flight sub-block,
+    distinct from ckpt inputs which sit in the outer graph):
+    ~10 × 32 = **320 MB**
+  - **KDA inner-saved [B,T,HV,BT/BC]**: Aqk/Akk/Akkd of in-flight
+    sub-block + eager last layer ≈ **1.4 GB** (these are non-[B,T,H]
+    shapes, computed from KDA's [B,T,H] q/k/v above)
+  - **FLCE autograd hold**: 485 (embed_weight) + 32 (dx) = **517 MB**
+    (the 485 MB embed reference returns to the caching pool on bwd)
+  - **FFN intermediates** (SwiGLU gate*up): ~5 in-flight sub-block
+    layers × 96 MB = **480 MB**
+  - **Block-attn residuals** (8 blocks × 32 MB): **256 MB**
+  - **Other** (cuDNN workspace + autograd metadata + small per-op
+    allocations): ~**200 MB**
+  - Sum: 544 + 320 + 1400 + 517 + 480 + 256 + 200 ≈ **3.72 GB**
+
+**Reconciliation note**: this is still ~1.24 GB below the measured
+`+4.96 GB` delta. The gap is the GC walk's blind spot — Python
+references inside autograd `Function.ctx` (per-op cuDNN/cuBLAS handle
+state, the KDA inner subgraph's `initial_state`/`cu_seqlens`/
+`chunk_indices` tensors, plus per-chunk workspace freed between
+sub-block bwd passes that the GC walk sees as live because their
+refcount hasn't dropped yet). The numbers above are the
+*attributable* cost; the residual 1.24 GB is "GC walk blind spot,
+bounded by the steady-state 8.02 GB reserved pool" rather than a
+specific component.
+
+**Old "27 activations" entry was misleading**: the previous version
+of this doc counted `17 ckpt inputs + 10 KDA inner-saved [B,T,H]`
+together as "27 × [B,T,H] activations = 0.86 GB". That value is the
+sum of two *separate* sub-budgets (ckpt inputs in the outer graph;
+KDA inner saved in the per-layer subgraph) and shouldn't be added
+to "KDA saved" without double-counting. The breakdown above splits
+them into the two attributable lines.
+
+**The 8.02 GB reserved - 2.66 GB alloc = 5.36 GB** is the free
+pool (not held for any specific tensor; the allocator doesn't shrink
+the pool between mb's because that would force expensive `cudaFree`
+calls only to `cudaMalloc` them again on the next mb).
 
 **Dominant headroom opportunities** (revised):
 1. **KDA bwd saved (~2-3 GB)** — most of the transient fwd-peak cost
@@ -550,3 +619,158 @@ high-water mark. The driver view (8.23 GB) and the reserved pool
      `CUPTI_ERROR_INVALID_DEVICE`; need root or a CUDA-capable
      profiler container).
 4. **Embed tied weight (474 MB)** — intrinsic; no further sharing.
+
+## VRAM profiling methodology (throwaway diagnostic pattern)
+
+When the steady-state numbers in this doc drift from observation, or a
+new config size pushes peak past the budget, re-measure using the same
+methodology that produced the numbers above. The diagnostic itself is
+a one-shot script in `test/_tmp/vram_breakdown.py`; it is **deleted
+before commit** per the test-first rule, but the recipe below
+re-creates it.
+
+### The tool
+
+`test/_tmp/vram_breakdown.py` runs the actual `_train_worker` from
+`src/training/loop.py` (so the path matches `scripts/train.py`
+exactly), and adds four hooks:
+
+1. **`torch.cuda.memory._record_memory_history`** for the full
+   allocation trace (best-effort; some PyTorch builds lack
+   `_dump_memory_history` and the dump is a no-op).
+2. **Monkey-patched `torch.cuda.empty_cache`** that logs every
+   call's pre-state (alloc, reserved, driver_used).
+3. **Monkey-patched `torch.utils.checkpoint.checkpoint`** that logs
+   alloc/reserved/driver around each ckpt region (only enabled with
+   `--inline_snapshots`).
+4. **Monkey-patched `torch.Tensor.backward`** that logs alloc/reserved
+   pre/post each `loss.backward()` call.
+5. **Monkey-patched `torch.cuda.synchronize`** that logs every new
+   `max_memory_allocated` high-water mark — this is what catches the
+   peak inside an op, not just at op boundaries.
+
+### How to run it
+
+```bash
+# Default — 1 step × 16 mbs, production config, with empty_cache enabled
+python test/_tmp/vram_breakdown.py --step 1 --grad_accum 16
+
+# Compare empty_cache on vs off (must override the argparse bool directly,
+# see Pitfalls below)
+python test/_tmp/vram_breakdown.py --step 1 --grad_accum 16 --no_empty_cache
+
+# Per-component attribution via gc.walk at the end
+python test/_tmp/vram_breakdown.py --step 1 --grad_accum 16 --track_tensors
+
+# Test --kda_skip_aqk_akk_saved at the prod dims
+python test/_tmp/vram_breakdown.py --step 1 --grad_accum 16 --kda_skip_aqk_akk_saved
+```
+
+A short run (`--step 1 --grad_accum 4`) completes in ~30 s on a
+5060 Ti 16G; `--grad_accum 16` takes ~2 min. The output gives you
+the per-mb steady state, the per-ckpt alloc/reserved trace, and the
+peak HWM with phase labels.
+
+### Pitfalls
+
+- **`argparse` `type=bool` does NOT parse `"False"` as `False`.**
+  `bool("False")` is `True` because non-empty strings are truthy.
+  The CLI flag `--empty_cache_between_mb` uses `type=bool`, so passing
+  `--empty_cache_between_mb False` from a wrapper silently enables
+  the flag. The wrapper script in `test/_tmp/vram_breakdown.py`
+  works around this by parsing the arg normally and then overriding
+  `cli_args.empty_cache_between_mb = False` directly. **Before
+  trusting a "with-empty_cache" run, verify `empty_cache call count`
+  in the output matches the expected mb count.**
+
+- **`max_memory_allocated` only catches peaks at sync points.**
+  The `torch.cuda.synchronize` monkey-patch in the tool closes this
+  gap: it logs every new high-water mark. Without it, peaks that
+  happen inside a CUDA op (e.g., between `loss.backward()`'s pre-
+  and post-snapshots) are invisible. The sync-patch is the reason
+  this methodology catches the 6.31 GB FWD-tail peak that the
+  raw `max_memory_allocated` alone would have missed.
+
+- **`max_memory_reserved` ≠ `max_memory_allocated`.** Reserved is
+  the caching-allocator pool size (incl. freed-but-not-returned
+  blocks); allocated is live-tensor bytes only. The peak to optimize
+  is `max_memory_allocated`; `max_memory_reserved` only matters for
+  the driver-side ceiling (i.e., `mem_get_info()`).
+
+- **`mem_get_info()` "driver used" is `total - free`, not `reserved`.**
+  They differ by the small amount of allocator metadata the driver
+  tracks but `memory_reserved` doesn't. Use `mem_get_info()` when
+  you care about the actual ceiling; use `memory_reserved` for
+  allocator-behavior analysis.
+
+### How to read the output
+
+The script's output has four sections; this is how to interpret them:
+
+**`Snapshot table`** (top of output) — pre-init and post-train-worker
+values for `memory_allocated`, `memory_reserved`, `max_memory_allocated`,
+`max_memory_reserved`, `driver_used`, `driver_total`. The
+`max_memory_allocated` is the **peak live tensors** at any point
+during the run; that's the number to optimize against.
+
+**`empty_cache call log`** — state BEFORE each empty_cache invocation.
+This is the "between mb" snapshot. Without `--empty_cache_between_mb
+false` you should see one entry per mb. If `reserved` here is ~7 GB
+without empty_cache and ~2.6 GB with it, the cleanup is working.
+
+**`Inline ckpt snapshots`** — alloc/reserved/driver around each ckpt
+region. With sub_block_size=2 and 17 ckpts per mb, mb 0 produces
+ckpts 0-16 (forward pass), ckpts 17-33 (backward re-forward), and
+so on for each mb. **The pattern to look for:**
+- ckpt 0-16: alloc grows monotonically from ~1.4 GB to ~4.3 GB
+  (cumulative saved-tensor cost of the fwd graph)
+- ckpts 17-33: alloc drops back to ~1.4 GB at start (post-bwd of
+  first ckpt), then grows again as bwd progresses (re-fwd creating
+  new subgraph tensors). Peak ckpt-post alloc across the bwd
+  region is usually smaller than the fwd peak — if it's not, the
+  re-fwd is hitting a memory wall.
+
+**`Sync points with new max_memory_allocated`** — only the high-water
+marks. The **last** entry (highest peak) tells you the phase:
+- `sync# <last ckpt fwd post>`: peak is in the ckpt region itself
+  (rare — would mean the per-ckpt saved is the bottleneck)
+- `sync# <after ckpts, before bwd>`: peak is in FWD's tail (eager
+  last layer + lm_head + FLCE forward). This is the most common
+  case for the prod config — the FLCE workspace + eager last
+  layer's KDA saved add ~1.4 GB after ckpts end.
+- `sync# <mid-bwd>`: peak is in BWD. Check ckpt snapshots for the
+  re-fwd burst; this is the case where `--kda_skip_aqk_akk_saved`
+  or per-layer sub_block_size helps.
+
+### Why `--kda_skip_aqk_akk_saved` doesn't measurably reduce peak
+
+At prod dims, this flag saves ~32 MiB/layer (Aqk + Akk) × 32 layers
+= 1 GB theoretical. Empirically the peak drops by <50 MB (within
+noise). The reason: the **peak happens at FWD-tail** (sync#17 in
+the sync log), not at the per-ckpt region. By the time the peak
+is reached, only a fraction of layers' KDA saved are alive — the
+others are either not yet materialized (forward hasn't reached
+them) or already partially released by autograd graph traversal.
+The 1 GB "savings" only applies if the peak is dominated by KDA
+saved of *in-flight* layers, which it isn't at our L=32.
+
+If the peak *did* shift to a per-ckpt region (e.g., at L=80 or
+larger dims where the per-ckpt saved grows), this flag would help
+proportionally. Don't trust the doc claim of "1 GB peak savings"
+without re-measuring at the actual peak phase.
+
+### What to do with the result
+
+After running the tool, identify the phase of the peak from the
+sync log, then read the matching per-component section above:
+
+| Peak phase (last sync#) | Dominant consumer | See section |
+|---|---|---|
+| After ckpts, before bwd | FLCE workspace + eager last layer + KDA inner saved | "Per-component breakdown" + "FLCE chunked workspace" |
+| Mid-ckpt-region | KDA bwd saved (per-layer 193 MiB) | "KDA bwd saved tensors" |
+| Mid-bwd of a single ckpt | ckpt re-fwd + new KDA subgraph | "Why `use_reentrant=True` matters" |
+| Steady-state between mbs (with empty_cache) | Caching pool size | "Caching-allocator slack pool" |
+
+If the measured peak is much higher than the table predicts, the
+config has changed since this doc was last updated — re-measure and
+update the table.
