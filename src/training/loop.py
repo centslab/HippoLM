@@ -65,6 +65,69 @@ log = logging.getLogger(__name__)
 _DIAG_STEPS = 3
 
 
+def wsd_lr(
+    step: int,
+    peak_lr: float,
+    warmup_steps: int,
+    decay_steps: int,
+    max_steps: int,
+    min_lr: float = 0.0,
+) -> float:
+    """WSD (Warmup-Stable-Decay) learning rate schedule.
+
+    Three phases over the ``max_steps`` training horizon:
+
+      1. **Warmup**  : steps ``[0, warmup_steps)`` —
+         linear ramp from ``0`` to ``peak_lr``.
+      2. **Stable**  : steps ``[warmup_steps, max_steps - decay_steps)`` —
+         constant at ``peak_lr``.
+      3. **Decay**   : steps ``[max_steps - decay_steps, max_steps)`` —
+         linear ramp from ``peak_lr`` to ``min_lr``.
+
+    Edge cases:
+
+    - ``step < 0`` or ``step >= max_steps``  : ``0`` (clamped; the
+      training loop never reaches these but tests / callers may).
+    - ``warmup_steps == 0`` : no warmup phase; step 0 is already at
+      ``peak_lr``.
+    - ``decay_steps == 0``  : no decay phase; LR stays at ``peak_lr``
+      to the end (matches the pre-WSD "constant LR" behavior).
+    - ``warmup + decay > max_steps`` : stable phase shrinks to zero;
+      the warmup phase is still walked first, then the decay phase
+      kicks in at ``max_steps - decay_steps`` (overlap region is
+      governed by phase priority: warmup > stable > decay).
+    - ``peak_lr <= 0`` : returns ``peak_lr`` unchanged (no-op).
+
+    Both optimizers in this codebase (``CPUAdamW`` and ``CPUMuon``)
+    read ``self.lr`` at the start of :meth:`step`, so updating
+    ``muon_opt.lr`` and ``adamw_opt.lr`` between optimizer
+    constructions and each step is enough — no
+    ``torch.optim.lr_scheduler`` wrapper needed.
+    """
+    if peak_lr <= 0.0:
+        return peak_lr
+    if step < 0 or step >= max_steps:
+        return 0.0
+    # Phase 1: warmup.
+    if warmup_steps > 0 and step < warmup_steps:
+        # step 0 -> 0, step warmup_steps-1 -> peak * (warmup-1)/warmup.
+        # The very first stable step (== warmup_steps) hits peak.
+        return peak_lr * step / warmup_steps
+    # Phase 3: decay.
+    decay_start = max_steps - decay_steps
+    if decay_steps > 0 and step >= decay_start:
+        # step decay_start -> peak_lr, step max_steps-1 -> min_lr.
+        # Decay spans ``decay_steps`` steps [decay_start, decay_start +
+        # decay_steps - 1]; divisor is ``decay_steps - 1`` so the
+        # final step lands exactly on min_lr. With decay_steps == 1
+        # the single decay step jumps straight to min_lr.
+        denom = decay_steps - 1 if decay_steps > 1 else 1
+        progress = (step - decay_start) / denom
+        return peak_lr + (min_lr - peak_lr) * progress
+    # Phase 2: stable.
+    return peak_lr
+
+
 def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     """Compute the L2 norm across all per-param accumulators in
     the given optimizers, all-reduce across the TP world, and
@@ -489,6 +552,16 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
     scaler = ctx["scaler"]
     muon_opt = ctx["muon_opt"]
     adamw_opt = ctx["adamw_opt"]
+    # WSD LR scheduler knobs (see :func:`wsd_lr`). The two peak LRs
+    # (``muon_lr`` and ``learning_rate``) are scaled independently by
+    # the same schedule — both peak at the start of the stable phase
+    # and decay together. Defaults of 0/0 disable scheduling (constant
+    # peak LR), preserving the pre-WSD behavior for short smoke runs
+    # that don't opt in.
+    warmup_steps = getattr(args, "lr_warmup_steps", 0)
+    decay_steps = getattr(args, "lr_decay_steps", 0)
+    peak_muon_lr = args.muon_lr
+    peak_adamw_lr = args.learning_rate
     # Activation precision comes from the precision config:
     # fp16 / bf16 → ``torch.amp.autocast`` with that dtype
     # (tensor-core matmul); fp32 → autocast disabled (pure FP32
@@ -704,6 +777,25 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                                 muon_state=muon_opt.state,
                                 adamw_state=adamw_opt.state,
                             )
+                        # Apply the WSD schedule: scale both peak LRs by
+                        # the same multiplier so Muon and AdamW track
+                        # each other through warmup / stable / decay.
+                        # ``wsd_lr`` reads the supplied peak; we then
+                        # push it onto ``opt.lr`` because both
+                        # ``CPUAdamW.step`` and ``CPUMuon.step`` read
+                        # ``self.lr`` at the top of each call.
+                        cur_muon_lr = wsd_lr(
+                            global_step, peak_muon_lr,
+                            warmup_steps, decay_steps,
+                            args.max_steps,
+                        )
+                        cur_adamw_lr = wsd_lr(
+                            global_step, peak_adamw_lr,
+                            warmup_steps, decay_steps,
+                            args.max_steps,
+                        )
+                        muon_opt.lr = cur_muon_lr
+                        adamw_opt.lr = cur_adamw_lr
                         muon_opt.step()
                         if global_step < _DIAG_STEPS and rank == 0:
                             log_post_opt_diag(
@@ -736,10 +828,17 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                             f"{total_norm:.2f}" if total_norm == total_norm
                             else "nan"
                         )
+                        # Show the LRs that just ran so users can see
+                        # the WSD curve in the log (Muon + AdamW).
+                        lr_str = (
+                            f"lr_muon={muon_opt.lr:.2e}"
+                            f" lr_adamw={adamw_opt.lr:.2e}"
+                        )
                         logger.info(
                             f"Step {global_step}/{args.max_steps} | "
                             f"Loss: {avg_loss:.4f} | "
-                            f"grad_norm: {grad_norm_str}"
+                            f"grad_norm: {grad_norm_str} | "
+                            f"{lr_str}"
                         )
                         for d in gpus:
                             free, total = torch.cuda.mem_get_info(d)

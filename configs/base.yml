@@ -38,6 +38,8 @@ batch_size: 1
 seq_len: 16384
 learning_rate: 0.01
 weight_decay: 0.01
+lr_warmup_steps: 0
+lr_decay_steps: 100
 gradient_accumulation_steps: 16
 # Chunk-aware FFD packing (see src/training/data/collate.py).
 # ``pack_chunk_size``: alignment granularity for doc boundaries inside

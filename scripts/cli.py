@@ -86,6 +86,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=1000)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    # ---- WSD LR scheduler (warmup-stable-decay) ----
+    # Both peaks (``--learning_rate`` and ``--muon_lr``) are scaled
+    # by the same multiplier, so Muon and AdamW track each other
+    # through warmup / stable / decay. Defaults of 0/0 disable
+    # scheduling (constant peak LR); set both in ``configs/base.yml``
+    # (or on the CLI) to opt in. See ``src/training/loop.py:wsd_lr``.
+    p.add_argument(
+        "--lr_warmup_steps", type=int, default=0,
+        help="Number of warmup steps at the start of training."
+             " Linear ramp 0 -> peak. 0 disables the warmup phase.",
+    )
+    p.add_argument(
+        "--lr_decay_steps", type=int, default=0,
+        help="Number of decay steps at the end of training."
+             " Linear ramp peak -> 0 over the last N steps."
+             " 0 disables the decay phase (constant LR).",
+    )
     p.add_argument("--max_grad_norm", type=float, default=1.0,
                    help="Max global (TP-reduced) L2 grad norm. "
                         "Set <= 0 to disable clipping. Default 1.0.")
