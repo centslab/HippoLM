@@ -7,15 +7,18 @@ flash-linear-attention
 
 # Data
 datasets>=2.14.0
-dill>=0.4.0
-
-# Training
-accelerate>=0.20.0
-tqdm>=4.65.0
+# Streaming parquet loader (RotatingParquetIterable, LocalParquetIterable)
+pyarrow>=14.0.0
+# MS repo-tree API discovery + part downloads (rotating.py, prefetch.py)
+requests>=2.31.0
+# MS dataset streaming (load_streaming_with_fallback in sources.py)
+modelscope>=1.18.0
 
 # Evaluation
 evalscope>=1.6.0
 
+# Testing
+pytest>=7.0.0
+
 # Utilities
 pyyaml>=6.0
-psutil>=5.9.0
