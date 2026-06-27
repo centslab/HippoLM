@@ -43,6 +43,10 @@ checkpoints/
 *.pt
 *.ckpt
 
+# Local data caches (ModelScope/HF parquet shards, etc.)
+# Resolved relative to the repo root by src/training/data/cache.py.
+.cache/
+
 # Logs
 *.log
 

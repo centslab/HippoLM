@@ -15,18 +15,13 @@ backend (``src/inference/`` is reserved for that; see CLAUDE.md).
 For evals the latency hit of a few ms of HTTP framing per request
 is dwarfed by the per-step model cost.
 
-Known limitation (June 2026): TP-trained checkpoints have an empty
-``model_state_dict`` because :class:`src.models.tp_model.TPHippoModel`
-stores its per-device modules in plain Python dicts (see
-``self.replicated_per_device`` / ``self.layers_per_device`` in
-``__init__``), which PyTorch's ``state_dict()`` skips. To eval a
-plain checkpoint, build a :class:`src.models.model.HippoModel` with
-matching dims and save it in the same ``{step, model_state_dict,
-optimizer_state_dict, loss, scaler_state_dict}`` shape
-:func:`src.training.checkpoint.save_checkpoint` writes. Once
-TPHippoModel's module registration is fixed upstream, this script
-loads both layouts transparently — the ``_is_tp_state_dict`` sniff
-already routes TP-shaped keys to the TPHippoModel loader.
+Both checkpoint layouts are now first-class:
+:class:`src.models.tp_model.TPHippoModel` stores its per-device
+submodules in ``nn.ModuleDict`` containers (fixed June 2026), so
+``model.state_dict()`` returns every trainable parameter with
+keys auto-prefixed by the container name
+(``replicated_per_device.<d>.<name>``, etc.). The
+``_is_tp_state_dict`` sniff below dispatches on those prefixes.
 
 Model loading
 -------------

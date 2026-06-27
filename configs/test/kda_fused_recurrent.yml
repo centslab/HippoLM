@@ -1,0 +1,40 @@
+# configs/test/kda_fused_recurrent.yml
+# -----------------------------------
+# KDA in fused_recurrent mode (the inference / single-token path).
+# This is a single-token step loop; the chunkwise Triton kernels
+# are NOT exercised. Useful to verify the model can be driven
+# recurrently without the chunkwise memory budget (e.g. for
+# generation workloads) and that the two code paths stay in sync
+# on a tiny fwd pass.
+#
+# Run: python scripts/train.py --config configs/test/kda_fused_recurrent.yml
+#
+# Inherits from ../base.yml (the production defaults).
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * kda_mode=fused_recurrent (was chunk)
+#   * use_short_conv=true (still required for the recurrent path)
+#   * Smaller dims: the recurrent path doesn't need the production
+#     K=128 head_dim to be representative; 64 is plenty to exercise
+#     the recurrence. Also keeps VRAM headroom on the 16G box.
+#   * use_dummy_data=true
+kda_mode: fused_recurrent
+use_short_conv: true
+
+num_heads: 2
+head_dim: 64
+hidden_size: 128
+intermediate_size: 256
+vocab_size: 512
+
+use_dummy_data: true
+
+batch_size: 1
+seq_len: 128
+gradient_accumulation_steps: 1
+max_steps: 2
+
+output_dir: output/kda_fused_recurrent
+log_interval: 1
+checkpoint_interval: 0

@@ -14,17 +14,44 @@ import os
 from pathlib import Path
 
 
+# Project-relative cache root. ``Path(__file__)`` is
+# ``<repo>/src/training/data/cache.py``; ``parents[3]`` is the
+# repo root. Used as the DEFAULT for :func:`get_cache_dir` so
+# that the cache lives next to the code (and travels with the
+# checkout) rather than in the user's home directory — this
+# matters when the dev box is throwaway (containers, CI runners,
+# shared multi-tenant hosts) where ``$HOME`` is not stable
+# across runs.
+#
+# Resolution is intentionally relative to the source file rather
+# than the cwd: the cache location is a property of the codebase,
+# not of wherever the user happened to invoke ``python`` from.
+_PROJECT_CACHE_ROOT = Path(__file__).resolve().parents[3] / ".cache" / "hippolm" / "datasets"
+
+
 def get_cache_dir() -> Path:
     """Return the local cache directory for downloaded parquet shards.
 
-    Honors the ``HIPPOLM_CACHE_DIR`` env var; defaults to
-    ``~/.cache/hippolm/datasets``. Creates the directory on first
-    call (idempotent).
+    Resolution order (first match wins):
+
+      1. ``HIPPOLM_CACHE_DIR`` env var — explicit override for
+         callers who need the cache on a different disk (e.g. a
+         fast SSD mount) or want to point at a shared location.
+      2. ``<repo_root>/.cache/hippolm/datasets`` — project-
+         relative default. Travels with the checkout, so two
+         worktrees of the same repo on the same machine get
+         separate caches (good — part-NN files would otherwise
+         collide).
+      3. **Removed**: the previous home-relative default
+         ``~/.cache/hippolm/datasets`` was the cause of cross-
+         environment pollution (CI runner cache from a prior
+         task ending up in the developer's home dir, etc.).
+         Set ``HIPPOLM_CACHE_DIR=~/.cache/hippolm/datasets`` to
+         restore the old behaviour if needed.
+
+    The directory is created on first call (idempotent).
     """
-    p = Path(
-        os.environ.get("HIPPOLM_CACHE_DIR")
-        or str(Path.home() / ".cache" / "hippolm" / "datasets")
-    )
+    p = Path(os.environ.get("HIPPOLM_CACHE_DIR") or _PROJECT_CACHE_ROOT)
     p.mkdir(parents=True, exist_ok=True)
     return p
 

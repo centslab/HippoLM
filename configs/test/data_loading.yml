@@ -1,0 +1,77 @@
+# configs/test/data_loading.yml
+# ----------------------------
+# Exercises the real streaming data path: ModelScope (or HF
+# fallback) → tokenize → collate → chunk-aligned packer → prefetch
+# batcher. The yml sets ``use_dummy_data: false`` so the streaming
+# pipeline is actually invoked (vs. the quick/tp*/kda* configs
+# that go through the random-token dummy loader).
+#
+# Run: python scripts/train.py --config configs/test/data_loading.yml
+#
+# Inherits from ../base.yml (production defaults).
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * use_dummy_data=false (REQUIRED — this is the whole point of
+#     the test; the streaming path must actually run)
+#   * Smaller dims so the test is fast (a few hundred microbatch
+#     forward/backwards per step, no big matmul time)
+#   * max_steps=1 (1 full step is enough to verify the pipeline
+#     produces real tokens; further steps are wasted time)
+#   * shuffle=false (faster first batch — the prod config has
+#     shuffle=false for the same reason)
+#   * pack_buffer_size=8 (the prod default of 128 would
+#     over-prefetch for a 1-step test)
+#   * log_interval=1 so the streaming log lines (MS discovery,
+#     download, tokenize) are visible in the run output
+#
+# What this test does NOT do:
+#   * Verify the streaming data is semantically correct
+#     (that's the smoke test on the production config).
+#   * Verify the cached parquet round-trips through multiple
+#     parts (only 1 part is needed for 1 step).
+#   * Verify MS vs. HF fallback (this depends on the network
+#     state at run time; the test is correct as long as either
+#     path delivers tokens).
+#
+# Network dependency
+# ------------------
+# The data path is **network-bound** — it tries ModelScope first
+# (faster Aliyun CDN), then falls back to HF. On a dev box
+# without fast CDN access, the first invocation can take many
+# minutes (the prefetch downloads ~1 GB of part-0 parquet).
+# Two knobs help:
+#
+#   * Set ``HIPPOLM_NO_PREFETCH=1`` in the environment to skip
+#     the pre-download — the streaming path will use MS or HF
+#     directly (still network-bound, but no 1 GB upfront cost).
+#   * Subsequent runs reuse the cache (now under
+#     ``<repo>/.cache/hippolm/datasets/`` after the v0.0.2
+#     cache move) and start within ~1 s.
+#
+# On a fully air-gapped dev box, this test will hang on the HF
+# fallback. That's expected — the yml is correct, the network
+# just isn't. The test exists to exercise the code path; the
+# actual data fetch is a property of the environment, not the
+# config.
+use_dummy_data: false
+
+num_layers: 2
+num_blocks: 2
+num_heads: 2
+head_dim: 32
+hidden_size: 64
+intermediate_size: 128
+vocab_size: 256
+
+batch_size: 2
+seq_len: 512
+gradient_accumulation_steps: 1
+max_steps: 1
+
+shuffle: false
+pack_buffer_size: 8
+
+output_dir: output/data_loading
+log_interval: 1
+checkpoint_interval: 0

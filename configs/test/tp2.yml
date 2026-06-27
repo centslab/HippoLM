@@ -1,0 +1,39 @@
+# configs/test/tp2.yml
+# -------------------
+# Tensor-parallel with world size 2, simulated on a single GPU
+# via gloo. The canonical "exercises the sharded code paths on
+# the dev box" config — same sharding math as a real 2x GPU run,
+# only the transport differs (NCCL → gloo, N processes pinned to
+# one device). Spawns 2 child processes; expect ~3-5x slowdown
+# vs. tp1 for the same dims because of the host-staged gloo
+# collectives.
+#
+# Run: python scripts/train.py --config configs/test/tp2.yml
+#
+# Inherits from ../base.yml (the production defaults).
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * tp_sim=true, tp_size=2 (the canonical smoke test combo)
+#   * Smaller dims + dummy data
+#   * No checkpoint save (the state_dict prefix check is covered
+#     by `test/test_tp_model_state_dict.py`)
+tp_sim: true
+tp_size: 2
+
+num_heads: 2
+head_dim: 64
+hidden_size: 128
+intermediate_size: 256
+vocab_size: 512
+
+use_dummy_data: true
+
+batch_size: 2
+seq_len: 512
+gradient_accumulation_steps: 1
+max_steps: 4
+
+output_dir: output/tp2
+log_interval: 1
+checkpoint_interval: 0

@@ -279,6 +279,59 @@ def _load_yaml(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def _load_yaml_with_extends(
+    path: str,
+    _visited: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Load a YAML file with optional ``extends: <relative-path>``
+    inheritance.
+
+    Parent is loaded first, then the child's top-level keys
+    shallow-override the parent's (child wins for any key it
+    specifies). The ``extends`` key is consumed and never reaches
+    ``set_defaults``.
+
+    This lets the configs/test/*.yml files list only the fields
+    they need to change from ``configs/base.yml`` rather than
+    duplicating the full base config. The merge is shallow by
+    design — predictable, easy to reason about, and matches what
+    most users expect from a yml overlay. If a child needs to
+    override one sub-key of a nested dict (e.g. just
+    ``precision.adamw_m.dtype``), it must repeat the whole
+    nested block.
+
+    The visited set guards against circular chains
+    (``a -> b -> a``) by absolute path.
+    """
+    import yaml
+    if _visited is None:
+        _visited = set()
+    abs_path = str(Path(path).resolve())
+    if abs_path in _visited:
+        raise ValueError(
+            f"Circular extends chain detected: {abs_path!r} already loaded. "
+            f"Chain: {sorted(_visited)}"
+        )
+    _visited.add(abs_path)
+    with open(path, "r") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"YAML root of {path!r} must be a mapping, got {type(data).__name__}"
+        )
+    extends = data.pop("extends", None)
+    if extends is None:
+        return data
+    # Resolve relative path against the *child's* directory, not
+    # the cwd — yml authors expect ``extends: ../base.yml`` to
+    # mean "sibling of the parent dir", not "sibling of cwd".
+    parent_path = str(Path(path).parent / extends)
+    parent = _load_yaml_with_extends(parent_path, _visited)
+    # Shallow merge: child wins for any key it specifies.
+    merged = {**parent, **data}
+    return merged
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse argv with yml-driven defaults; CLI flags win.
 
@@ -286,9 +339,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
       1. ``parse_known_args`` with the hardcoded defaults to
          discover ``--config`` (or the default ``configs/base.yml``).
-      2. Load the yml, ``parser.set_defaults(**yml_dict)`` so the
-         yml values become the parser defaults, then re-parse.
-         Any explicit CLI flag overrides the yml-set default.
+      2. Load the yml (with optional ``extends:`` resolution —
+         see :func:`_load_yaml_with_extends`), then
+         ``parser.set_defaults(**yml_dict)`` so the yml values
+         become the parser defaults, then re-parse. Any explicit
+         CLI flag overrides the yml-set default.
 
     Nested dicts (``precision: { ... }``) flow through as
     whole-dict attributes — ``set_defaults`` accepts any value,
@@ -305,7 +360,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     known, _ = parser.parse_known_args(argv)
     yml_path = Path(known.config)
     if yml_path.exists():
-        yml_dict = _load_yaml(str(yml_path))
+        yml_dict = _load_yaml_with_extends(str(yml_path))
         if yml_dict:
             parser.set_defaults(**yml_dict)
     return parser.parse_args(argv)

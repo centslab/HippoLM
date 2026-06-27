@@ -1,0 +1,38 @@
+# configs/test/no_short_conv.yml
+# ------------------------------
+# KDA in chunk mode with the short conv disabled. Exercises the
+# skip-short-conv code path in TPKDA / HippoModel — the
+# depthwise conv1d is bypassed and q/k/v flow straight into the
+# KDA chunkwise kernel. Useful when validating that the
+# use_short_conv=false path doesn't have a stale "shape: [B, T, H, K]"
+# assumption that was only correct for the conv-then-KDA path.
+#
+# Run: python scripts/train.py --config configs/test/no_short_conv.yml
+#
+# Inherits from ../base.yml (the production defaults).
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * use_short_conv=false (was true)
+#   * kda_mode=chunk (training path; recurrent doesn't need conv either
+#     but we want to exercise the chunkwise + no-conv combination)
+#   * Smaller dims + dummy data for fast interactive run
+kda_mode: chunk
+use_short_conv: false
+
+num_heads: 2
+head_dim: 64
+hidden_size: 128
+intermediate_size: 256
+vocab_size: 512
+
+use_dummy_data: true
+
+batch_size: 1
+seq_len: 512
+gradient_accumulation_steps: 2
+max_steps: 4
+
+output_dir: output/no_short_conv
+log_interval: 1
+checkpoint_interval: 0

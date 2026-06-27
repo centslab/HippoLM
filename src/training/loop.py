@@ -450,9 +450,12 @@ def _setup_worker(
     # :func:`flush_manual_flush_params` per microbatch (after
     # ``backward()`` returns) so we read the *complete* grad.
     manual_flush = []
-    embed_param = model.replicated_per_device[gpus[0]].get(
-        "embed_tokens", None
-    )
+    # nn.ModuleDict has no ``.get()`` (only ``__getitem__``), so fall
+    # back to an explicit ``in`` check. ``embed_tokens`` is always
+    # present in the current TPHippoModel layout, so the branch is
+    # only defensive against future layout changes.
+    device_mods = model.replicated_per_device[str(gpus[0])]
+    embed_param = device_mods["embed_tokens"] if "embed_tokens" in device_mods else None
     if embed_param is not None and hasattr(embed_param, "weight"):
         manual_flush.append(embed_param.weight)
     register_grad_offload_hooks(

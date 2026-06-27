@@ -1,0 +1,42 @@
+# configs/test/quick.yml
+# -------------------
+# Cheapest end-to-end sanity check. ~30s on the 5060 Ti 16G.
+# Use this to verify the basic forward / backward / optimizer /
+# checkpoint roundtrip works after a code change, before running
+# the longer TP or KDA-mode variants.
+#
+# Run: python scripts/train.py --config configs/test/quick.yml
+#
+# Inherits from ../base.yml (the production defaults: precision,
+# optimizer hparams, data source, etc.) and overrides only the
+# test-specific fields below.
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * use_dummy_data=true (no streaming / tokenize)
+#   * Smaller model: 2 layers / 2 blocks / 2 heads
+#   * 2 microbatch steps, no gradient accumulation
+#   * No TP sim, no checkpoint save
+use_dummy_data: true
+
+num_layers: 2
+num_blocks: 2
+num_heads: 2
+head_dim: 32
+hidden_size: 64
+intermediate_size: 128
+vocab_size: 256
+
+batch_size: 2
+seq_len: 256
+gradient_accumulation_steps: 1
+max_steps: 2
+
+output_dir: output/quick
+log_interval: 1
+checkpoint_interval: 0
+
+# WSD LR needs > lr_warmup_steps + lr_decay_steps to actually enter
+# the stable phase. Quick is too short — leave both at 0 (constant LR).
+lr_warmup_steps: 0
+lr_decay_steps: 0

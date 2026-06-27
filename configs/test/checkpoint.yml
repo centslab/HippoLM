@@ -1,0 +1,44 @@
+# configs/test/checkpoint.yml
+# --------------------------
+# Exercises the model-weight checkpoint save path. The yml sets
+# ``checkpoint_interval: 1`` so a checkpoint file is written on
+# every step, and the post-step loop's checkpoint pruner
+# (``checkpoint_keep_last_n: 1``) is exercised too — after the
+# 2nd save, the step-0 file is deleted so only the step-1 file
+# remains.
+#
+# Run: python scripts/train.py --config configs/test/checkpoint.yml
+#
+# Inherits from ../base.yml (production defaults).
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * checkpoint_interval=1 (save every step; default 1 already,
+#     pinned here for explicitness)
+#   * checkpoint_keep_last_n=1 (prune older after each save; the
+#     default is 3 — pin to 1 to exercise the pruner on this short run)
+#   * Smaller dims so the checkpoint file is small (a few hundred KB)
+#   * use_dummy_data=true (focus on checkpoint path, not data)
+#   * max_steps=3 (one full save + one prune cycle)
+#   * No TP sim (1 process — checkpoint save/load semantics are
+#     identical with TP sim, but the file IO is simpler to reason
+#     about for the single-process case)
+use_dummy_data: true
+
+num_layers: 2
+num_blocks: 2
+num_heads: 2
+head_dim: 32
+hidden_size: 64
+intermediate_size: 128
+vocab_size: 256
+
+batch_size: 2
+seq_len: 256
+gradient_accumulation_steps: 1
+max_steps: 3
+
+output_dir: output/checkpoint
+log_interval: 1
+checkpoint_interval: 1
+checkpoint_keep_last_n: 1

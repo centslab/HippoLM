@@ -1,0 +1,41 @@
+# configs/test/tp1.yml
+# -------------------
+# Tensor-parallel with world size 1. Verifies that the TP code
+# paths (column-parallel Q/K/V, row-parallel O, column-parallel
+# gate+up, row-parallel down) all run when there's only one rank
+# — i.e. the sharding math collapses to a plain replicate, no
+# collectives are issued, and the lm_head loss returns a sensible
+# number. This is the cheap way to check that a TP-related change
+# didn't break the rank-1 fast path (some "always all-reduce"
+# patterns silently no-op on world=1; some don't).
+#
+# Run: python scripts/train.py --config configs/test/tp1.yml
+#
+# Inherits from ../base.yml (the production defaults).
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * tp_size=1 (no need for --tp_sim at world=1; the launcher
+#     just spawns one process)
+#   * Smaller dims + dummy data
+#   * No checkpoint save (state_dict roundtrip is covered by
+#     `test/test_tp_model_state_dict.py`; this is a forward/backward
+#     check)
+tp_size: 1
+
+num_heads: 2
+head_dim: 64
+hidden_size: 128
+intermediate_size: 256
+vocab_size: 512
+
+use_dummy_data: true
+
+batch_size: 1
+seq_len: 512
+gradient_accumulation_steps: 1
+max_steps: 4
+
+output_dir: output/tp1
+log_interval: 1
+checkpoint_interval: 0
