@@ -43,6 +43,7 @@ from src.training.data import (
     StreamingDataset,
     dummy_dataloader,
 )
+from src.training.data.cache import purge_stale_cache_if_no_hit
 from src.training.diagnostics import log_post_opt_diag, log_pre_step_diag
 from src.training.param_offload import (
     accumulate_grads_to_cpu,
@@ -296,6 +297,31 @@ def _setup_worker(
             all_queues = list(shared_batch_queues)
         if rank == 0:
             tokenizer = load_tokenizer(args.tokenizer_path)
+            # Pre-training cache integrity check: gather the expected
+            # (ms_name, config_name) tuples for THIS run, then purge
+            # the cache if NONE of them have a hit. Prevents stale
+            # parquets from a *previous* dataset the dev box trained
+            # on from accumulating disk forever. See
+            # :func:`purge_stale_cache_if_no_hit` for the contract.
+            if args.stage == "sft":
+                expected_cache_keys = [
+                    (args.sft_dataset_ms, args.sft_config),
+                ]
+            elif getattr(args, "pretrain_multi_source", False):
+                expected_cache_keys = [
+                    (args.pretrain_dataset_ms, args.pretrain_en_multi_config),
+                    (args.pretrain_dataset_ms, args.pretrain_zh_multi_config),
+                    (args.pretrain_dataset_ms, args.pretrain_en_qa_config),
+                    (args.pretrain_dataset_ms, args.pretrain_zh_qa_config),
+                ]
+            else:
+                expected_cache_keys = [
+                    (args.pretrain_dataset_ms, args.pretrain_config),
+                ]
+            purge_stale_cache_if_no_hit(
+                expected_cache_keys, log=logger,
+            )
+
             if args.stage == "sft":
                 hf_name = args.sft_dataset_hf
                 ms_name = args.sft_dataset_ms

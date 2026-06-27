@@ -472,9 +472,30 @@ class RotatingParquetIterable:
         if self._part_idx + 1 >= len(self._parts):
             return
         evict_path = self._current_path
+        # Wait for the in-flight bg download of the next part to
+        # finish before opening it. Without this join, _open_current_part
+        # would race against the writer: cache_path doesn't exist yet
+        # (the rename happens at the end of _download_fn), so the
+        # "missing-or-wrong-size" check below kicks off a SECOND
+        # download that opens the same .part in "wb" mode and
+        # truncates the writer's output — pyarrow then reads 0 bytes
+        # from the final cache_path ("Parquet file size is 0 bytes").
+        # The join is a no-op when the bg download already finished
+        # (the common case on a fast link), and a bounded wait
+        # otherwise (matches what _open_current_part's sync fallback
+        # would have done anyway).
+        next_idx = self._part_idx + 1
+        if (
+            self._next_dl_thread is not None
+            and self._next_dl_part_idx == next_idx
+        ):
+            self._next_dl_thread.join()
+            self._next_dl_thread = None
         self._part_idx += 1
-        # Open the new part. If the background download hasn't
-        # finished yet, this will block (synchronous fallback).
+        # Open the new part. The bg download above (if any) is
+        # done by now, so cache_path either exists or the bg
+        # download failed — the latter triggers the normal sync
+        # retry inside _open_current_part.
         self._open_current_part()
         # The previous "next" is now the current, so drop the
         # ``_next_path`` reference; the new next (if any) will be

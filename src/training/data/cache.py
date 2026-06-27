@@ -10,6 +10,7 @@ lazily on first access; it is NOT created at module import time
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -117,3 +118,76 @@ def list_cached_parts(
                 continue
     out.sort()
     return out
+
+
+def purge_stale_cache_if_no_hit(
+    expected: list[tuple[str, str | None]],
+    cache_dir: Path | None = None,
+    log: logging.Logger | None = None,
+) -> int:
+    """Pre-training cache integrity check.
+
+    For each ``(ms_name, config_name)`` in ``expected``, check if any
+    matching cached parquet file exists in ``cache_dir``. If NONE
+    of them have any cache hit (the cache is empty OR holds only
+    parquets from a *different* dataset), clear ALL ``*.parquet``
+    files from the cache directory to prevent stale accumulation
+    across runs of different datasets.
+
+    Returns the number of files cleared. Zero means either:
+
+      - any expected config had a cache hit (caller will reuse), OR
+      - the cache was already empty (nothing to clear).
+
+    Idempotent — safe to call multiple times.
+
+    Rationale: the rotator's existing eviction contract keeps at
+    most ``max_cache_files`` (default 2) parquets for the *current*
+    dataset, but says nothing about parquets left over from a
+    *previous* dataset the dev box trained on. Those leftovers
+    accumulate disk usage forever. The "no hit for any expected
+    config" signal is a strong indicator we're starting a fresh
+    training run on a fresh dataset — purge everything to bound
+    the cache at zero before re-populating.
+
+    Called from :func:`src.training.loop._setup_worker` once on
+    rank 0 before any dataset is instantiated (so the purge happens
+    before :class:`RotatingParquetIterable` tries to reuse a
+    now-deleted cached part).
+    """
+    logger = log or logging.getLogger(__name__)
+    base = cache_dir if cache_dir is not None else get_cache_dir()
+
+    # 1. Did ANY expected config have a cache hit?
+    any_hit = False
+    for ms_name, cfg in expected:
+        cached = list_cached_parts(ms_name, cfg, cache_dir=base)
+        if cached:
+            any_hit = True
+            logger.info(
+                f"cache: hit for {ms_name} (config={cfg!r}):"
+                f" {len(cached)} part(s) on disk; skipping purge"
+            )
+            break
+
+    if any_hit:
+        return 0
+
+    # 2. No hit anywhere — clear every parquet in the cache dir.
+    cleared = 0
+    if not base.exists():
+        return 0
+    for p in base.iterdir():
+        if p.is_file() and p.name.endswith(".snappy.parquet"):
+            try:
+                p.unlink()
+                cleared += 1
+            except OSError as e:
+                logger.warning(
+                    f"cache: failed to clear stale file {p}: {e}"
+                )
+    logger.info(
+        f"cache: no hit for any of {len(expected)} expected config(s);"
+        f" cleared {cleared} stale parquet file(s) from {base}"
+    )
+    return cleared
