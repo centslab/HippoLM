@@ -133,14 +133,27 @@ def _chunk_o(
     scale: float,
     H: int, HV: int, K: int, V: int, V_TILE: int,
 ) -> torch.Tensor:
-    """Run chunk_o_kernel. Returns o [T_total, HV, V] bf16.
+    """Run chunk_o kernel. Returns o [T_total, HV, V] bf16.
 
     Output contract (matches FLA chunk_gla_fwd_o_gk):
         o[i, v] = (q[i] @ (exp2(g_cum[i]) * h)) * scale + Aqk @ v_new
     where ``A_qk`` is the local causal matrix with ``scale`` already baked in
     (computed by the intra phase). The q^Th contribution picks up scale
     ONCE; the Aqk @ v_new contribution picks it up via the pre-scaled Aqk.
+
+    Round-2: defaults to the Triton kernel (10× faster than the hand-rolled
+    CUDA). CUDA is kept as a fallback via the ``HIPPOLM_KDA_CHUNK_O_BACKEND``
+    env var — useful for debugging or environments without Triton.
     """
+    import os
+    backend = os.environ.get("HIPPOLM_KDA_CHUNK_O_BACKEND", "triton").lower()
+    if backend == "triton":
+        from .triton_kernels import triton_chunk_o
+        return triton_chunk_o(
+            q, v_new, g_cum, A_qk, h, chunk_token_base,
+            num_chunks, scale, H, HV, K, V,
+        )
+    # Fallback: hand-rolled CUDA
     mod = _ensure_compiled()
     T_total = q.shape[0]
     o = torch.empty(T_total, HV, V, dtype=torch.bfloat16, device=q.device)
