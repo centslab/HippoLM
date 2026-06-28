@@ -102,6 +102,7 @@ def _kda_recurrence_kernel(
     BLOCK_M: tl.constexpr,  # CHUNK = 16
     BLOCK_K: tl.constexpr,  # K (full)
     BLOCK_V: tl.constexpr,  # V per program
+    NUM_STAGES: tl.constexpr,  # pipelining depth for chunk loop
 ):
     pid_h = tl.program_id(0)
     pid_vs = tl.program_id(1)  # V-slice index
@@ -127,7 +128,7 @@ def _kda_recurrence_kernel(
         h_prev = tl.zeros([BLOCK_K, BLOCK_V], dtype=tl.float32)
 
     # ---------------- Sequential chunk loop ---------------- #
-    for c in tl.range(0, NC, num_stages=3):
+    for c in tl.range(0, NC, num_stages=NUM_STAGES):
         # Load workspace + V_chunk for chunk c
         mqk = tl.load(
             mqk_ptr + c * stride_mqk_nc + pid_h * stride_mqk_h
@@ -175,27 +176,27 @@ def _kda_recurrence_kernel(
         h_contrib = tl.dot(tl.trans(k_res), v_chunk)
         h_new = h_decayed + h_contrib  # [K, V], fp32
 
-        # Store h[c] (intermediate for next chunk, or final state)
+        # Keep h_prev resident in registers for the next iteration.
+        # The gmem write/read pair (previous version) was the bottleneck:
+        # 8KB write + 8KB read per chunk, * 1024 chunks = 16MB wasted per program.
+        h_prev = h_new
+
+        # Persist the LAST chunk only (callers want final_state; intermediate
+        # h[c] for c < NC-1 is not consumed downstream).
         is_last = c == (NC - 1)
-        if is_last and STORE_HT:
-            tl.store(
-                ht_ptr + pid_b * stride_ht_b + pid_h * stride_ht_h
-                + offs_k[:, None] * V + (v_off + offs_v_local)[None, :],
-                h_new,
-            )
-        else:
+        if is_last:
+            if STORE_HT:
+                tl.store(
+                    ht_ptr + pid_b * stride_ht_b + pid_h * stride_ht_h
+                    + offs_k[:, None] * V + (v_off + offs_v_local)[None, :],
+                    h_new,
+                )
+            # Mirror last chunk into h_intermediate[NC-1] for API compatibility.
             tl.store(
                 h_ptr + c * stride_h_nc + pid_h * stride_h_h
                 + offs_k[:, None] * V + (v_off + offs_v_local)[None, :],
                 h_new.to(tl.bfloat16),
             )
-
-        # Update h_prev for next iteration
-        if not is_last:
-            h_prev = tl.load(
-                h_ptr + c * stride_h_nc + pid_h * stride_h_h
-                + offs_k[:, None] * V + (v_off + offs_v_local)[None, :]
-            ).to(tl.float32)
 
 
 # ===================================================================== #
@@ -212,12 +213,15 @@ def kda_recurrence_triton(
     initial_state: torch.Tensor | None = None,  # [B, H, K, V] fp32
     output_final_state: bool = True,
     BLOCK_V: int = 16,
+    NUM_STAGES: int | None = None,  # None → pick by shape (4 for prod, 2 for small)
 ):
-    """Compute O and per-chunk state h via the KDA recurrence.
+    """Compute O and the KDA recurrence.
 
     Returns:
         o: [B, T, H, V] bf16
-        h_intermediate: [NC, H, K, V] bf16 (state at end of each chunk)
+        h_intermediate: [NC, H, K, V] bf16 — only the last chunk (c == NC-1)
+            is populated; intermediate chunks are uninitialized (callers
+            downstream don't consume them, so we skip the allocation cost).
         final_state: [B, H, K, V] fp32 (or None if output_final_state=False)
     """
     NC, H, _, K = q_decayed.shape
@@ -229,9 +233,17 @@ def kda_recurrence_triton(
     device = v.device
     dtype = v.dtype
 
-    # Allocate outputs
+    # Pipelining depth: longer pipelines help with lots of independent chunks
+    # (more ILP), but short pipelines beat the setup cost on small NC. The
+    # prod shape (NC=1024) wants ns=4; the small shape (NC=16) wants ns=2.
+    if NUM_STAGES is None:
+        NUM_STAGES = 4 if NC >= 256 else 2
+
+    # Allocate outputs. h_intermediate uses torch.empty (no memset) because
+    # only the last chunk is written — saves ~400MB of zero-fill at prod shape
+    # (NC=1024, H=12, K=V=128 bf16 = 400MB), which costs ~1ms.
     o = torch.empty(B, T, H, V, dtype=dtype, device=device)
-    h_intermediate = torch.zeros(NC, H, K, V, dtype=torch.bfloat16, device=device)
+    h_intermediate = torch.empty(NC, H, K, V, dtype=torch.bfloat16, device=device)
     if output_final_state:
         final_state = torch.empty(B, H, K, V, dtype=torch.float32, device=device)
     else:
@@ -266,5 +278,6 @@ def kda_recurrence_triton(
         BLOCK_M=CHUNK,
         BLOCK_K=K,
         BLOCK_V=BLOCK_V,
+        NUM_STAGES=NUM_STAGES,
     )
     return o, h_intermediate, final_state
