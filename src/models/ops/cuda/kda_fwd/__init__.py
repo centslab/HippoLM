@@ -272,34 +272,10 @@ def chunk_kda_fwd(
     # g_last per chunk: [num_chunks, HV, K] = g_cum[:, BT-1, :, :] (in fp32)
     g_last = g_cum_fp32[:, BT - 1, :, :].contiguous()  # [num_chunks, HV, K] fp32
 
-    # ----- middle-aligned decay scales (matches FLA chunk_intra's trick) -----
-    # FLA's chunk_intra token_parallel kernel subtracts the SUB-CHUNK's
-    # MIDDLE g_cum (not the chunk's last g_cum) before exp2 to keep
-    # exponents in [-85, 85] range — see chunk_intra.py line 709-710:
-    #   "current block, keep numerical stability by subtracting the left
-    #    boundary less than 85 to avoid overflow in exp2"
-    # With BC=16, sub-chunks are 16-wide; the middle is at offset 8.
-    # For each sub-chunk s in [0, BC): anchor g_cum[s * BC + BC//2].
-    BC = 16
-    sub_idx = torch.arange(BT, device=q.device)  # [BT] in [0, BT)
-    sub_id = sub_idx // BC                      # [BT] sub-chunk id in [0, NC)
-    sub_mid = sub_id * BC + (BC // 2)           # [BT] absolute offset of sub-chunk middle
-    # g_sub_mid[c, i, hv, k] = g_cum[c, sub_mid[i], hv, k]
-    g_sub_mid = g_cum_fp32[:, sub_mid, :, :]    # [num_chunks, BT, HV, K] fp32
-    # Now compute r and c relative to sub-chunk middle (instead of chunk last).
-    # r[i] = exp2(g_cum[i] - g_sub_mid[i])   for causal A_qk/A_kk
-    # c[i] = exp2(g_sub_mid[i] - g_cum[i])
-    chunk_ids = torch.arange(num_chunks, device=q.device).repeat_interleave(BT)
-    g_cum_tok_fp32 = g_cum_fp32.view(T_total, HV, K).contiguous()
-    r_intra = (g_cum_tok_fp32 - g_sub_mid.view(T_total, HV, K)).exp2().to(torch.bfloat16)
-    c_intra = (g_sub_mid.view(T_total, HV, K) - g_cum_tok_fp32).exp2().to(torch.bfloat16)
-    # The chunk_o output uses scale-baked A_qk with the SAME middle-aligned
-    # scale, so the math is self-consistent (the masking in chunk_intra
-    # already absorbed the unaligned contribution).
-
-    # r_global / c_global still needed by delta_h for the per-token decay.
-    r_global = (g_cum_tok_fp32 - g_last[chunk_ids]).exp2().to(torch.bfloat16)  # exp2(g - g_last)
-    c_global = (g_last[chunk_ids] - g_cum_tok_fp32).exp2().to(torch.bfloat16)  # exp2(g_last - g)
+    # (The middle-aligned r/c scales for the intra loop are computed
+    # inline below in the (s_i, s_j) pair loop — no need to precompute
+    # them here.)
+    BC = 16  # sub-chunk width — matches FLA chunk_intra's token_parallel path
 
     # ----- batched matmuls for A_qk and A_kk (block-by-block, FLA-exact) -----
     # FLA's intra splits the [BT, BT] causal matrix into BC x BC sub-chunks.
@@ -350,11 +326,11 @@ def chunk_kda_fwd(
         else:
             anchor_pos = s_i * BC                # ROW sub-chunk start
         # Anchor g_cum at anchor_pos, shape [num_chunks, HV, K] fp32
-        g_anchor = g_per[:, :, anchor_pos, :].contiguous()  # [num_chunks, HV, K]
+        g_anchor = g_per[:, :, anchor_pos, :]  # [num_chunks, HV, K]
         # r block: exp2(g_cum[i] - g_anchor) for i in [s_i*BC, (s_i+1)*BC)
         # c block: exp2(g_anchor - g_cum[j]) for j in [s_j*BC, (s_j+1)*BC)
-        g_row = g_per[:, :, s_i*BC:(s_i+1)*BC, :].contiguous()  # [NC, HV, BC, K]
-        g_col = g_per[:, :, s_j*BC:(s_j+1)*BC, :].contiguous()
+        g_row = g_per[:, :, s_i*BC:(s_i+1)*BC, :]  # [NC, HV, BC, K]
+        g_col = g_per[:, :, s_j*BC:(s_j+1)*BC, :]
         r_block = (g_row - g_anchor.unsqueeze(2)).exp2()  # [NC, HV, BC, K] fp32
         c_block = (g_anchor.unsqueeze(2) - g_col).exp2()
         # q / k blocks: q for row sub-chunk s_i, k_col for col sub-chunk s_j.
@@ -382,7 +358,6 @@ def chunk_kda_fwd(
         A_kk[:, s_i*BC:(s_i+1)*BC, s_j*BC:(s_j+1)*BC] = A_kk_block
 
     # Apply beta to A_kk
-    beta_per_blocked = beta_per.unsqueeze(-1).expand(num_chunks, HV, BT, 1)  # not used
     # beta is per-token: shape [num_chunks, HV, BT]
     # In stacked [num_chunks*HV, BT, BT] layout, beta is [num_chunks*HV, BT]
     beta_stacked = beta_per.reshape(num_chunks * HV, BT)
@@ -408,7 +383,7 @@ def chunk_kda_fwd(
     # and chunk_o consumes v_new (NOT raw v) plus the q^Th contribution scaled
     # by exp2(g_cum[i]) and the local-qk contribution via Aqk (which already
     # has scale baked in).
-    v_per = v_tok.view(num_chunks, BT, HV, V).transpose(1, 2).contiguous()  # [NC, HV, BT, V]
+    # Reuse v_per from above (line ~321).
     v_per_stacked = v_per.view(num_chunks * HV, BT, V)
     k_per_stacked = k_per.view(num_chunks * HV, BT, K)
     beta_stacked = beta_per.reshape(num_chunks * HV, BT)
