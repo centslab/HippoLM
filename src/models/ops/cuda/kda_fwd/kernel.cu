@@ -143,7 +143,7 @@ __global__ void forward_sub_kernel(
 // Templated on K, V, V_TILE.                                          //
 // ===================================================================== //
 template<int K, int V, int V_TILE>
-__global__ void delta_h_kernel(
+__global__ void __launch_bounds__(256, 2) delta_h_kernel(
     const __nv_bfloat16* __restrict__ k,           // [T_total, H, K]
     const __nv_bfloat16* __restrict__ u,           // [T_total, HV, V]   = A_inv @ (v * beta)
     const __nv_bfloat16* __restrict__ w,           // [N_chunks, HV, BT, K] = A_inv @ (k * beta * exp2(g_cum))
@@ -187,13 +187,15 @@ __global__ void delta_h_kernel(
         const int token_base = chunk_token_base[chunk_id];
 
         // ----- store h at START of this chunk (to global) -----
+        // No __syncthreads needed: nothing in this iteration reads h_dst.
+        // The output is consumed by a downstream kernel (chunk_o) which
+        // sees consistent data via the kernel-launch boundary.
         float* h_dst = h_per_chunk + ((chunk_id * HV + i_h) * K * V) + v_start;
         for (int idx = tid; idx < K * V_TILE; idx += nthreads) {
             const int kk = idx / V_TILE;
             const int vj = idx % V_TILE;
             h_dst[kk * V + vj] = h_prev[idx];
         }
-        __syncthreads();
 
         // ----- pointers (correct strides for [T, H/HV, K/V] layout) -----
         // k:   [T, H,  K] -> stride H*K
@@ -230,6 +232,10 @@ __global__ void delta_h_kernel(
         __syncthreads();
 
         // ----- step 2: write UN-DECAYED v_new to v_new_out (chunk_o reads this) -----
+        // No __syncthreads needed: step 5 reads v_new_smem (already
+        // synced at the end of step 3), not v_new_out. v_new_out is
+        // consumed by the next kernel (chunk_o) which has its own
+        // kernel-launch boundary for memory consistency.
         {
             __nv_bfloat16* v_new_dst = v_new_out + (token_base * HV + i_h) * V;
             for (int idx = tid; idx < BT * V_TILE; idx += nthreads) {
@@ -239,7 +245,6 @@ __global__ void delta_h_kernel(
                     __float2bfloat16(v_new_smem[i * V_TILE + vj]);
             }
         }
-        __syncthreads();
 
         // ----- step 3: h_prev[k, vj] = exp2(g_last[k]) * h_prev[k, vj] -----
         //                      + sum_i k[i, k] * v_new[i, vj] (UN-DECAYED) -----
