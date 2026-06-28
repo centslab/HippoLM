@@ -56,6 +56,7 @@ def _chunk_o_kernel(
     g_p   = g   + (token_base * g_token_stride)   + i_h * K
     A_p   = A_qk + (i_t * HV + i_h) * BT * BT
     h_p   = h   + (i_t * HV + i_h) * K * V
+    o_p   = o   + (token_base * v_token_stride)  + i_h * V
 
     v_start = i_v * BV
 
