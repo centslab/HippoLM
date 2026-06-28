@@ -22,21 +22,6 @@ sys.path.insert(0, str(_REPO))
 from src.models.ops._triton.fast_kda.prepare import kda_prepare_triton
 from src.models.ops._triton.fast_kda.recurrence import kda_recurrence_triton
 from src.models.ops._vendored.fla.ops.kda import chunk_kda
-from __future__ import annotations
-
-import argparse
-import math
-import sys
-from pathlib import Path
-
-import torch
-
-_REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO))
-
-from src.models.ops._triton.fast_kda.prepare import kda_prepare_triton
-from src.models.ops._triton.fast_kda.recurrence import kda_recurrence_triton
-from src.models.ops._vendored.fla.ops.kda import chunk_kda
 
 
 CHUNK = 16
@@ -99,7 +84,6 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--shape", default="all", choices=list(SHAPES.keys()) + ["all"])
     p.add_argument("--iters", type=int, default=20)
-    p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--seed", type=int, default=7)
     args = p.parse_args()
@@ -125,30 +109,22 @@ def main():
         dt_bias = torch.randn(H, K, device=device, dtype=torch.float32) * 0.5
 
         # 1. Prepare alone
-        ws_cache = {}
-        def _prep():
-            ws_cache.clear()
-            ws_cache.update(kda_prepare_triton(q, k, g, beta, A_log, dt_bias, -5.0, scale))
-        prep_ms = _bench(_prep, args.iters)
+        prep_ms = _bench(
+            lambda: kda_prepare_triton(q, k, g, beta, A_log, dt_bias, -5.0, scale),
+            args.iters,
+        )
 
-        # 2. Recurrence alone (re-prepare to be safe; cache invalidation not worth it)
-        prep_ms2 = prep_ms  # used in combined timing
+        # 2. Recurrence alone (subtract prepare cost)
         def _rec():
             ws = kda_prepare_triton(q, k, g, beta, A_log, dt_bias, -5.0, scale)
             kda_recurrence_triton(
                 ws["q_decayed"], ws["k_restored"], ws["g_total"], ws["Mqk"], v,
             )
-        rec_ms = _bench(_rec, args.iters)
-        # Subtract prepare to isolate recurrence
-        rec_only_ms = max(rec_ms - prep_ms2, 0.01)
+        rec_total_ms = _bench(_rec, args.iters)
+        rec_only_ms = max(rec_total_ms - prep_ms, 0.01)
 
         # 3. End-to-end (prep + rec)
-        def _fwd():
-            ws = kda_prepare_triton(q, k, g, beta, A_log, dt_bias, -5.0, scale)
-            kda_recurrence_triton(
-                ws["q_decayed"], ws["k_restored"], ws["g_total"], ws["Mqk"], v,
-            )
-        fwd_ms = _bench(_fwd, args.iters)
+        fwd_ms = rec_total_ms
 
         # 4. FLA reference
         fla_ms = _bench(
@@ -179,12 +155,11 @@ def main():
     in_bytes_p += T * H * dtype_bytes  # beta
     in_bytes_p += H * fp32_bytes + H * K * fp32_bytes  # A_log, dt_bias
 
-    # Workspace out: qd, kr (each NC*H*CHUNK*K bf16), gt (NC*H*K fp32), Mqk (NC*H*CHUNK*CHUNK bf16)
     out_bytes_p = (NC * H * CHUNK * K * dtype_bytes * 2  # qd, kr
                    + NC * H * K * fp32_bytes  # gt
                    + NC * H * CHUNK * CHUNK * dtype_bytes)  # Mqk
     total_bytes_p = in_bytes_p + out_bytes_p
-    flops_p = NC * H * CHUNK * CHUNK * K * 2 * 2  # two bmms (L=Mqk, but wk = wy too)
+    flops_p = NC * H * CHUNK * CHUNK * K * 2 * 2
     print(f"  inputs:   {in_bytes_p/1024/1024:.1f} MB")
     print(f"  outputs:  {out_bytes_p/1024/1024:.1f} MB")
     print(f"  total:    {total_bytes_p/1024/1024:.1f} MB")
@@ -195,21 +170,15 @@ def main():
 
     # =================== Recurrence kernel ===================
     print("\n[Recurrence] Inputs + state I/O:")
-    # Reads: qd, kr, gt, Mqk (workspace from prepare), V (T*H*V bf16), h_inter (NC*H*K*V bf16)
     in_bytes_r = (NC * H * CHUNK * K * dtype_bytes * 2  # qd, kr
                   + NC * H * K * fp32_bytes  # gt
                   + NC * H * CHUNK * CHUNK * dtype_bytes  # Mqk
                   + T * H * V * dtype_bytes  # v
                   + NC * H * K * V * dtype_bytes)  # h_inter (read+written each chunk)
-    # Writes: O (T*H*V bf16), h_inter (NC*H*K*V bf16), final_state (H*K*V fp32)
     out_bytes_r = (T * H * V * dtype_bytes  # o
                    + NC * H * K * V * dtype_bytes  # h_inter
                    + H * K * V * fp32_bytes)  # final_state
     total_bytes_r = in_bytes_r + out_bytes_r
-    # FLOPs: per chunk, o_attn (CHUNKxCHUNK @ CHUNKxV) + o_state (CHUNKxK @ KxV)
-    #        + h_contrib (KxCHUNK @ CHUNKxV)
-    # Each is 2 * M * N * K FLOPs (per chunk)
-    # Per chunk: 2*CHUNK*CHUNK*V + 2*CHUNK*K*V + 2*K*CHUNK*V
     flops_r_per_chunk = (2 * CHUNK * CHUNK * V + 2 * CHUNK * K * V + 2 * K * CHUNK * V)
     flops_r = NC * H * flops_r_per_chunk
     print(f"  reads:    {in_bytes_r/1024/1024:.1f} MB")
@@ -228,10 +197,6 @@ def main():
 
     # =================== Combined fwd ===================
     print("\n[Combined fwd] prepare + recurrence:")
-    # Note: h_inter is produced by recurrence (not an input to prepare).
-    # So total unique I/O is union of prepare inputs + recurrence unique I/O.
-    # Prepare outputs (qd, kr, gt, Mqk) sit in gmem between the two kernels.
-    # Combined unique I/O:
     combined_in = (T * H * K * dtype_bytes * 3  # q, k, g
                    + T * H * dtype_bytes  # beta
                    + H * fp32_bytes + H * K * fp32_bytes  # A_log, dt_bias
