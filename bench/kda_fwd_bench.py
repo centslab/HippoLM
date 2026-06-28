@@ -26,24 +26,36 @@ Notes
   the Python wrappers for A_qk/A_kk/bmm-of-w-u are torch.bmm calls
   and we time them with a profiler hook.
 
-Round-1 Perf Findings (prod shape B=1 T=16384 H=12 K=128 V=128)
+Round-2 Perf Findings (prod shape B=1 T=16384 H=12 K=128 V=128)
 ----------------------------------------------------------------
-Stage breakdown from bench/kda_fwd_stage_breakdown.py:
-  intra (10-pair bmm loop):   19.4 ms  <- #1 bottleneck, no tensor cores
-  delta_h kernel:             17.8 ms  <- #2 bottleneck, serial loops
+Stage breakdown (post-Round-2, opt #4 WMMA delta_h merged):
+  intra (10-pair bmm loop):   19.4 ms  <- #1 remaining bottleneck, no tensor cores
+  delta_h kernel:              4.4 ms  <- WMMA tensor cores (was 14.8 ms, -71%)
   wy_transform (u, w bmm):     4.7 ms
-  forward_sub kernel:          0.65 ms <- already efficient
-  chunk_o kernel:             ~23 ms   <- (no tensor cores, shmem-bound)
-  --- total CUDA:             ~66 ms
-  FLA Triton reference:        5.2 ms  <- 12.7x faster
+  forward_sub kernel:          0.65 ms
+  chunk_o kernel (Triton):    ~3 ms    <- was ~23 ms CUDA
+  --- subtotal:              ~32 ms
+  FLA Triton reference:        5.2 ms  <- 6.1x slower (down from 12.7x)
 
-Root cause: the custom CUDA kernels (delta_h, chunk_o) and the
-intra_solve bmm loop are all at ~0.2% of bf16 tensor-core peak
-(~100 TFLOPS theoretical, ~200 GFLOPS observed). The fix for
-Round 2 is to use Triton for the custom kernels (its autotuner
-will pick optimal tensor-core tile sizes), and to batch the 10-pair
-intra_solve bmm into a single large bmm so cuBLAS picks a better
-kernel.
+Round-2 fixes (all merged on feature/cuda-kernel-optim):
+  R2A  (cuda): chunk_o → Triton, biggest single bottleneck (~20 ms)
+  opt#2 (cuda): delta_h launch_bounds + 2 redundant __syncthreads (~3 ms)
+  opt#3 (cuda): wrapper dead-code + redundant .contiguous() removal (~10 ms)
+  opt#4 (cuda): WMMA delta_h (TF32 tensor cores, biggest remaining win) (~10 ms)
+  opt#5 (cuda): intra_solve + wy_transform fusion — NO ROI (reverted)
+  opt#6 (cuda): intra_solve precomputed r/c — NO ROI (reverted; 19.86 ms
+               precompute > 16 ms original; precompute is dominated by
+               elementwise exp2 + mul on large tensors, not the bmms)
+
+Remaining gap to FLA Triton: ~27 ms, concentrated in intra_solve (60%
+of total). Custom CUDA WMMA intra_solve kernel that fuses exp2 + mul +
+bmm is the only path forward — estimated savings ~10-15 ms but a
+multi-day kernel effort.
+
+ncu bottleneck analysis was blocked by driver incompatibility:
+  - ncu 2025.1.1.0 vs driver 580.76.05 (CUDA 13.0) — CUPTI LibraryNotLoaded
+  - torch.profiler also fails with CUPTI_ERROR_INVALID_DEVICE
+  - Manual CUDA-event stage breakdown used instead (results above).
 """
 from __future__ import annotations
 
@@ -239,21 +251,25 @@ def main():
     print()
     print("Bottleneck analysis (prod shape, see kda_fwd_stage_breakdown.py):")
     print("  intra (10-pair bmm loop):  19.4 ms  #1 - no tensor cores")
-    print("  delta_h kernel:            14.8 ms  #2 - serial loops (opt #2)")
+    print("  delta_h kernel:             4.4 ms  WMMA done (was 14.8 ms, -71%)")
     print("  wy_transform (u, w bmm):    4.7 ms")
     print("  forward_sub kernel:         0.65 ms  already efficient")
     print("  chunk_o kernel (Triton):   ~3 ms    R2A — was ~23 ms CUDA")
-    print("  --- total CUDA:             ~42 ms")
-    print("  FLA Triton reference:       5.2 ms   (8.2x faster)")
+    print("  --- total CUDA:             ~32 ms")
+    print("  FLA Triton reference:       5.2 ms   (6.1x slower)")
     print()
     print("Round-2 fixes (merged on feature/cuda-kernel-optim):")
     print("  R2A  (cuda): chunk_o → Triton, biggest single bottleneck (~20 ms)")
     print("  opt#2 (cuda): delta_h launch_bounds + 2 redundant __syncthreads (~3 ms)")
     print("  opt#3 (cuda): wrapper dead-code + .contiguous() removal (~10 ms)")
-    print("  opt#1 (cuda): intra bmm batching — NO ROI (slower + 2x VRAM), reverted")
+    print("  opt#1 (cuda): intra bmm batching — NO ROI (slower + 2x VRAM), reverted (R1)")
+    print("  opt#4 (cuda): WMMA delta_h (TF32 tensor cores, biggest remaining win) (~10 ms)")
+    print("  opt#5 (cuda): intra_solve + wy_transform fusion — NO ROI, reverted (R2)")
+    print("  opt#6 (cuda): intra_solve precomputed r/c — NO ROI, reverted (R2)")
     print()
-    print("Remaining gap to FLA Triton: ~37 ms (intra_solve + delta_h serialization).")
-    print("Next step: rewrite delta_h with WMMA tensor cores; fuse intra_solve+wy.")
+    print("Remaining gap to FLA Triton: ~27 ms, concentrated in intra_solve (60% of total).")
+    print("Next step: opt #7 — custom CUDA WMMA intra_solve kernel that fuses")
+    print("exp2 + mul + bmm into one launch per (s_i, s_j) pair.")
 
 
 if __name__ == "__main__":
