@@ -104,7 +104,12 @@ def _delta_h(
         (chunk_o consumes this).
       * h_final     [num_docs, HV, K, V]    fp32 — h at the end of each doc
         (returned to the caller if output_final_state=True).
+
+    Backend selection:
+      * HIPPOLM_KDA_DELTA_H_BACKEND = "wmma"   (default; tensor cores via nvcuda::wmma)
+      * HIPPOLM_KDA_DELTA_H_BACKEND = "scalar" (Round-1 scalar GEMM fallback)
     """
+    import os
     mod = _ensure_compiled()
     h_per_chunk = torch.empty(
         num_chunks, HV, K, V, dtype=torch.float32, device=u.device,
@@ -112,7 +117,9 @@ def _delta_h(
     h_final = torch.empty(
         num_docs, HV, K, V, dtype=torch.float32, device=u.device,
     )
-    mod.delta_h(
+    backend = os.environ.get("HIPPOLM_KDA_DELTA_H_BACKEND", "wmma").lower()
+    fn = mod.wmma_delta_h if backend == "wmma" else mod.delta_h
+    fn(
         k, u, w, g_cum,
         doc_chunk_start, doc_chunk_count, chunk_token_base,
         v_new_out,
