@@ -143,7 +143,7 @@ def _load(verbose: bool = False):
         # load_inline auto-generates the PYBIND11_MODULE entry for
         # these function names. The C++ functions live in global
         # namespace in kernel.cu (no `kda::` qualifier).
-        functions=["forward_sub", "delta_h", "chunk_o",
+        functions=["forward_sub", "delta_h", "wmma_delta_h", "chunk_o",
                    "kda_fwd", "kda_fwd_version"],
         extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cuda_cflags,

@@ -19,6 +19,15 @@ void delta_h(
     int64_t num_chunks, int64_t H, int64_t HV
 );
 
+void wmma_delta_h(
+    torch::Tensor k, torch::Tensor u, torch::Tensor w, torch::Tensor g,
+    torch::Tensor doc_chunk_start, torch::Tensor doc_chunk_count,
+    torch::Tensor chunk_token_base,
+    torch::Tensor v_new_out,
+    torch::Tensor h_per_chunk, torch::Tensor h_final,
+    int64_t num_chunks, int64_t H, int64_t HV
+);
+
 void chunk_o(
     torch::Tensor q, torch::Tensor v_new, torch::Tensor g,
     torch::Tensor A_qk, torch::Tensor h_per_chunk, torch::Tensor chunk_token_base,

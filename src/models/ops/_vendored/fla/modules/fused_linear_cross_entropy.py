@@ -239,6 +239,111 @@ def cross_entropy_kernel(
     tl.store(logits + b_y, b_l)
 
 
+# =============================================================================
+# TP-aware cross-entropy kernel for TP-sharded vocab (column-parallel lm_head)
+#
+# Problem the existing kernel has in a TP setting:
+#   The standard ``cross_entropy_kernel`` reads
+#       b_l = tl.load(logits + b_y)
+#   where ``b_y`` is the GLOBAL target id and ``logits`` is the rank-local
+#   slice of shape ``[C, V/world]``. For tokens whose target lands in
+#   another rank's vocab slice, ``b_y >= V/world`` and the load reads past
+#   the end of the local logits buffer (undefined behaviour, was the
+#   root cause of the sporadic ±1e25..±1e35 mb-loss reports in TP sim).
+#
+# What this kernel does differently:
+#   1. The caller pre-remaps ``target`` to ``target - rank * V_local`` and
+#      passes it as ``target_local``. Off-rank targets arrive as
+#      ``target_local < 0`` or ``target_local >= V``.
+#   2. The kernel takes the GLOBAL ``lse`` (computed by the caller via
+#      logsumexp across all ranks) instead of computing it locally — so
+#      ``softmax = exp(logits - lse_global) / sum_global(exp)`` is correct
+#      even though this rank only sees ``V_local`` of the ``V`` vocab
+#      slots.
+#   3. For off-rank tokens (``is_in_range == False``):
+#        - b_l is NEVER loaded (no OOB read).
+#        - The loss contribution is forced to 0 — the rank that OWNS the
+#          target is the one that writes the non-zero loss.
+#        - dlogits is the softmax itself (no onehot subtraction), so
+#          this rank's gradient contribution is the partial softmax
+#          slice; the owning rank contributes softmax_local - onehot at
+#          its target slot. After all-reduce the global dlogits sums to
+#          softmax_full - onehot exactly.
+#   4. The kernel writes RAW per-token losses (no division by ``total``);
+#      the caller does the all-reduce SUM, then divides by the GLOBAL
+#      ``total`` once. This keeps the math numerically identical to the
+#      non-TP path and avoids per-rank mean-vs-global-mean confusion.
+#
+# Constraints (enforced at the Python wrapper level):
+#   - ``label_smoothing == 0`` (no label smoothing in HippoLM's configs
+#     and the existing V_global divisor would need a custom path).
+#   - ``logit_softcapping is None`` (softcap derivative on the target
+#     position is undefined for off-rank tokens; not used in prod).
+#   - ``logit_scale == 1.0`` (the per-rank loss math otherwise needs
+#     care; default in prod).
+# =============================================================================
+@triton.jit
+def cross_entropy_kernel_tp(
+    logits,
+    lse,                 # GLOBAL lse per token, shape [C]
+    target,              # GLOBAL target id (used for ignore_index check)
+    target_local,        # target - rank_offset; out-of-range means off-rank
+    loss,                # output per-token loss (raw, no /total)
+    total_global,        # GLOBAL non-ignored count (denominator)
+    ignore_index,
+    logit_scale: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_n = tl.program_id(0).to(tl.int64)
+    NV = tl.cdiv(V, BV)
+
+    b_y_local = tl.load(target_local + i_n)
+    b_y_global = tl.load(target + i_n)
+
+    logits += i_n * V
+
+    is_ignore = b_y_global == ignore_index
+    # Off-rank: target_local outside [0, V) AND not an ignored token.
+    is_in_range = (b_y_local >= 0) & (b_y_local < V) & (~is_ignore)
+
+    b_lse = tl.load(lse + i_n)
+
+    # Loss: only non-zero on the rank that owns the target.
+    if is_in_range:
+        b_l = tl.load(logits + b_y_local).to(tl.float32) * logit_scale
+        b_loss = b_lse - b_l
+    else:
+        b_loss = 0.0
+
+    if is_ignore:
+        # dlogits all zero for ignored tokens (matches non-TP kernel).
+        for iv in range(0, NV):
+            o_v = iv * BV + tl.arange(0, BV)
+            tl.store(logits + o_v, 0.0, mask=o_v < V)
+    else:
+        # Online softmax — uses global lse, correct for both
+        # in-range and off-rank tokens.
+        for iv in range(0, NV):
+            o_v = iv * BV + tl.arange(0, BV)
+            b_logits = tl.load(
+                logits + o_v, mask=o_v < V, other=float('-inf'),
+            ).to(tl.float32) * logit_scale
+            b_p = exp(b_logits - b_lse) * logit_scale
+            # Mean reduction: divide by global total. Same denom as non-TP.
+            b_p = b_p / total_global
+            tl.store(logits + o_v, b_p, mask=o_v < V)
+
+        # Onehot subtraction — only on the rank that owns the target.
+        if is_in_range:
+            b_l_corrected = tl.load(logits + b_y_local)
+            b_l_corrected += -logit_scale / total_global
+            tl.store(logits + b_y_local, b_l_corrected)
+
+    # Write raw per-token loss (caller does /total after all-reduce).
+    tl.store(loss + i_n, b_loss)
+
+
 @triton.jit
 def elementwise_mul_kernel(
     x,
@@ -392,6 +497,201 @@ def fused_linear_cross_entropy_forward(
     if db is not None:
         db = db.to(bias)
     return loss, dx, dw, db
+
+
+def fused_linear_cross_entropy_tp_forward(
+    x: torch.Tensor,
+    target: torch.LongTensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    ignore_index: int = -100,
+    logit_scale: float = 1.0,
+    num_chunks: int = 8,
+    tp_group=None,
+    tp_rank: int = 0,
+    tp_world: int = 1,
+):
+    """TP-sharded variant of :func:`fused_linear_cross_entropy_forward`.
+
+    Used when the vocab is column-parallel (TP>1). Computes
+    ``loss = CE(local_logits, target)`` where ``local_logits =
+    hidden @ local_w.T`` lives on each rank with shape
+    ``[N, V/world]``. The cross-entropy is over the GLOBAL vocab,
+    so we need:
+
+      1. Local lse via :func:`logsumexp_fwd` over the rank-local
+         slice ``[V/world]``.
+      2. All-gather the per-rank lse → logsumexp across ranks → global
+         lse per token.
+      3. Call :func:`cross_entropy_kernel_tp` which uses the global
+         lse and a per-rank ``target_local`` to compute the loss
+         and the per-rank gradient of the local logits without
+         any out-of-bounds reads.
+      4. All-reduce SUM the per-token losses across ranks; divide
+         by the GLOBAL non-ignored count for mean reduction.
+      5. All-reduce SUM the per-rank ``dx = c_logits @ local_w``
+         across ranks (the hidden state is replicated, so its
+         gradient is the sum of the per-rank partial gradients).
+      6. ``dw`` (and ``db``) are rank-local — they accumulate into
+         the rank's slice of the embed weight gradient.
+
+    Constraints (matching the kernel):
+      - ``label_smoothing == 0`` (HippoLM configs don't use it).
+      - ``logit_softcapping is None`` (not used in prod; the
+        softcap derivative is undefined for off-rank tokens).
+      - ``logit_scale == 1.0`` (default in prod).
+
+    ``tp_group`` is the ``torch.distributed`` process group used
+    for the all-gather and all-reduce. ``tp_rank`` and ``tp_world``
+    tell the orchestrator which vocab slice this rank owns.
+    """
+    assert logit_scale == 1.0, (
+        "TP path does not yet support logit_scale != 1.0; "
+        "the per-rank loss math needs care. Set logit_scale=1.0."
+    )
+
+    device = x.device
+    N, H, V = *x.shape, weight.shape[0]
+    BV = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+    NC = min(num_chunks, triton.cdiv(V, H))
+    C = triton.next_power_of_2(triton.cdiv(N, NC))
+    NC = triton.cdiv(N, C)
+
+    rank_offset = tp_rank * V
+
+    # Global non-ignored count (target is replicated across ranks).
+    total_global = target.ne(ignore_index).sum().item()
+
+    # Target remapped to this rank's slice. For tokens whose target
+    # lives in another rank's slice, ``target_local`` is negative;
+    # the kernel uses ``target_local < 0`` to detect off-rank and
+    # skips the ``b_l = tl.load(logits + b_y)`` read that would
+    # otherwise be out-of-bounds.
+    target_local = target - rank_offset
+
+    # [N, H]
+    dx = torch.zeros_like(x, device=device)
+    # [V, H] — rank-local. Accumulated in BF16 (matches prod path).
+    dw = torch.zeros_like(weight, device=device, dtype=weight.dtype) if weight is not None else None
+    # [V] — rank-local, FP32 accumulator.
+    db = torch.zeros_like(bias, device=device, dtype=torch.float) if bias is not None else None
+    # [N] — RAW per-token loss (kernel writes lse - b_l; caller
+    # does /total after all-reduce). FP32 for precision.
+    loss = torch.zeros(N, device=device, dtype=torch.float)
+
+    for ic in range(NC):
+        start, end = ic * C, min((ic + 1) * C, N)
+        # [C, N]
+        c_x = x[start:end]
+        # [C, V]
+        c_logits = F.linear(c_x, weight, bias)
+        c_target = target[start:end]
+        c_target_local = target_local[start:end]
+        # [C]
+        c_lse_local = logsumexp_fwd(
+            c_logits, scale=logit_scale, softcapping=None, dtype=torch.float,
+        )
+
+        # Combine per-rank lse into the global lse via all-gather
+        # + logsumexp. The math is exact: for two ranks, the global
+        # softmax denominator is sum_i exp(z_i) where z_i is the
+        # rank-local lse; log of that sum is the global lse.
+        # For rank-local lse == -inf (empty slice, never happens
+        # in our configs but defensively), the exp(-inf) = 0 and
+        # the contribution drops out.
+        if tp_world > 1 and tp_group is not None:
+            # List-based all_gather (more flexible than
+            # all_gather_into_tensor, which is picky about 1D
+            # tensors on the gloo backend). See
+            # fla/modules/fused_cross_entropy.py for the reference
+            # pattern.
+            lse_list = [torch.empty_like(c_lse_local) for _ in range(tp_world)]
+            torch.distributed.all_gather(lse_list, c_lse_local, group=tp_group)
+            # logsumexp along the rank dim (0).
+            c_lse_global = torch.logsumexp(torch.stack(lse_list, dim=0), dim=0)
+        else:
+            c_lse_global = c_lse_local
+
+        # unreduced loss buffer for this chunk
+        c_loss = loss[start:end]
+
+        cross_entropy_kernel_tp[(c_logits.shape[0],)](
+            logits=c_logits,
+            lse=c_lse_global,
+            target=c_target,
+            target_local=c_target_local,
+            loss=c_loss,
+            total_global=total_global,
+            ignore_index=ignore_index,
+            logit_scale=logit_scale,
+            V=V,
+            BV=BV,
+            num_warps=STATIC_WARPS,
+        )
+
+        # dlogits has been written in-place by the kernel; compute
+        # dx = c_logits @ weight. Both c_logits and weight are
+        # rank-local, so dx is the rank-local partial gradient of
+        # the hidden state.
+        dx[start:end] = torch.mm(c_logits, weight)
+
+        # dw rank-local: c_logits.t() @ c_x. Each rank accumulates
+        # its own slice of the embed weight gradient.
+        if weight is not None:
+            dw += c_logits.t() @ c_x
+        if bias is not None:
+            torch.add(input=db, other=c_logits.sum(0), out=db)
+
+    # All-reduce SUM the per-token losses across ranks. The total
+    # contribution is ``sum_{in-range tokens} (lse_global - logit_y)``
+    # which equals the global cross-entropy. Divide by total_global
+    # for mean reduction.
+    if tp_world > 1 and tp_group is not None:
+        loss = _AllReduceSumTP.apply(loss, tp_group)
+    loss = loss.sum() / total_global
+
+    # All-reduce SUM dx across ranks. The hidden state is REPLICATED,
+    # so its gradient is the sum of the per-rank partial gradients
+    # ``d_logits_local @ local_w``. Skipping this means each rank
+    # would see a different gradient and the optimiser step would
+    # apply inconsistent updates.
+    if tp_world > 1 and tp_group is not None:
+        dx = _AllReduceSumTP.apply(dx, tp_group)
+
+    if dw is not None:
+        dw = dw.to(weight)
+    if db is not None:
+        db = db.to(bias)
+    return loss, dx, dw, db
+
+
+class _AllReduceSumTP(torch.autograd.Function):
+    """SUM all-reduce with identity backward.
+
+    Used by :func:`fused_linear_cross_entropy_tp_forward` to fold
+    the per-rank partial gradients of ``dx`` (and the per-token
+    losses) into the global values. Identity backward: every rank
+    already received the full sum in the forward, so backward
+    just passes ``do`` straight through.
+
+    Clones the input to avoid in-place modifications on autograd
+    leaves (the orchestrator's dx comes from ``torch.zeros_like``
+    + in-place matmul accumulation, which makes it part of the
+    graph).
+    """
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        out = x.clone()
+        torch.distributed.all_reduce(
+            out, op=torch.distributed.ReduceOp.SUM, group=group,
+        )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
 
 
 def fused_linear_cross_entropy_backward(

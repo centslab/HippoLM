@@ -40,6 +40,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 
 #include <string>
 
@@ -143,7 +144,7 @@ __global__ void forward_sub_kernel(
 // Templated on K, V, V_TILE.                                          //
 // ===================================================================== //
 template<int K, int V, int V_TILE>
-__global__ void delta_h_kernel(
+__global__ void __launch_bounds__(256, 2) delta_h_kernel(
     const __nv_bfloat16* __restrict__ k,           // [T_total, H, K]
     const __nv_bfloat16* __restrict__ u,           // [T_total, HV, V]   = A_inv @ (v * beta)
     const __nv_bfloat16* __restrict__ w,           // [N_chunks, HV, BT, K] = A_inv @ (k * beta * exp2(g_cum))
@@ -187,13 +188,15 @@ __global__ void delta_h_kernel(
         const int token_base = chunk_token_base[chunk_id];
 
         // ----- store h at START of this chunk (to global) -----
+        // No __syncthreads needed: nothing in this iteration reads h_dst.
+        // The output is consumed by a downstream kernel (chunk_o) which
+        // sees consistent data via the kernel-launch boundary.
         float* h_dst = h_per_chunk + ((chunk_id * HV + i_h) * K * V) + v_start;
         for (int idx = tid; idx < K * V_TILE; idx += nthreads) {
             const int kk = idx / V_TILE;
             const int vj = idx % V_TILE;
             h_dst[kk * V + vj] = h_prev[idx];
         }
-        __syncthreads();
 
         // ----- pointers (correct strides for [T, H/HV, K/V] layout) -----
         // k:   [T, H,  K] -> stride H*K
@@ -230,6 +233,10 @@ __global__ void delta_h_kernel(
         __syncthreads();
 
         // ----- step 2: write UN-DECAYED v_new to v_new_out (chunk_o reads this) -----
+        // No __syncthreads needed: step 5 reads v_new_smem (already
+        // synced at the end of step 3), not v_new_out. v_new_out is
+        // consumed by the next kernel (chunk_o) which has its own
+        // kernel-launch boundary for memory consistency.
         {
             __nv_bfloat16* v_new_dst = v_new_out + (token_base * HV + i_h) * V;
             for (int idx = tid; idx < BT * V_TILE; idx += nthreads) {
@@ -239,7 +246,6 @@ __global__ void delta_h_kernel(
                     __float2bfloat16(v_new_smem[i * V_TILE + vj]);
             }
         }
-        __syncthreads();
 
         // ----- step 3: h_prev[k, vj] = exp2(g_last[k]) * h_prev[k, vj] -----
         //                      + sum_i k[i, k] * v_new[i, vj] (UN-DECAYED) -----
@@ -255,6 +261,242 @@ __global__ void delta_h_kernel(
             h_prev[idx] = exp2f(g_last_per_k[kk]) * h_prev[idx] + s;
         }
         __syncthreads();
+    }
+
+    // ----- write final h to h_final -----
+    float* h_final_dst = h_final + ((doc_id * HV + i_h) * K * V) + v_start;
+    for (int idx = tid; idx < K * V_TILE; idx += nthreads) {
+        const int kk = idx / V_TILE;
+        const int vj = idx % V_TILE;
+        h_final_dst[kk * V + vj] = h_prev[idx];
+    }
+}
+
+// ===================================================================== //
+// Kernel 2b: wmma_delta_h_kernel — tensor-core delta_h                  //
+//                                                                     //
+// Round-2 opt #4: replace the scalar GEMMs in delta_h_kernel step 1   //
+// (v_new = u - w @ h_prev) and step 3 (h_prev = decay*h_prev + k.T @  //
+// v_new) with nvcuda::wmma [16, 16, 16] bf16 inputs + fp32 accumulator.//
+// Expected ROI: ~10 ms on prod (delta_h 14.8 ms -> ~4 ms).             //
+//                                                                     //
+// Layout constraints (matches scalar delta_h_kernel for V_TILE=32):    //
+//   * 256 threads = 8 warps per block (matches __launch_bounds).       //
+//   * Step 1 GEMM: M=BT=64, N=V_TILE=32, K=K=128. 8 output tiles,    //
+//     1 per warp (4 M-tiles * 2 N-tiles).                              //
+//   * Step 3 GEMM: M=K=128, N=V_TILE=32, K=BT=64. 16 output tiles,    //
+//     2 per warp (8 M-tiles * 2 N-tiles).                             //
+//   * h_prev[K * V_TILE] in shmem = 16KB.                              //
+//   * v_new_smem[BT * V_TILE] in shmem = 8KB.                          //
+//   * g_last_per_k[K] = 512B.                                          //
+//   * Per-warp acc temp = 1KB * 8 warps = 8KB.                        //
+//   Total ~33KB, fits under 48KB Blackwell consumer shmem cap.        //
+// ===================================================================== //
+template<int K, int V, int V_TILE>
+__global__ void __launch_bounds__(256, 2) wmma_delta_h_kernel(
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ u,
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ g,
+    const int* __restrict__ doc_chunk_start,
+    const int* __restrict__ doc_chunk_count,
+    const int* __restrict__ chunk_token_base,
+    __nv_bfloat16* __restrict__ v_new_out,
+    float* __restrict__ h_per_chunk,
+    float* __restrict__ h_final,
+    int num_chunks,
+    int H,
+    int HV
+) {
+    using namespace nvcuda;
+    constexpr int nthreads = 256;
+    constexpr int n_warps = 8;
+
+    const int doc_id = blockIdx.x;
+    const int i_h = blockIdx.y;
+    const int i_v = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int wid = tid / 32;
+    const int lane = tid % 32;
+
+    const int chunk_start_idx = doc_chunk_start[doc_id];
+    const int NT = doc_chunk_count[doc_id];
+
+    __shared__ float h_prev[K * V_TILE];
+    __shared__ float v_new_smem[BT * V_TILE];
+    __shared__ float g_last_per_k[K];
+    // Per-warp reusable scratch: holds bf16→fp32 staging for w/k during K-tile loop,
+    // then holds the WMMA accumulator result for element-wise post-processing.
+    __shared__ float acc_smem[n_warps * 16 * 16];
+
+    for (int idx = tid; idx < K * V_TILE; idx += nthreads) {
+        h_prev[idx] = 0.f;
+    }
+    __syncthreads();
+
+    const int v_start = i_v * V_TILE;
+
+    for (int i_t = 0; i_t < NT; ++i_t) {
+        const int chunk_id = chunk_start_idx + i_t;
+        if (chunk_id >= num_chunks) break;
+        const int token_base = chunk_token_base[chunk_id];
+
+        // ----- store h at START of this chunk (to global) -----
+        float* h_dst = h_per_chunk + ((chunk_id * HV + i_h) * K * V) + v_start;
+        for (int idx = tid; idx < K * V_TILE; idx += nthreads) {
+            const int kk = idx / V_TILE;
+            const int vj = idx % V_TILE;
+            h_dst[kk * V + vj] = h_prev[idx];
+        }
+
+        // ----- pointers -----
+        const __nv_bfloat16* k_t = k + (token_base * H + i_h) * K;
+        const __nv_bfloat16* u_t = u + (token_base * HV + i_h) * V;
+        const __nv_bfloat16* g_t = g + (token_base * HV + i_h) * K;
+        const __nv_bfloat16* w_c = w + ((chunk_id * HV + i_h) * BT) * K;
+        const int v_token_stride = HV * V;
+
+        // ----- load g_last per-K -----
+        for (int k = tid; k < K; k += nthreads) {
+            g_last_per_k[k] = __bfloat162float(
+                g[(token_base + BT - 1) * HV * K + i_h * K + k]);
+        }
+        __syncthreads();
+
+        // ================================================================ //
+        // STEP 1: v_new[BT, V_TILE] = u[BT, V_TILE] - w[BT, K] @ h_prev[K, V_TILE]   //
+        // TF32 fragments (K_inner=8, fp32 inputs) — preserves full exponent //
+        // range so the bf16 quantization of h_prev doesn't lose precision.   //
+        // M=BT=64, N=V_TILE=32, K_inner=K=128. 16 K-tiles per warp.          //
+        // ================================================================ //
+        {
+            const int m_tile = wid / 2;
+            const int n_tile = wid % 2;
+            const int m_start = m_tile * 16;
+            const int n_start = n_tile * 16;
+
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc_frag;
+            wmma::fill_fragment(acc_frag, 0.0f);
+
+            #pragma unroll
+            for (int k_tile = 0; k_tile < K / 8; ++k_tile) {
+                const int k_start = k_tile * 8;
+                // Convert w[m_start..m_start+16, k_start..k_start+8] (bf16 -> fp32)
+                // into the warp's reusable staging slot. 32 threads × 4 elements each
+                // covers the 16*8 = 128 fp32 cells.
+                float* w_stage = &acc_smem[wid * 256];
+                for (int e = 0; e < 4; ++e) {
+                    const int linear = lane * 4 + e;  // 0..127
+                    if (linear < 128) {
+                        const int rr = linear / 8;
+                        const int cc = linear % 8;
+                        w_stage[rr * 8 + cc] = __bfloat162float(
+                            w_c[(m_start + rr) * K + k_start + cc]);
+                    }
+                }
+                // A = w[m_start..m_start+16, k_start..k_start+8] (row_major, ldm=8).
+                wmma::load_matrix_sync(a_frag, w_stage, 8);
+                // B = h_prev[k_start..k_start+8, n_start..n_start+16] (row_major, ldm=V_TILE).
+                wmma::load_matrix_sync(b_frag, &h_prev[k_start * V_TILE + n_start], V_TILE);
+                wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+
+            wmma::store_matrix_sync(
+                &acc_smem[wid * 16 * 16], acc_frag, 16, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // ---- Apply: v_new = u - acc; store to v_new_smem (fp32) ----
+        // Each (i, vj) in [0, BT) x [0, V_TILE) reads from the warp slot
+        // that owns its tile (m_tile * 2 + n_tile).
+        for (int idx = tid; idx < BT * V_TILE; idx += nthreads) {
+            const int i = idx / V_TILE;
+            const int vj = idx % V_TILE;
+            const int m_tile = i / 16;
+            const int n_tile = vj / 16;
+            const int warp_for_tile = m_tile * 2 + n_tile;
+            const int local_i = i % 16;
+            const int local_vj = vj % 16;
+            float acc_val = acc_smem[warp_for_tile * 256 + local_i * 16 + local_vj];
+            float u_val = __bfloat162float(u_t[i * v_token_stride + v_start + vj]);
+            v_new_smem[i * V_TILE + vj] = u_val - acc_val;
+        }
+        __syncthreads();
+
+        // ---- write UN-DECAYED v_new to v_new_out (chunk_o reads this) ----
+        {
+            __nv_bfloat16* v_new_dst = v_new_out + (token_base * HV + i_h) * V;
+            for (int idx = tid; idx < BT * V_TILE; idx += nthreads) {
+                const int i = idx / V_TILE;
+                const int vj = idx % V_TILE;
+                v_new_dst[i * v_token_stride + v_start + vj] =
+                    __float2bfloat16(v_new_smem[i * V_TILE + vj]);
+            }
+        }
+        __syncthreads();
+
+        // ================================================================ //
+        // STEP 3: h_prev[K, V_TILE] = exp2(g_last[K]) * h_prev[K, V_TILE]   //
+        //                          + k[BT, K].T @ v_new[BT, V_TILE]          //
+        // TF32 fragments (K_inner=8, fp32 inputs). M=K=128, N=V_TILE=32.   //
+        // 8 M-tiles * 2 N-tiles = 16 tiles, 2 per warp.                      //
+        // ================================================================ //
+        for (int t_iter = 0; t_iter < 2; ++t_iter) {
+            const int m_tile = (wid / 2) + t_iter * 4;
+            const int n_tile = wid % 2;
+            const int m_start = m_tile * 16;
+            const int n_start = n_tile * 16;
+
+            wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::col_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc_frag;
+            wmma::fill_fragment(acc_frag, 0.0f);
+
+            #pragma unroll
+            for (int k_tile = 0; k_tile < BT / 8; ++k_tile) {
+                const int k_start = k_tile * 8;
+                // Convert k.T[m_start..m_start+16, k_start..k_start+8] (bf16 -> fp32).
+                // For col_major matrix_a, A(i, j) = ptr[j * ldm + i].
+                // We want A(m, k_inner) = k[k_inner, m_start + m] (k_inner = k_start + j).
+                // ptr[j * ldm + i] = k[(k_start + j) * K + (m_start + i)].
+                // So ptr = k_t + m_start, ldm = K, j indexes into K_inner (k_inner = k_start + j).
+                // For our 16x8 tile: 128 cells, 32 threads × 4 = 128.
+                float* k_stage = &acc_smem[wid * 256];
+                for (int e = 0; e < 4; ++e) {
+                    const int linear = lane * 4 + e;
+                    if (linear < 128) {
+                        const int rr = linear / 8;
+                        const int cc = linear % 8;
+                        k_stage[rr * 8 + cc] = __bfloat162float(
+                            k_t[(k_start + cc) * K + m_start + rr]);
+                    }
+                }
+                // A = k.T[m_start..m_start+16, k_start..k_start+8] (col_major, ldm=8).
+                wmma::load_matrix_sync(a_frag, k_stage, 8);
+                // B = v_new[k_start..k_start+8, n_start..n_start+16] (row_major, ldm=V_TILE).
+                wmma::load_matrix_sync(b_frag, &v_new_smem[k_start * V_TILE + n_start], V_TILE);
+                wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+
+            wmma::store_matrix_sync(
+                &acc_smem[wid * 16 * 16], acc_frag, 16, wmma::mem_row_major);
+            __syncthreads();
+
+            // Apply: h_new[k, vj] = exp2(g_last[k]) * h_prev[k, vj] + acc[k, vj].
+            for (int idx = tid; idx < 16 * 16; idx += nthreads) {
+                const int i = idx / 16;
+                const int vj = idx % 16;
+                float acc_val = acc_smem[wid * 256 + i * 16 + vj];
+                const int kk = m_start + i;
+                const int vjj = n_start + vj;
+                float old_h = h_prev[kk * V_TILE + vjj];
+                float decay = exp2f(g_last_per_k[kk]);
+                h_prev[kk * V_TILE + vjj] = decay * old_h + acc_val;
+            }
+            __syncthreads();
+        }
     }
 
     // ----- write final h to h_final -----
@@ -468,6 +710,82 @@ void delta_h(
     } else {
         TORCH_CHECK(false, "Unsupported (K, V) combination for delta_h: ",
                     K, ", ", V, " — Round-1 supports only (32,32), (64,64), (128,128)");
+    }
+}
+
+void wmma_delta_h(
+    torch::Tensor k, torch::Tensor u, torch::Tensor w, torch::Tensor g,
+    torch::Tensor doc_chunk_start, torch::Tensor doc_chunk_count,
+    torch::Tensor chunk_token_base,
+    torch::Tensor v_new_out,
+    torch::Tensor h_per_chunk, torch::Tensor h_final,
+    int64_t num_chunks, int64_t H, int64_t HV
+) {
+    TORCH_CHECK(k.is_cuda() && u.is_cuda() && w.is_cuda() && g.is_cuda(),
+                "k/u/w/g must be CUDA");
+    TORCH_CHECK(k.scalar_type() == at::kBFloat16, "k must be bf16");
+    TORCH_CHECK(u.scalar_type() == at::kBFloat16, "u must be bf16");
+    TORCH_CHECK(w.scalar_type() == at::kBFloat16, "w must be bf16");
+    TORCH_CHECK(g.scalar_type() == at::kBFloat16, "g must be bf16");
+    TORCH_CHECK(v_new_out.scalar_type() == at::kBFloat16, "v_new_out must be bf16");
+    TORCH_CHECK(h_per_chunk.scalar_type() == at::kFloat, "h_per_chunk must be fp32");
+    TORCH_CHECK(h_final.scalar_type() == at::kFloat, "h_final must be fp32");
+
+    int num_docs = doc_chunk_start.size(0);
+    int HV_v = HV;
+    int V = u.size(-1);
+    int K = k.size(-1);
+    int V_TILE = 32;
+    TORCH_CHECK(V % V_TILE == 0, "V must be divisible by V_TILE=32");
+
+    dim3 grid(num_docs, HV_v, V / V_TILE);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (K == 128 && V == 128) {
+        wmma_delta_h_kernel<128, 128, 32><<<grid, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(u.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(g.data_ptr()),
+            doc_chunk_start.data_ptr<int>(),
+            doc_chunk_count.data_ptr<int>(),
+            chunk_token_base.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
+            h_per_chunk.data_ptr<float>(),
+            h_final.data_ptr<float>(),
+            (int)num_chunks, (int)H, (int)HV_v
+        );
+    } else if (K == 64 && V == 64) {
+        wmma_delta_h_kernel<64, 64, 32><<<grid, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(u.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(g.data_ptr()),
+            doc_chunk_start.data_ptr<int>(),
+            doc_chunk_count.data_ptr<int>(),
+            chunk_token_base.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
+            h_per_chunk.data_ptr<float>(),
+            h_final.data_ptr<float>(),
+            (int)num_chunks, (int)H, (int)HV_v
+        );
+    } else if (K == 32 && V == 32) {
+        wmma_delta_h_kernel<32, 32, 32><<<grid, 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(u.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(g.data_ptr()),
+            doc_chunk_start.data_ptr<int>(),
+            doc_chunk_count.data_ptr<int>(),
+            chunk_token_base.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
+            h_per_chunk.data_ptr<float>(),
+            h_final.data_ptr<float>(),
+            (int)num_chunks, (int)H, (int)HV_v
+        );
+    } else {
+        TORCH_CHECK(false, "Unsupported (K, V) combination for wmma_delta_h: ",
+                    K, ", ", V, " — supports only (32,32), (64,64), (128,128)");
     }
 }
 
