@@ -13,20 +13,21 @@ no SM90+ TMA, no external deps). The key idea:
     Mqk = q_decayed @ k_inv.T         <-- single tl.dot
     INV = (I - L)^(-1) via Neumann    <-- 4 in-tile matmuls
 
-Per-program work: 1 chunk (CHUNK=16 tokens) of 1 head.
+Per-program work: 1 chunk (CHUNK=16 tokens) of 1 head of 1 batch.
 
 Layout (row-major contiguous, stride documented inline):
     q, k, g:           [B, T, H, K]      bf16   stride (T*H*K, H*K, K, 1)
     beta:              [B, T, H]         bf16   stride (T*H, H, 1)
     A_log:             [H]               fp32
     dt_bias:           [H, K]            fp32
-    workspace (out):
-      k_decayed:       [NC, H, CHUNK, K]   bf16   per-head
-      q_decayed:       [NC, H, CHUNK, K]   bf16
-      k_restored:      [NC, H, CHUNK, K]   bf16
-      g_total:         [NC, H, K]          fp32
-      INV:             [NC, H, CHUNK, CHUNK] bf16
-      Mqk:             [NC, H, CHUNK, CHUNK] bf16
+    workspace (out, flat [B*NC, ...] so the recurrence kernel can read
+                                    it with the same pid_b*NC + pid_nc scheme):
+      k_decayed:       [B*NC, H, CHUNK, K]   bf16
+      q_decayed:       [B*NC, H, CHUNK, K]   bf16
+      k_restored:      [B*NC, H, CHUNK, K]   bf16
+      g_total:         [B*NC, H, K]          fp32
+      INV:             [B*NC, H, CHUNK, CHUNK] bf16
+      Mqk:             [B*NC, H, CHUNK, CHUNK] bf16
 """
 from __future__ import annotations
 
@@ -48,13 +49,13 @@ def _kda_prepare_kernel(
     # workspace outputs
     kd_ptr, qd_ptr, kr_ptr, gt_ptr, inv_ptr, mqk_ptr,
     # problem dims
-    H, K,  # K must equal CHUNK*8 (=128 with CHUNK=16)
-    T, NC,  # total tokens, num chunks
+    B, H, K,  # K must equal CHUNK*8 (=128 with CHUNK=16)
+    T, NC,  # total tokens per batch, num chunks per batch
     # strides (in elements, not bytes)
-    stride_q_t, stride_q_h,
-    stride_k_t, stride_k_h,
-    stride_g_t, stride_g_h,
-    stride_b_t, stride_b_h,
+    stride_q_b, stride_q_t, stride_q_h,
+    stride_k_b, stride_k_t, stride_k_h,
+    stride_g_b, stride_g_t, stride_g_h,
+    stride_b_b, stride_b_t, stride_b_h,
     stride_kd_nc, stride_kd_h,
     stride_qd_nc, stride_qd_h,
     stride_kr_nc, stride_kr_h,
@@ -71,6 +72,7 @@ def _kda_prepare_kernel(
 ):
     pid_nc = tl.program_id(0)
     pid_h = tl.program_id(1)
+    pid_b = tl.program_id(2)
 
     # ---------------- load dt_bias for this head ---------------- #
     offs_n = tl.arange(0, BLOCK_N)
@@ -83,21 +85,26 @@ def _kda_prepare_kernel(
     valid_m = offs_m < seq_len
 
     # ---------------- load q, k, g, beta ---------------- #
+    # Input pointer base = pid_b * B_stride (row-major [B, T, H, K] etc.)
+    q_p = q_ptr + pid_b * stride_q_b
+    k_p = k_ptr + pid_b * stride_k_b
+    g_p = g_ptr + pid_b * stride_g_b
+    b_p = beta_ptr + pid_b * stride_b_b
     # q, k, g: shape [BLOCK_M, BLOCK_N]
     q = tl.load(
-        q_ptr + offs_m[:, None] * stride_q_t + pid_h * stride_q_h + offs_n[None, :],
+        q_p + offs_m[:, None] * stride_q_t + pid_h * stride_q_h + offs_n[None, :],
         mask=valid_m[:, None], other=0.0,
     ).to(tl.float32)
     k = tl.load(
-        k_ptr + offs_m[:, None] * stride_k_t + pid_h * stride_k_h + offs_n[None, :],
+        k_p + offs_m[:, None] * stride_k_t + pid_h * stride_k_h + offs_n[None, :],
         mask=valid_m[:, None], other=0.0,
     ).to(tl.float32)
     g_raw = tl.load(
-        g_ptr + offs_m[:, None] * stride_g_t + pid_h * stride_g_h + offs_n[None, :],
+        g_p + offs_m[:, None] * stride_g_t + pid_h * stride_g_h + offs_n[None, :],
         mask=valid_m[:, None], other=0.0,
     ).to(tl.float32)
     beta = tl.load(
-        beta_ptr + offs_m * stride_b_t + pid_h * stride_b_h,
+        b_p + offs_m * stride_b_t + pid_h * stride_b_h,
         mask=valid_m, other=0.0,
     ).to(tl.float32)
 
@@ -164,7 +171,23 @@ def _kda_prepare_kernel(
     INV = identity - L  # bf16 [BLOCK_M, BLOCK_M]
 
     # ---------------- Neumann series inv: INV_k = INV_{k-1} @ (I + L) ---------------- #
-    # Need to do in fp32 for numerical stability, cast back at the end
+    # We compute (I - L)^-1 in fp32 via the truncated Neumann series
+    #   (I + L + L^2 + ... + L^k) ≈ (I - L)^-1
+    # which only converges when ||L|| < 1. L is stored in bf16 above, so
+    # entries up to ~1e10 already saturate the bf16 mantissa — the
+    # recurrence step consumes INV as a multiplier and is robust to the
+    # bf16 storage loss in INV (matches FlashKDA's behavior; see
+    # test/_tmp/test_neumann_stability.py for the empirical safe range).
+    #
+    # Safety contract (enforced at the wrapper level):
+    #   - lower_bound must be in [-10, 0] (production uses -5).
+    #   - A_log range is bounded by the user (KDA init ≈ [-5, 5]).
+    #   - g_raw is post-L2-norm-style scaled (see kernel).
+    # If any of these is violated, the bf16 L storage can lose the
+    # sub-leading bits and the Neumann iteration diverges — the
+    # kernel will silently produce NaNs downstream. The wrapper
+    # asserts on lower_bound; the others are documented as caller
+    # responsibility.
     INV_f32 = INV.to(tl.float32)
     L_f32 = L.to(tl.float32)
     I_plus_L = identity.to(tl.float32) + L_f32
@@ -174,10 +197,12 @@ def _kda_prepare_kernel(
     INV = INV_f32.to(tl.bfloat16)
 
     # ---------------- Store workspace outputs ---------------- #
+    # Flat (b, c) → single index = pid_b * NC + pid_nc; workspace is [B*NC, H, ...]
+    nc_idx = pid_b * NC + pid_nc
     # k_decayed, q_decayed, k_restored: [BLOCK_M, BLOCK_N] bf16
-    kd_off = pid_nc * stride_kd_nc + pid_h * stride_kd_h
-    qd_off = pid_nc * stride_qd_nc + pid_h * stride_qd_h
-    kr_off = pid_nc * stride_kr_nc + pid_h * stride_kr_h
+    kd_off = nc_idx * stride_kd_nc + pid_h * stride_kd_h
+    qd_off = nc_idx * stride_qd_nc + pid_h * stride_qd_h
+    kr_off = nc_idx * stride_kr_nc + pid_h * stride_kr_h
     # Build 2D offset for these tensors
     store_2d = offs_m_local[:, None] * BLOCK_N + offs_n[None, :]
     tl.store(kd_ptr + kd_off + store_2d, k_decayed)
@@ -185,13 +210,13 @@ def _kda_prepare_kernel(
     tl.store(kr_ptr + kr_off + store_2d, k_restored)
 
     # g_total: [BLOCK_N] fp32
-    gt_off = pid_nc * stride_gt_nc + pid_h * stride_gt_h
+    gt_off = nc_idx * stride_gt_nc + pid_h * stride_gt_h
     tl.store(gt_ptr + gt_off + offs_n, g_total)
 
     # INV, Mqk: [BLOCK_M, BLOCK_M] bf16
     store_2d_small = offs_m_local[:, None] * BLOCK_M + offs_m_local[None, :]
-    inv_off = pid_nc * stride_inv_nc + pid_h * stride_inv_h
-    mqk_off = pid_nc * stride_mqk_nc + pid_h * stride_mqk_h
+    inv_off = nc_idx * stride_inv_nc + pid_h * stride_inv_h
+    mqk_off = nc_idx * stride_mqk_nc + pid_h * stride_mqk_h
     tl.store(inv_ptr + inv_off + store_2d_small, INV)
     tl.store(mqk_ptr + mqk_off + store_2d_small, Mqk)
 
@@ -213,24 +238,40 @@ def kda_prepare_triton(
     """Returns dict of per-chunk workspace tensors for use by the
     recurrence step. All workspace is bf16 (small matrices) or fp32
     (g_total, used for the recurrence's state decay).
+
+    Workspace layout: [B*NC, H, ...] (batch-major then chunk-major),
+    so the recurrence can read it with the same pid_b * NC + pid_nc
+    scheme. For B=1, this reduces to the previous [NC, H, ...] layout.
     """
     import torch
 
     assert q.is_cuda and k.is_cuda and g.is_cuda and beta.is_cuda
     assert q.dtype == torch.bfloat16
     assert q.shape[-1] == 128, f"only K=128 supported, got {q.shape[-1]}"
+    # Neumann series safety (see kernel comment for the math):
+    # lower_bound drives the magnitude of g_activated, which drives
+    # exp(g_total) at the chunk tail, which drives ||L||_∞ in the bf16
+    # L storage. lower_bound=-5 is the production setting; values
+    # more negative push L entries into the regime where the bf16
+    # storage of L loses the sub-leading bits and the truncated
+    # Neumann series diverges. See test/_tmp/test_neumann_stability.py
+    # for the empirical safe range.
+    assert -10.0 <= lower_bound <= 0.0, (
+        f"lower_bound must be in [-10, 0] for Neumann series "
+        f"stability; got {lower_bound} (production: -5.0)"
+    )
     B, T, H, K = q.shape
     NC = (T + CHUNK - 1) // CHUNK
     device = q.device
 
-    # Workspace allocation (FlashKDA layout: [H, NC, ...] but ours is [NC, H, ...]
-    # which is easier in Triton)
-    kd = torch.empty(NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
-    qd = torch.empty(NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
-    kr = torch.empty(NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
-    gt = torch.empty(NC, H, K, dtype=torch.float32, device=device)
-    inv = torch.empty(NC, H, CHUNK, CHUNK, dtype=torch.bfloat16, device=device)
-    mqk = torch.empty(NC, H, CHUNK, CHUNK, dtype=torch.bfloat16, device=device)
+    # Workspace allocation — flat [B*NC, H, ...] so the kernel uses one
+    # `nc_idx = pid_b * NC + pid_nc` index for the leading dim.
+    kd = torch.empty(B * NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
+    qd = torch.empty(B * NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
+    kr = torch.empty(B * NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
+    gt = torch.empty(B * NC, H, K, dtype=torch.float32, device=device)
+    inv = torch.empty(B * NC, H, CHUNK, CHUNK, dtype=torch.bfloat16, device=device)
+    mqk = torch.empty(B * NC, H, CHUNK, CHUNK, dtype=torch.bfloat16, device=device)
 
     a_log_exp = torch.exp(A_log.float()).contiguous()
     # gate_scale = lower_bound * ln(2) so that:
@@ -240,16 +281,18 @@ def kda_prepare_triton(
     # in log2 space, then exp2(g) gives the multiplier).
     gate_scale = lower_bound * 0.6931471805599453  # ln(2) ≈ 0.6931
 
-    grid = (NC, H)
+    grid = (NC, H, B)
     _kda_prepare_kernel[grid](
         q, k, g, beta,
         A_log, dt_bias,
         kd, qd, kr, gt, inv, mqk,
-        H, K, T, NC,
-        q.stride(1), q.stride(2),  # stride_q_t = T*H*K, stride_q_h = K
-        k.stride(1), k.stride(2),
-        g.stride(1), g.stride(2),
-        beta.stride(1), beta.stride(2),
+        B, H, K, T, NC,
+        # B strides (may equal T-stride for B=1, but we pass it
+        # unconditionally so the kernel works for any B).
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        g.stride(0), g.stride(1), g.stride(2),
+        beta.stride(0), beta.stride(1), beta.stride(2),
         kd.stride(0), kd.stride(1),
         qd.stride(0), qd.stride(1),
         kr.stride(0), kr.stride(1),

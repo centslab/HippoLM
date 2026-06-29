@@ -334,6 +334,20 @@ def cross_entropy_kernel_tp(
             b_p = b_p / total_global
             tl.store(logits + o_v, b_p, mask=o_v < V)
 
+        # We need tl.debug_barrier() before the load-after-store in
+        # the onehot correction. Without it, the Triton compiler can
+        # reorder the load past the store above, and b_l_corrected
+        # reads the pre-loop logits value (the raw matmul output)
+        # instead of the freshly-stored dlogits. This was the root
+        # cause of the sporadic wrong-dlogits bug at the target
+        # position (e.g. dlogits[2, 89] = -7.875 instead of -0.25 in
+        # the TP dx-consistency test, with the wrong value tracking
+        # the unscaled matmul output rather than a meaningful
+        # gradient). The non-TP kernel has the same barrier (see
+        # line ~207 of cross_entropy_kernel). Mirrored here.
+        # Ref: https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/ops/cross_entropy.py#L34
+        tl.debug_barrier()
+
         # Onehot subtraction — only on the rank that owns the target.
         if is_in_range:
             b_l_corrected = tl.load(logits + b_y_local)
