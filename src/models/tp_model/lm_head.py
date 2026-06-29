@@ -18,10 +18,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.tp_layers import get_tp_rank, get_tp_world_size
+from src.models.tp_layers import get_tp_rank, get_tp_world_size, get_tp_group
 from src.models.ops._vendored.fla.modules.fused_linear_cross_entropy import (
     fused_linear_cross_entropy_backward,
     fused_linear_cross_entropy_forward,
+    fused_linear_cross_entropy_tp_forward,
 )
 
 
@@ -71,11 +72,29 @@ class _TiedFusedLCEFunction(torch.autograd.Function):
         flat_hidden = hidden.reshape(N, H)
         flat_target = target.reshape(N)
 
-        loss, dx, dw, _ = fused_linear_cross_entropy_forward(
-            flat_hidden, flat_target, local_w, None,
-            ignore_index=ignore_index, num_chunks=num_chunks,
-            reduction="mean",
-        )
+        if get_tp_world_size() > 1:
+            # TP-sharded vocab path: the kernel reads
+            # ``logits[b_y]`` where b_y is the GLOBAL target id and
+            # logits is the rank-local ``[N, V/world]`` slice. The
+            # stock fla FusedLinearCE would OOB-read for off-rank
+            # targets; ``fused_linear_cross_entropy_tp_forward``
+            # wraps the kernel with TP-aware lse/loss all-reduce
+            # and a per-rank target remap. See
+            # ``fused_linear_cross_entropy.py::cross_entropy_kernel_tp``
+            # for the per-row kernel details.
+            loss, dx, dw, _ = fused_linear_cross_entropy_tp_forward(
+                flat_hidden, flat_target, local_w, None,
+                ignore_index=ignore_index, num_chunks=num_chunks,
+                tp_group=get_tp_group(),
+                tp_rank=get_tp_rank(),
+                tp_world=get_tp_world_size(),
+            )
+        else:
+            loss, dx, dw, _ = fused_linear_cross_entropy_forward(
+                flat_hidden, flat_target, local_w, None,
+                ignore_index=ignore_index, num_chunks=num_chunks,
+                reduction="mean",
+            )
 
         # ``dw`` comes out as FP32 from the kernel (accumulated in
         # FP32 inside the chunked loop for precision); cast to the
