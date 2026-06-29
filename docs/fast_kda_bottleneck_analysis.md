@@ -948,3 +948,199 @@ isn't worth it without evidence that training is the bottleneck.
 
 **Bwd is the new bottleneck for training throughput.** If we ever
 need to optimize, this is where to look. But not now.
+
+---
+
+## Round-8: Per-chunk rescaling & parallel scan analysis (June 2026-29)
+
+Round-7 closed the fwd at 99% HBM. But it left three open questions
+about the algorithm and its precision:
+
+1. **Can we avoid the bf16 overflow in `k_inv = k * exp(-g_cumsum)`?**
+   Per-chunk rescaling?
+2. **Can a parallel-scan formulation skip the matrix inverse entirely?**
+   Would it be faster/simpler/more precise?
+3. **Where is the *real* CHUNK=16 precision bottleneck?** Not the exp
+   (that's safe). Maybe the Neumann truncation?
+
+This round is the analytical work answering (1) and (2), plus a
+bench experiment for (1) using fp32 `k_inv`. The precision question
+(3) is open — see "Open questions" at the end.
+
+### Question 1: Can we avoid the `exp(-g_cumsum)` overflow?
+
+The overflow is in `prepare.py:135`:
+
+```python
+k_inv = (k * exp_neg_g).to(tl.bfloat16)   # NaN source at CHUNK=32
+```
+
+The bf16 max exponent is `ln(3.4e38) ≈ 88`. With CHUNK=32 and
+`lower_bound=-5`, `|g_cumsum|_max = 103` (measured), so
+`exp(103) = 2.6e44 > 3.4e38 → NaN`.
+
+**Three candidate fixes:**
+
+| fix | math | cost | benefit |
+|-----|------|------|---------|
+| (a) **Per-chunk rescaling** (subtract reference from g_cumsum) | shift `g_cumsum` to compress dynamic range | 1 sub/chunk (free) | **doesn't work** — see below |
+| (b) **fp32 k_inv** (don't cast to bf16) | nothing changes, just higher precision storage | bmm becomes mixed-precision bf16×fp32 | overflow eliminated |
+| (c) **Parallel scan** (no inverse) | rewrite chunk-local recurrence as a Blelloch scan | O(log CHUNK) scan steps; bmm sizes shrink as scan progresses | math is clean, but mma efficiency drops |
+
+### Why (a) per-chunk rescaling doesn't work
+
+The natural idea: subtract a reference value from `g_cumsum` so the
+range of `exp(-g_cumsum)` is bounded. E.g.:
+
+```python
+g_cumsum_rescaled = g_cumsum - g_total   # most negative becomes 0
+exp(-g_cumsum_rescaled) = exp(-g_cumsum + g_total) = exp(g_total - g_cumsum) = c[s]
+```
+
+This just renames `c[s]` (the backward product, always ≤ 1 — safe).
+But the **dynamic range** of `exp(-g_cumsum)` within a chunk is
+`exp(|g_total| - |g_cumsum[0]|) ≈ exp(|g_total|)`. Subtracting a
+constant from the input doesn't compress this — it just shifts the
+absolute values. The range itself is determined by the cumulative
+sum of `g_activated` over the chunk, which is independent of any
+subtraction:
+
+```
+range(exp(-g_cumsum)) = exp(max(-g_cumsum) - min(-g_cumsum))
+                     = exp(|g_total| - |g_cumsum[0]|)
+                     ≈ exp(|g_total|)
+```
+
+For CHUNK=32, this is `exp(101)` regardless of rescaling. So (a)
+gives the same overflow at CHUNK=32.
+
+**Real per-chunk rescaling** (the kind that does work) would be
+**dynamic**: monitor the running `g_cumsum` and split the chunk
+when `|g_cumsum|` approaches the bf16 threshold (88). This is
+equivalent to capping CHUNK at 16 (the algorithm's natural limit).
+Net: same as the current CHUNK=16 design. No free lunch.
+
+### (b) fp32 k_inv: experiment
+
+The simplest practical fix: keep `k_inv` in fp32 (it stays in
+registers, no gmem storage). The bmm inputs become mixed-precision
+`bf16 × fp32`. Triton's `tl.dot` handles this by promoting the
+bf16 operand to fp32 (so the dot is effectively fp32). The output
+Mqk is then fp32, which we cast to bf16 at the end.
+
+**Implementation (in registers, no gmem change):**
+- `k_inv = k * exp_neg_g` (no `.to(tl.bfloat16)` cast)
+- `L = tl.dot(k_decayed_bf16, k_inv_fp32.T)` — Triton promotes
+- `Mqk = tl.dot(q_decayed_bf16, k_inv_fp32.T).to(tl.bfloat16)`
+
+**Experiment results (June 2026-29, `bench/fast_kda_fp32_kinv.py`):**
+
+| CHUNK | k_inv dtype | Mqk finite? | g_total max | prepare time |
+|------:|-------------|:-----------:|------------:|-------------:|
+| 16    | bf16 (current) | ✓ | 53.0 | 0.99 ms |
+| 16    | fp32           | ✓ | 53.0 | 0.99 ms (no regression) |
+| 32    | bf16           | ✗ NaN | 102.7 | 1.02 ms (NaN) |
+| 32    | fp32           | **✗ NaN** | 102.7 | 1.10 ms (NaN) |
+
+**Result: fp32 does NOT fix the overflow.** The first NaN is at
+Mqk[31, 31] (the diagonal, last row/col), from
+`k_inv[31] = k[31] * exp(-g_cumsum[31]) = k[31] * exp(103)`.
+
+Why fp32 doesn't help: the overflow threshold is determined by
+the dtype's max exponent. Both bf16 and fp32 have `max ≈ 3.4e38`,
+so `ln(3.4e38) ≈ 88` is the threshold in BOTH cases. CHUNK=32
+produces `|g_cumsum| ≈ 103` regardless of k_inv's storage dtype.
+
+**Conclusion for (b):** to enable CHUNK=32 via storage precision
+alone, we'd need fp64 (max ~1.3e308, threshold ln(1.3e308) ≈ 284).
+fp64 bmm is 2x slower than fp32 bmm on tensor cores, which would
+eat most of the recurrence speedup. Not worth it.
+
+**End-to-end fwd timing with fp32 k_inv (NaN or not):**
+- CHUNK=16 bf16 k_inv (current): 3.16 ms
+- CHUNK=32 fp32 k_inv: 2.50 ms (1.26x faster) — but **output is NaN**, so this is not a real win. The kernel just runs faster on NaN inputs.
+
+**The CHUNK=32 speedup of 1.26x on the recurrence kernel is
+real, but the precision is the blocker.** No free lunch.
+
+### Question 2: Parallel scan (Blelloch) — why FLA/FlashKDA don't do it
+
+The chunkwise parallel form uses an associative operator to combine
+partial recurrences in O(log CHUNK) steps:
+
+```
+(h_a, α_a) ⊕ (h_b, α_b) = (h_b * α_a + h_a, α_a * α_b)
+```
+
+For CHUNK=16, this is 4 scan steps (vs 16 sequential). No matrix
+inverse. No `exp(-g_cumsum)` overflow (only `exp(α_t)` per step,
+which is bounded).
+
+**Why FLA/FlashKDA use the closed-form inverse instead:**
+
+1. **mma granularity**: the closed-form uses one
+   `[CHUNK=16, K=128] @ [K, BLOCK_V=16]` mma (m16n8k16 perfectly
+   fits). The scan form does `[chunk_size, K] @ [K, BLOCK_V]` at
+   each step; `chunk_size` halves each step (8, 4, 2, 1), so the
+   last two steps have <50% mma utilization.
+
+2. **The exp overflow at CHUNK>16 is independent of the form**.
+   The cumulative product `exp(Σ g_activated)` is the same
+   regardless of whether you compute it sequentially or via scan.
+   The scan form only avoids the *matrix inverse*, not the
+   *cumulative product overflow*. To push CHUNK>16 with the scan
+   form, you still need per-step fp32 (or periodic rescaling).
+
+3. **Backward complexity**. The closed-form bwd uses
+   `(I - L)^(-1)` as a black box (chain rule on the inverse is
+   direct: `dL^(-1) = -L^(-1) @ dL @ L^(-1)`). The scan form
+   requires a separate bwd derivation through the scan steps —
+   weeks of work for a kernel that's already at 99% HBM.
+
+**Per the conversation with the user, the parallel-scan approach
+was attempted in an earlier EFKDA project but didn't succeed** —
+likely for reason (1) or (3). The closed-form-with-inverse is
+the natural form for this algorithm on tensor cores.
+
+### Question 3: Where is the real CHUNK=16 precision bottleneck?
+
+The bf16 exp overflow only matters at CHUNK>16. At CHUNK=16, the
+prepare kernel is in safe territory (`exp(55) = 7e23` vs max
+`exp(88) = 3e38` — 15 orders of magnitude headroom).
+
+The likely real precision bottleneck at CHUNK=16 is the
+**Neumann series inverse of L** in `prepare.py:172-174`:
+
+```python
+# 4 iterations: (I + L + L^2 + L^3 + L^4) approximation
+for _ in range(4):
+    INV_f32 = tl.dot(INV_f32, I_plus_L, out_dtype=tl.float32)
+```
+
+The Neumann series `Σ L^k` converges iff `||L|| < 1`. With
+L2-normalized q/k, `||L||` is at most 1, and the 4-term
+truncation error is `||L^5|| / (1 - ||L||)`. For `||L|| ≈ 1`,
+this is O(1) — i.e. the truncated series has order-1 error,
+not order-1e-3.
+
+**Mitigation: use `tl.inverse` (CUDA 12.4+) for an exact inverse
+instead of Neumann.** FLA's vendored kernel uses this on sm_120.
+Our kernel still uses Neumann. The fix is straightforward but
+unverified at our precision target.
+
+### Open questions
+
+1. **Neumann truncation error** at CHUNK=16 — measure vs
+   `tl.inverse` (would need a bench comparing the two). This is
+   the most likely real precision bottleneck.
+2. ~~**fp32 k_inv experiment**~~ — **DONE, doesn't help** (see
+   experiment above). `exp(103)` overflows fp32 same as bf16.
+   Would need fp64, which is too slow.
+3. **Per-step rescaling** (dynamic, not the static shift in (a))
+   — could theoretically allow larger CHUNK by splitting mid-chunk
+   when `|g_cumsum|` exceeds threshold. Equivalent to CHUNK=16
+   with extra overhead. Not promising.
+4. **CHUNK=32 with explicit per-sub-chunk rescaling** — split the
+   CHUNK=32 chunk into 2 sub-chunks of 16 at the algorithm level,
+   with fp32 handoff between sub-chunks. This is essentially
+   CHUNK=16 with extra structure. Would need a new kernel design.
