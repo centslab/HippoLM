@@ -576,6 +576,184 @@ algorithmic headroom.
 
 ---
 
+## Round-7: Tiling sweep — confirming CHUNK=16 is the algorithm's hard limit (June 2026-29)
+
+Round-6 left one question open: is the V-split design (BLOCK_V=16,
+NUM_STAGES=4) really optimal, or are there other tilings that beat
+it? Round-7 is a sweep over the recurrence kernel's tiling space
+plus a closer look at the CHUNK constraint. The conclusion: **V-split
+at C=16 V=16 is the local optimum, and CHUNK=16 is an algorithm-level
+constraint, not a tunable**.
+
+### Sweep setup
+
+- `bench/fast_kda_tiling_sweep.py` — sweeps `CHUNK ∈ {8,16,32,64}` ×
+  `BLOCK_V ∈ {4,8,16,32,64,128}` with adaptive `NUM_STAGES`. Reports
+  wall time, % HBM, and `h_prev` register footprint.
+- `bench/fast_kda_num_stages_sweep.py` — explicit `NUM_STAGES ∈ {1,2,3,4}`
+  on the top configs to see if the adaptive heuristic is missing wins.
+- Both bypass the wrapper and call `_kda_recurrence_kernel` directly
+  so `CHUNK` and `BLOCK_V` can vary.
+
+### Sweep results (B=1, T=16384, H=12, K=V=128)
+
+| CHUNK | BLOCK_V | NUM_STAGES | # progs | waves | h_prev reg | ms | % HBM | status |
+|------:|--------:|-----------:|--------:|------:|-----------:|---:|------:|:-------|
+| 16 | 16 | 4 | 96 | 2.67 | 8 KB | **2.31** | 97% | **current ✓** |
+| 16 | 16 | 2 | 96 | 2.67 | 8 KB | 2.32 | 97% | tied with ns=4 |
+| 16 | 32 | 4 | 48 | 1.33 | 16 KB | 2.66 | 46% | too few progs |
+| 16 | 64 | * | 24 | 0.67 | 32 KB | 2.85 | 26% | only 24 progs |
+| 16 | 128 | * | 12 | 0.33 | 64 KB | 6.44 | 7% | V-loop, 12 progs (Round-4) |
+| **32** | **16** | **2** | **96** | **2.67** | **8 KB** | **1.55** | **60%** | **✗ NaN in Mqk/O** |
+| 32 | 32 | 3 | 48 | 1.33 | 16 KB | 1.74 | 65% | ✗ NaN |
+| 32 | 64 | 2 | 24 | 0.67 | 32 KB | 2.22 | 33% | ✗ NaN |
+| 8 | * | * | — | — | — | — | — | ✗ `exp_g_total` kernel compile error |
+| 64 | * | * | — | — | — | — | — | ✗ SMEM out-of-resource |
+
+The `>100%` HBM columns at BLOCK_V=4/8 (small V) are L2 cache
+amplification: the workspace tensors (Mqk, q_dec, k_res, g_total)
+are re-read across many V-splits of the same head and the L2
+(32 MB) caches the head's 1.5 MB Mqk easily. So the actual
+HBM traffic is much lower than naive per-program accounting.
+
+**Wins are illusory**: CHUNK=32 looks like a 1.39x speedup at
+1.55 ms, but the output is full of NaN (Mqk has 72300 NaN per
+batch in the O tensor).
+
+### Why CHUNK=32 produces NaN — the exp(-g_cumsum) overflow
+
+The KDA forget gate is bounded: `α_t = exp(g_activated_t) ∈ (0, 1)`
+because `g_activated = lower_bound * ln(2) * sigmoid(...)` is
+always negative. Per-step `exp(g_activated)` is in `(exp(lower_bound), 1)`
+and never overflows. **The overflow comes from the chunked-algorithm
+reformulation, not from the gate itself.**
+
+The chunked algorithm writes the cumulative product in log space:
+
+```
+r[s] = α_0 · α_1 · ... · α_s  =  exp(g_cumsum[s])      ≤ 1
+1/r[s]                       =  exp(-g_cumsum[s])     can be >> 1
+c[s] = α_{s+1} · ... · α_{CHUNK-1}  =  exp(g_total - g_cumsum[s])  ≤ 1
+```
+
+`r[s]` and `c[s]` are always ≤ 1 (safe). But the **inverse**
+`exp(-g_cumsum[s])` grows monotonically with `s` and is
+multiplied into `k_inv` in the prepare kernel:
+
+```python
+# src/models/ops/_triton/fast_kda/prepare.py:128-135
+exp_g     = tl.exp(g_cs)            # ≤ 1, safe
+exp_neg_g = tl.exp(-g_cs)           # = 1/r[s], can be >> 1  ← overflow here
+q_decayed = (q * exp_g * scale).to(tl.bfloat16)
+k_decayed = (k * exp_g).to(tl.bfloat16)
+k_inv     = (k * exp_neg_g).to(tl.bfloat16)  # ← NaN source
+k_restored = (k * exp_neg_g * exp_g_total[None, :]).to(tl.bfloat16)
+...
+Mqk = tl.dot(q_decayed, tl.trans(k_inv)).to(tl.bfloat16)  # ← propagates NaN
+```
+
+**bf16 overflow threshold**: `exp(88) ≈ 1.65e38 > bf16 max 3.4e38`,
+so any `|g_cumsum| > 88` produces Inf, then NaN after the
+subsequent `.to(tl.bfloat16)` cast.
+
+**Why CHUNK=16 is safe and CHUNK=32 is not:**
+
+With `lower_bound = -5` and the standard FLA gate activation:
+
+```
+gate_scale = -5 · ln(2) = -3.466
+g_activated_t = -3.466 · sigmoid(...)
+```
+
+Each `g_activated_t ∈ (-3.466, 0)`. The cumulative sum over a
+chunk is `g_cumsum[s] = Σ_{t≤s} g_activated_t`:
+
+| CHUNK | typical `|g_cumsum|` max | `exp(\|g_cumsum\|)` | bf16 safe? |
+|------:|-------------------------:|--------------------:|:-----------|
+| 16 | 53 (from test, prod-shape input) | 2.9e22 | ✓ (1.6e16 headroom) |
+| **32** | **103** (from test) | **2.6e44** | **✗ overflow → NaN** |
+| 24 | (not tested) | ~exp(80) | marginal |
+
+The test inputs use `g_raw ~ N(-0.5, 1)` so `g_activated` is
+biased negative (gate is always decaying). With `g_raw ~ N(0,1)`
+the worst-case `|g_cumsum|` would be larger for both CHUNK values
+but the relative gap remains: 32 is unsafe when 16 is safe.
+
+The fix would require either:
+- **Per-chunk rescaling** in the prepare kernel (i.e. subtract
+  `g_total` from `g_cumsum` before computing `exp(-g_cs)` so the
+  worst case is `exp(CHUNK * max|g_activated|) / exp(CHUNK * min|g_activated|)`
+  — this is an algorithmic change, not a parameter change).
+- **fp32 workspace** for `k_inv` (doubles workspace traffic; Mqk
+  would still need bf16 dot input).
+- **Clamp `g_cumsum` to `[-88, 0]`** before `exp` (changes the
+  output; only correct if `g_activated` is small enough that the
+  clamp doesn't activate in practice).
+
+None of these are free, so **CHUNK=16 is the algorithm's hard
+limit**, and FLA pins the same value. The "1.39x speedup" from
+the CHUNK=32 sweep is a measurement artifact (the kernel runs
+faster because it produces NaN, not because it does less work).
+
+### What about the recurrence kernel's design space (CHUNK=16 fixed)?
+
+With CHUNK fixed at 16, the remaining knobs are BLOCK_V and
+NUM_STAGES. The sweep above shows the local optimum is
+**BLOCK_V=16, NUM_STAGES=4** at 2.31 ms / 97% HBM. Why this
+config:
+
+- BLOCK_V=16: 96 programs (8 V-splits × 12 heads) on 36 SMs = 2.67
+  waves. Good occupancy.
+- BLOCK_V=8: 192 programs but `h_prev` only 4 KB; the V-slice is
+  small enough that the bmm `Mqk @ v[:, :, v_block]` is 16x16@16x8
+  = 16x8 output, which is under-utilizing the 16x16x16 mma
+  instruction. Net: 3.19 ms (the L2 reuse of 134% HBM is real
+  but the mma under-utilization cancels it).
+- BLOCK_V=32: 48 programs = 1.33 waves, last wave 33% empty.
+  2.66 ms.
+- BLOCK_V≥64: too few programs; can't fill 36 SMs.
+- NUM_STAGES=4 vs 2: tied at 2.31 ms. The deeper pipeline
+  doesn't help here because there are enough progs to hide
+  latency; the deeper pipeline only helps when work-per-prog
+  is small relative to wave count.
+
+### Other strategies considered (all ruled out)
+
+- **K-split** (split K axis instead of V): 1 prog = 1 head × 1
+  K-tile × full V. h_prev = [BLOCK_K, V=128] = BLOCK_K * 512
+  bytes. At BLOCK_K=16, that's 8 KB — same as V-split. # progs
+  identical (96). Total data identical. **But**: the V tensor
+  (50 MB per batch) is no longer split, so it doesn't fit in
+  L2 (V-split's 6 MB V-slices do). Strictly worse for L2 reuse.
+- **Multi-head per program** (pack 2-4 heads per program):
+  Mqk, q_dec, k_res, g_total are all per-head, so no workspace
+  reuse to exploit. Just serializes more work per program with
+  no benefit.
+- **Persistent kernel** (1 prog per head, V-loop inside chunk
+  loop, atomic handoff): ruled out in Round-4 — only 12 progs
+  can't saturate 36 SMs. Same reasoning applies to multi-head
+  per program.
+
+### Lesson
+
+**Always verify correctness in a sweep.** The CHUNK=32 "win"
+of 1.55 ms was visible in raw timing before any correctness
+check. A simple `torch.isfinite().all()` would have caught it
+in one line. Sweep timing without correctness = meaningless
+data. (This is now a feedback rule: `feedback_verify_correctness.md`.)
+
+### Bottom line (Round-7)
+
+V-split at CHUNK=16, BLOCK_V=16, NUM_STAGES=4 is the local
+optimum. The CHUNK=16 ceiling is structural: the chunked
+algorithm's `k_inv = k * exp(-g_cumsum)` overflows bf16 when
+`|g_cumsum| > 88`, which happens for CHUNK=32 with the standard
+`lower_bound=-5` gate. To raise CHUNK, the algorithm itself
+needs rescaling (out of scope). **No further fwd speedup
+available** without changing the algorithm.
+
+---
+
 ## Round-6 cont: bwd data movement analysis (June 2026-29)
 
 The fwd at 2.15 ms is the local optimum. But the fwd is only half
