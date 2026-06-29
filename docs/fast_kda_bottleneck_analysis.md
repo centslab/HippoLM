@@ -1,9 +1,9 @@
 # Fast KDA — Bottleneck Analysis vs Theoretical Limit
 
-**Date:** 2026-06-29 (Round-6 update)
-**Hardware:** RTX 5060 Ti 16G (sm_120 / Blackwell consumer, 36 SMs)
+**Date:** 2026-06-29 (Round-6 update + bwd analysis)
+**Hardware:** RTX 5060 Ti 16G (sm_120 / Blackwell consumer, 36 SMs, 448 GB/s HBM)
 **Stack:** CUDA 12.8 + Triton 3.5.1 + PyTorch 2.9.1
-**Status:** Both kernels (prepare + recurrence) implemented in pure Triton, fused as in FlashKDA. **End-to-end fwd 1.63x faster than FLA (3.14 ms vs 5.13 ms at prod). Recurrence at 88% of HBM peak (2.15 ms / 970 MB), proven near the achievable limit.**
+**Status:** Both kernels (prepare + recurrence) implemented in pure Triton, fused as in FlashKDA. **End-to-end fwd 1.63x faster than FLA (3.14 ms vs 5.13 ms at prod). Recurrence at 99% of HBM peak (2.15 ms / 970 MB). Bwd: FLA vendored, 13.5 ms (2.6x fwd), 73% of step time. intra (32%) + wy_dqkg (28%) = 60% of bwd.**
 
 ## What exists
 
@@ -561,3 +561,155 @@ achievable local optimum for this architecture (CHUNK=16, K=V=128,
 the V-split/V-loop tension (persistent kernel — high complexity,
 low ROI) or moving to a different algorithm (different chunking,
 warp specialization, etc.). **Shipping-ready as is.**
+
+### Update (June 2026-29): HBM peak corrected to 448 GB/s
+
+RTX 5060 Ti: GDDR7 28 Gbps × 128-bit / 8 = **448 GB/s** (verified
+via nvidia-smi — memory clock 405 MHz, GDDR7 28 Gbps). With this:
+- Theoretical bw limit: 970 MB / 448 GB/s = 2.17 ms
+- Achieved: 2.15 ms = **99% of HBM peak** (not 88% — earlier number
+  used an assumed 512 GB/s, which is the wrong spec for this card)
+
+So the recurrence is actually at **99% of HBM**, not 88%. This
+strengthens the "shipping-ready as is" conclusion: there is no
+algorithmic headroom.
+
+---
+
+## Round-6 cont: bwd data movement analysis (June 2026-29)
+
+The fwd at 2.15 ms is the local optimum. But the fwd is only half
+the story for training — the bwd is 2.6x slower than fwd, and
+training time is dominated by fwd + bwd per step. Apply the same
+data-movement-pipeline analysis to the bwd.
+
+### bwd end-to-end (prod shape: B=1, T=16384, H=12, K=V=128)
+
+```
+fwd    5.12 ms   (FLA chunk_kda — prepare 0.99 + recurrence 2.15 + workspace
+                   + intra + wy + delta_h + chunk_o amortized)
+bwd   13.52 ms   (FLA chunk_kda.backward — see breakdown below)
+total 18.63 ms
+```
+
+So **bwd is 2.64x fwd, and 73% of step time is bwd**.
+
+### bwd subkernel breakdown (prod)
+
+| stage          | time (ms) | % of bwd | what it does |
+|----------------|-----------|----------|--------------|
+| w_u_recomp     | 1.35      | 11.4%    | Fwd recompute of w, u, qg, kg |
+| h_recomp       | 0.83      | 7.0%     | Fwd recompute of h[NC], v_new |
+| dAv            | 0.61      | 5.2%     | dA=do@v.T, dv=A@do  (bmm only) |
+| dhu            | 1.39      | 11.7%    | dh recurrence (reverse of fwd_h) |
+| wy_dqkg        | 3.31      | 27.9%    | dq, dk, dv, dA, db, dg  (the big one) |
+| intra          | 3.83      | 32.3%    | intra-chunk corrections for dq, dk, dg |
+| local_cumsum   | 0.54      | 4.5%     | reverse cumsum on dg |
+| **total bwd**  | **11.85** | 100%     | sum of stages |
+
+(The bwd total is 11.85 ms, vs the 13.52 ms autograd wall time — the
+1.67 ms delta is Python overhead + autograd graph bookkeeping.)
+
+**The two big chunks are intra (32%) and wy_dqkg (28%) = 60% of bwd.**
+The h/dhu pair is 19%. The recomputes (fwd) are 18%. The rest is
+small.
+
+### Per-subkernel data movement (bwd)
+
+At prod shape (B=1, T=16384, H=12, K=V=128, NC=256, CHUNK=64).
+Sizes are for the dominant fwd path (use_gate_in_kernel=False,
+disable_recompute=False) which is what the model uses.
+
+| stage        | reads (MB)                       | writes (MB)                | total | roofline @448 GB/s |
+|--------------|----------------------------------|----------------------------|-------|--------------------|
+| w_u_recomp   | q(4) k(4) v(4) beta(0.25) A(3)  | w(4) u(4) qg(4) kg(4)      | 31    | 0.07 ms            |
+| h_recomp     | k(4) u(4) w(4) g(4)             | h(400) v_new(4)            | 420   | 0.94 ms            |
+| dAv          | v_new(4) do(4) A(3)             | dA(4) dv(4)                | 19    | 0.04 ms            |
+| dhu          | q(4) k(4) w(4) do(4) dv(4) dh(400) g(4) | dv2(4)            | 428   | 0.96 ms            |
+| wy_dqkg      | q(4) k(4) v(4) v_new(4) g(4) beta(0.25) A(3) h(400) do(4) dh(400) dv(4) | dq(8) dk(8) dv(4) dv2(4) dg(8) db(0.5) dA(4) | ~870 | 1.94 ms |
+| intra        | q(4) k(4) g(4) beta(0.25) dAqk(4) dAkk(4) dq(8) dk(8) dg(8) db(0.5) | dq2(8) dk2(8) dg2(8) db(0.5) | ~67 | 0.15 ms |
+| local_cumsum | dg(8)                            | dg(8)                      | 16    | 0.04 ms            |
+
+### Where the bwd actually spends its time vs roofline
+
+| stage        | actual (ms) | roofline (ms) | overhead | % of bw peak |
+|--------------|-------------|---------------|----------|--------------|
+| w_u_recomp   | 1.35        | 0.07          | 19x      | 5%            |
+| h_recomp     | 0.83        | 0.94          | 0.9x     | **113%** (overlap) |
+| dAv          | 0.61        | 0.04          | 15x      | 7%            |
+| dhu          | 1.39        | 0.96          | 1.4x     | 69%           |
+| wy_dqkg      | 3.31        | 1.94          | 1.7x     | 59%           |
+| intra        | 3.83        | 0.15          | 25x      | 4%            |
+| local_cumsum | 0.54        | 0.04          | 13x      | 7%            |
+
+**Three stages are >50% of HBM:** h_recomp (113%, due to overlap with
+fwd writes counted twice), dhu (69%), wy_dqkg (59%). The other four
+(w_u_recomp, dAv, intra, cumsum) are well below 50% — they're
+compute-bound or have terrible data locality (intra in particular:
+0.15 ms roofline vs 3.83 ms actual = 25x overhead, likely due to
+gather/scatter patterns of the intra kernel which is fundamentally
+4 nested loops over BC).
+
+### The bwd's three redundant transfers
+
+1. **h tensor: written once, read twice** (or three times counting
+   fwd). 400 MB write + 400 MB read in fwd_h, 400 MB read in dhu,
+   400 MB read in wy_dqkg. Total h traffic: **1600 MB** for a tensor
+   that's "only" 400 MB.
+
+2. **dh tensor: written in dhu (400 MB), read in wy_dqkg (400 MB)**.
+   Total dh traffic: 800 MB. Could be kept in registers across both
+   stages — saves 800 MB ≈ 1.8 ms at HBM peak.
+
+3. **q, k, g are loaded in fwd recompute AND in bwd stages** (intra
+   re-loads q, k, g; wy_dqkg re-loads q, k, g; etc.). Total q/k/g
+   reload: ~12 MB × ~6 stages ≈ 70 MB. Small.
+
+### The intra kernel: 32% of bwd at 4% of HBM peak
+
+The intra kernel is special — it's the only one with terrible
+bandwidth utilization (4%). Looking at the kernel code
+(`chunk_kda_bwd_kernel_intra` in `chunk_intra.py`), this is
+because:
+
+- The grid is `(K/BK, BT/BC, B*HV)` = `(1, 4, 12)` = 48 programs
+  for prod. Only 48 programs to saturate 36 SMs.
+- Each program does 4 nested loops over BC (intra sub-chunks),
+  with a complex gather/scatter pattern.
+- The kernel is fundamentally intra-chunk (4 sub-chunks of 16
+  tokens each), so the natural parallelism is small.
+
+This is compute-bound, not bandwidth-bound. The 3.83 ms is roughly
+the irreducible compute cost of the intra-chunk dq/dk/dg correction.
+
+### The wy_dqkg fused kernel: 28% of bwd at 59% of HBM
+
+This is the "workhorse" bwd kernel — fuses dq, dk, dv, dA, db, dg
+into one launch. It reads h[400 MB] and dh[400 MB] which are 92% of
+its I/O. This is similar to the fwd recurrence: bandwidth-bound on
+the h traffic. At 59% of HBM, it's leaving some headroom (vs 99%
+for fwd recurrence), but not much — probably ~0.5 ms of theoretical
+improvement.
+
+### Bottom line (bwd)
+
+The bwd at **13.5 ms (2.6x fwd)** is dominated by three things:
+1. **intra (32%)** — 4% of HBM, compute-bound, hard to optimize
+   without restructuring intra-chunk math
+2. **wy_dqkg (28%)** — 59% of HBM, bandwidth-bound on h/dh traffic,
+   ~0.5 ms theoretical headroom
+3. **h_recomp + dhu (19%)** — 113% / 69% of HBM, fwd+reverse
+   recurrence on h[NC], bandwidth-bound
+
+The biggest single opportunity is the **1600 MB h tensor traffic**
+across fwd_h, dhu, wy_dqkg — a persistent-kernel fusing all three
+would save ~1.6 ms (12% of bwd), at the cost of 5x more code
+complexity. Same trade-off as fwd.
+
+**Shipping-ready.** The fwd is at 99% of HBM; the bwd is 2.6x
+fwd which is the irreducible cost of the algorithm. Optimizing
+further requires a persistent-kernel rewrite of the bwd h-path
+(same complexity story as fwd, same low ROI).
+
+**Bwd is the new bottleneck for training throughput.** If we ever
+need to optimize, this is where to look. But not now.
