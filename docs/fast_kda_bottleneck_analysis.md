@@ -672,44 +672,101 @@ bandwidth utilization (4%). Looking at the kernel code
 (`chunk_kda_bwd_kernel_intra` in `chunk_intra.py`), this is
 because:
 
-- The grid is `(K/BK, BT/BC, B*HV)` = `(1, 4, 12)` = 48 programs
-  for prod. Only 48 programs to saturate 36 SMs.
-- Each program does 4 nested loops over BC (intra sub-chunks),
-  with a complex gather/scatter pattern.
+- The grid is `(NK*NC, NT, B*HV)` = `(16, 256, 12)` = 49,152
+  programs for prod. (NK=K/BK=4, NC=BT/BC=4, so 16 K-tile×
+  sub-chunk pairs per token-chunk per head, 256 token-chunks,
+  12 heads.)
+- Each program does small `tl.dot` of `(BC=16, BC=16) @ (BC=16, BK=32)`
+  — only **4.8 GFLOPs total** across all 49,152 programs.
 - The kernel is fundamentally intra-chunk (4 sub-chunks of 16
-  tokens each), so the natural parallelism is small.
+  tokens each), so per-program bmm is tiny.
 
-This is compute-bound, not bandwidth-bound. The 3.83 ms is roughly
-the irreducible compute cost of the intra-chunk dq/dk/dg correction.
+**This is NOT compute-bound.** Total intra compute is 4.8 GFLOPs,
+at 419 TFLOPs peak that's 0.012 ms. Actual: 3.83 ms. **0.30% of
+compute peak.** It's bandwidth-bound on the 605 MB I/O (AI = 8
+FLOPs/B, 117x below ridge), but more specifically it's
+**locality-bound**: small bmm + many small loads per program
+= poor SM utilization. ~3.82 ms of the 3.83 ms is overhead, not
+useful work.
 
-### The wy_dqkg fused kernel: 28% of bwd at 59% of HBM
+### Corrected arithmetic intensity analysis
+
+The earlier claim that intra is "compute-bound" was wrong.
+**Every bwd subkernel is bandwidth-bound.** The corrected picture
+(bench/fast_kda_bwd_ai_analysis.py):
+
+| stage          | FLOPs    | bytes  | AI    | ridge 935 | bound   | % peak |
+|----------------|----------|--------|-------|-----------|---------|--------|
+| w_u_recomp     | 6.4 G    | 428 MB | 15.0  | 62x below | BW      | 1.1% tc |
+| h_recomp       | 12.9 G   | 352 MB | 36.6  | 25x below | BW      | 3.7% tc |
+| dAv            | 6.4 G    | 226 MB | 28.4  | 33x below | BW      | 2.5% tc |
+| dhu            | 19.3 G   | 453 MB | 42.7  | 22x below | BW      | 3.3% tc |
+| wy_dqkg        | 27.4 G   | 932 MB | 29.4  | 32x below | BW      | 2.0% tc |
+| intra          | 4.8 G    | 606 MB | 8.0   | 117x below| BW-locality | 0.3% tc |
+| local_cumsum   | 25 M     | 201 MB | 0.1   | way below | BW      | 0.01% tc |
+| **TOTAL bwd**  | **77 G** | **3.2 GB** | **24** | **39x below ridge** | **all BW** | **1.6% tc** |
+
+Ridge point = 419 TFLOPs / 448 GB/s = **935 FLOPs/B**. Every bwd
+subkernel is 20-120x below ridge — they have 30-60x more
+*bandwidth* headroom than *compute* headroom. Even intra at
+0.30% of compute peak.
+
+**Total bwd compute = 77.3 GFLOPs** (chain-rule check: fwd is
+~30 GFLOPs, so bwd is 2.6x — matches the chain-rule prediction
+for 2-3x bwd-to-fwd ratio).
+
+**Total bwd time = 11.86 ms** at 1.56% of compute peak → 64x
+headroom on compute. The bwd is firmly bandwidth-bound; the
+2.6x slowdown vs fwd is **not** from compute.
+
+### Where the bwd time actually goes
+
+```
+bwd time (11.86 ms) vs:
+  - compute peak:  0.18 ms   (we use 1.6% of it, 64x headroom)
+  - HBM peak (using only the unique I/O across stages, no h/dh re-reads): 7.14 ms
+  - actual:       11.86 ms   (60% of HBM peak, 1.7x the "deduplicated" roofline)
+```
+
+The 11.86 / 7.14 = 1.7x gap is the cost of redundant h/dh traffic:
+h is read 3x (fwd_h write+read, dhu read, wy_dqkg read) and dh is
+read+writen across 2 stages. A persistent kernel fusing fwd_h +
+dhu + wy_dqkg would deduplicate the h/dh traffic and bring bwd
+close to the 7.14 ms roofline — saving ~4.7 ms (40% of bwd, 25%
+of step time).
+
+### The wy_dqkg fused kernel: 28% of bwd at 63% of HBM
 
 This is the "workhorse" bwd kernel — fuses dq, dk, dv, dA, db, dg
-into one launch. It reads h[400 MB] and dh[400 MB] which are 92% of
-its I/O. This is similar to the fwd recurrence: bandwidth-bound on
-the h traffic. At 59% of HBM, it's leaving some headroom (vs 99%
-for fwd recurrence), but not much — probably ~0.5 ms of theoretical
-improvement.
+into one launch. It reads h[100 MB] and dh[100 MB] which are 22% of
+its 932 MB I/O (also reads q, k, v, v_new, g, beta, A, do, dv).
+At 63% of HBM, it's similar to the fwd recurrence: bandwidth-bound
+on the h/dh traffic. ~0.8 ms of theoretical improvement at HBM
+peak.
 
-### Bottom line (bwd)
+### Bottom line (bwd, corrected)
 
-The bwd at **13.5 ms (2.6x fwd)** is dominated by three things:
-1. **intra (32%)** — 4% of HBM, compute-bound, hard to optimize
-   without restructuring intra-chunk math
-2. **wy_dqkg (28%)** — 59% of HBM, bandwidth-bound on h/dh traffic,
-   ~0.5 ms theoretical headroom
-3. **h_recomp + dhu (19%)** — 113% / 69% of HBM, fwd+reverse
-   recurrence on h[NC], bandwidth-bound
+The bwd at **13.5 ms (2.6x fwd)** is bandwidth-bound, dominated by:
+1. **intra (32%)** — 0.3% of compute peak, 35% of HBM peak.
+   Bandwidth-bound AND locality-bound (small bmm in 49k programs).
+   Hard to fix without restructuring intra math (e.g., larger
+   sub-chunks, fewer programs).
+2. **wy_dqkg (28%)** — 2% of compute peak, 63% of HBM peak.
+   Bandwidth-bound on h/dh traffic, ~0.8 ms headroom.
+3. **h_recomp + dhu (19%)** — 4% / 3% of compute peak, 95% / 73%
+   of HBM. Reverse+forward recurrence on h[NC], already near HBM
+   peak.
 
-The biggest single opportunity is the **1600 MB h tensor traffic**
-across fwd_h, dhu, wy_dqkg — a persistent-kernel fusing all three
-would save ~1.6 ms (12% of bwd), at the cost of 5x more code
-complexity. Same trade-off as fwd.
+**Compute is irrelevant.** Total bwd compute is 77 GFLOPs which
+would take 0.18 ms at peak. The 2.6x bwd-vs-fwd slowdown is from
+h/dh tensor re-traffic, not compute.
 
-**Shipping-ready.** The fwd is at 99% of HBM; the bwd is 2.6x
-fwd which is the irreducible cost of the algorithm. Optimizing
-further requires a persistent-kernel rewrite of the bwd h-path
-(same complexity story as fwd, same low ROI).
+**Biggest single opportunity** is the **700 MB h/dh redundant
+traffic** across fwd_h, dhu, wy_dqkg. A persistent kernel fusing
+all three (similar to what we considered for fwd) would save
+~4.7 ms (40% of bwd, 25% of step time), at the cost of 5x more
+code complexity. **Shipping-ready for now** — the complexity
+isn't worth it without evidence that training is the bottleneck.
 
 **Bwd is the new bottleneck for training throughput.** If we ever
 need to optimize, this is where to look. But not now.
