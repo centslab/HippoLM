@@ -334,7 +334,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [1])
+        # Default FLA restricts to [1] on non-ampere. On RTX 5060 Ti (ada,
+        # not ampere) ns=2 is the actual best — picks BV=64 nw=4 ns=2 at
+        # 1.322 ms vs the FLA default pick of BV=32 nw=4 ns=1 at 1.480 ms
+        # (+0.158 ms / 10.7% on dhu bwd). Extended to [2, 1] to match the
+        # fwd kernel above.
+        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
     key=['H', 'HV', 'K', 'V', 'BT', 'BV', 'USE_G', 'USE_EXP2', 'TRANSPOSE_STATE'],

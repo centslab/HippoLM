@@ -14,10 +14,11 @@ kda_mode: chunk            # chunk for training, fused_recurrent for inference
 use_short_conv: true
 allow_neg_eigval: false
 # ``safe_gate`` enables the M=16 TensorCore fast path in chunk_kda
-# (requires ``lower_bound``). Leave both off until the kernel
-# authors confirm the prod-dim block sizes support M=16.
-safe_gate: false
-lower_bound: null
+# (bwd intra + dhu + wy_dqkg). Requires ``lower_bound`` so the
+# chunk-cumsummed gate activation stays in a numerically safe range.
+# Recommended ``lower_bound`` is ``-5`` (FLA's default).
+safe_gate: true
+lower_bound: -5.0
 conv_size: 4
 conv_bias: false
 

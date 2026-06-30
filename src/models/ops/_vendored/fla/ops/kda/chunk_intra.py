@@ -865,7 +865,12 @@ def chunk_kda_bwd_intra(
     B, T, H, K, HV = *k.shape, g.shape[2]
     BT = chunk_size
     BC = min(16, BT)
-    BK = min(32, triton.next_power_of_2(K))
+    # BK = K (one iteration, single load of k and b_gn per program).
+    # Was min(32, ...) before — but K=128 is the production dim and
+    # going to BK=128 saves ~0.2 ms / ~5% on intra bwd (verified on
+    # RTX 5060 Ti). Autotune key includes 'BK' so the best nw/ns is
+    # still picked per-arch.
+    BK = min(128, triton.next_power_of_2(K))
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
