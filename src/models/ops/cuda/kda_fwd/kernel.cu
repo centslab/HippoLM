@@ -153,8 +153,8 @@ __global__ void __launch_bounds__(256, 2) delta_h_kernel(
     const int* __restrict__ doc_chunk_count,       // [num_docs]
     const int* __restrict__ chunk_token_base,      // [N_chunks]
     __nv_bfloat16* __restrict__ v_new_out,         // [T_total, HV, V]  per-token v_new (UN-DECAYED)
-    float* __restrict__ h_per_chunk,               // [N_chunks, HV, K, V]
-    float* __restrict__ h_final,                   // [num_docs, HV, K, V]
+    __nv_bfloat16* __restrict__ h_per_chunk,       // [N_chunks, HV, K, V] bf16 (Lever B: chunk_o reads bf16)
+    float* __restrict__ h_final,                   // [num_docs, HV, K, V] fp32 (unused in Round-1)
     int num_chunks,
     int H,
     int HV
@@ -191,11 +191,16 @@ __global__ void __launch_bounds__(256, 2) delta_h_kernel(
         // No __syncthreads needed: nothing in this iteration reads h_dst.
         // The output is consumed by a downstream kernel (chunk_o) which
         // sees consistent data via the kernel-launch boundary.
-        float* h_dst = h_per_chunk + ((chunk_id * HV + i_h) * K * V) + v_start;
+        // Lever B (June 2026-30): store bf16 to halve h_per_chunk HBM
+        // traffic. Internal fp32 accumulation is preserved in `h_prev`
+        // (shmem, fp32). Only the per-chunk snapshot is bf16 — safe
+        // because chunk_o's qg @ h matmul with bf16×bf16 has cos=1.0
+        // vs fp32×fp32 at prod shape (see test/_tmp/test_chunk_o_bf16_h.py).
+        __nv_bfloat16* h_dst = h_per_chunk + ((chunk_id * HV + i_h) * K * V) + v_start;
         for (int idx = tid; idx < K * V_TILE; idx += nthreads) {
             const int kk = idx / V_TILE;
             const int vj = idx % V_TILE;
-            h_dst[kk * V + vj] = h_prev[idx];
+            h_dst[kk * V + vj] = __float2bfloat16(h_prev[idx]);
         }
 
         // ----- pointers (correct strides for [T, H/HV, K/V] layout) -----
@@ -302,7 +307,7 @@ __global__ void __launch_bounds__(256, 2) wmma_delta_h_kernel(
     const int* __restrict__ doc_chunk_count,
     const int* __restrict__ chunk_token_base,
     __nv_bfloat16* __restrict__ v_new_out,
-    float* __restrict__ h_per_chunk,
+    __nv_bfloat16* __restrict__ h_per_chunk,   // Lever B: bf16 (was float*)
     float* __restrict__ h_final,
     int num_chunks,
     int H,
@@ -342,11 +347,12 @@ __global__ void __launch_bounds__(256, 2) wmma_delta_h_kernel(
         const int token_base = chunk_token_base[chunk_id];
 
         // ----- store h at START of this chunk (to global) -----
-        float* h_dst = h_per_chunk + ((chunk_id * HV + i_h) * K * V) + v_start;
+        // Lever B: bf16 store halves h_per_chunk HBM traffic vs fp32.
+        __nv_bfloat16* h_dst = h_per_chunk + ((chunk_id * HV + i_h) * K * V) + v_start;
         for (int idx = tid; idx < K * V_TILE; idx += nthreads) {
             const int kk = idx / V_TILE;
             const int vj = idx % V_TILE;
-            h_dst[kk * V + vj] = h_prev[idx];
+            h_dst[kk * V + vj] = __float2bfloat16(h_prev[idx]);
         }
 
         // ----- pointers -----
@@ -649,7 +655,9 @@ void delta_h(
     TORCH_CHECK(w.scalar_type() == at::kBFloat16, "w must be bf16");
     TORCH_CHECK(g.scalar_type() == at::kBFloat16, "g must be bf16");
     TORCH_CHECK(v_new_out.scalar_type() == at::kBFloat16, "v_new_out must be bf16");
-    TORCH_CHECK(h_per_chunk.scalar_type() == at::kFloat, "h_per_chunk must be fp32");
+    // Lever B (June 2026-30): h_per_chunk is now bf16 (was fp32). chunk_o
+    // consumes it via bf16 mma — cos=1.0 vs fp32 at prod shape.
+    TORCH_CHECK(h_per_chunk.scalar_type() == at::kBFloat16, "h_per_chunk must be bf16");
     TORCH_CHECK(h_final.scalar_type() == at::kFloat, "h_final must be fp32");
 
     int num_docs = doc_chunk_start.size(0);
@@ -675,7 +683,7 @@ void delta_h(
             doc_chunk_count.data_ptr<int>(),
             chunk_token_base.data_ptr<int>(),
             reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
-            h_per_chunk.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(h_per_chunk.data_ptr()),
             h_final.data_ptr<float>(),
             (int)num_chunks, (int)H, (int)HV_v
         );
@@ -689,7 +697,7 @@ void delta_h(
             doc_chunk_count.data_ptr<int>(),
             chunk_token_base.data_ptr<int>(),
             reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
-            h_per_chunk.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(h_per_chunk.data_ptr()),
             h_final.data_ptr<float>(),
             (int)num_chunks, (int)H, (int)HV_v
         );
@@ -703,7 +711,7 @@ void delta_h(
             doc_chunk_count.data_ptr<int>(),
             chunk_token_base.data_ptr<int>(),
             reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
-            h_per_chunk.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(h_per_chunk.data_ptr()),
             h_final.data_ptr<float>(),
             (int)num_chunks, (int)H, (int)HV_v
         );
@@ -728,7 +736,9 @@ void wmma_delta_h(
     TORCH_CHECK(w.scalar_type() == at::kBFloat16, "w must be bf16");
     TORCH_CHECK(g.scalar_type() == at::kBFloat16, "g must be bf16");
     TORCH_CHECK(v_new_out.scalar_type() == at::kBFloat16, "v_new_out must be bf16");
-    TORCH_CHECK(h_per_chunk.scalar_type() == at::kFloat, "h_per_chunk must be fp32");
+    // Lever B (June 2026-30): h_per_chunk is now bf16 (was fp32). chunk_o
+    // consumes it via bf16 mma — cos=1.0 vs fp32 at prod shape.
+    TORCH_CHECK(h_per_chunk.scalar_type() == at::kBFloat16, "h_per_chunk must be bf16");
     TORCH_CHECK(h_final.scalar_type() == at::kFloat, "h_final must be fp32");
 
     int num_docs = doc_chunk_start.size(0);
@@ -751,7 +761,7 @@ void wmma_delta_h(
             doc_chunk_count.data_ptr<int>(),
             chunk_token_base.data_ptr<int>(),
             reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
-            h_per_chunk.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(h_per_chunk.data_ptr()),
             h_final.data_ptr<float>(),
             (int)num_chunks, (int)H, (int)HV_v
         );
@@ -765,7 +775,7 @@ void wmma_delta_h(
             doc_chunk_count.data_ptr<int>(),
             chunk_token_base.data_ptr<int>(),
             reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
-            h_per_chunk.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(h_per_chunk.data_ptr()),
             h_final.data_ptr<float>(),
             (int)num_chunks, (int)H, (int)HV_v
         );
@@ -779,7 +789,7 @@ void wmma_delta_h(
             doc_chunk_count.data_ptr<int>(),
             chunk_token_base.data_ptr<int>(),
             reinterpret_cast<__nv_bfloat16*>(v_new_out.data_ptr()),
-            h_per_chunk.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(h_per_chunk.data_ptr()),
             h_final.data_ptr<float>(),
             (int)num_chunks, (int)H, (int)HV_v
         );

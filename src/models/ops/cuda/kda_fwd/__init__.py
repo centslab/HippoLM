@@ -100,10 +100,12 @@ def _delta_h(
     ``v_new_out`` for chunk_o to consume.
 
     Returns (h_per_chunk, h_final):
-      * h_per_chunk [num_chunks, HV, K, V] fp32 — h at the start of each chunk
-        (chunk_o consumes this).
+      * h_per_chunk [num_chunks, HV, K, V] bf16 — h at the start of each chunk
+        (chunk_o consumes this; Lever B June 2026-30: was fp32, now bf16
+        to halve HBM traffic on the qg @ h matmul).
       * h_final     [num_docs, HV, K, V]    fp32 — h at the end of each doc
-        (returned to the caller if output_final_state=True).
+        (returned to the caller if output_final_state=True; not used in
+        Round-1 since output_final_state is hardcoded False).
 
     Backend selection:
       * HIPPOLM_KDA_DELTA_H_BACKEND = "wmma"   (default; tensor cores via nvcuda::wmma)
@@ -111,8 +113,12 @@ def _delta_h(
     """
     import os
     mod = _ensure_compiled()
+    # Lever B (June 2026-30): h_per_chunk is bf16 (was fp32). The delta_h
+    # kernels accumulate in fp32 (h_prev in shmem), but only the per-chunk
+    # SNAPSHOT is bf16 — chunk_o consumes it via bf16 mma with cos=1.0 vs
+    # fp32 at prod shape (see test/_tmp/test_chunk_o_bf16_h.py).
     h_per_chunk = torch.empty(
-        num_chunks, HV, K, V, dtype=torch.float32, device=u.device,
+        num_chunks, HV, K, V, dtype=torch.bfloat16, device=u.device,
     )
     h_final = torch.empty(
         num_docs, HV, K, V, dtype=torch.float32, device=u.device,

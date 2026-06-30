@@ -5,7 +5,7 @@ biggest single-bottleneck in the Round 1 CUDA path), with our own layout
 conventions:
 
   * A_qk: [num_chunks, HV, BT, BT] bf16 (precomputed, scale baked in, lower-tri)
-  * h:    [num_chunks, HV, K, V]   fp32  (state at start of each chunk)
+  * h:    [num_chunks, HV, K, V]   bf16  (Lever B: state at start of each chunk)
   * q:    [T_total, H, K]          bf16
   * v_new:[T_total, HV, V]         bf16  (UN-DECAYED — output of delta_h)
   * g:    [T_total, HV, K]         bf16  (chunk-local cumsum, per-K)
@@ -15,6 +15,14 @@ Per-token strides: q is H*K per token; v_new / g / o are HV*V or HV*K per
 token (matches __init__.py layout).
 
 Round-2 R2A: triton_chunk_o replaces the 23-ms hand-rolled CUDA kernel.
+
+Lever B (June 2026-30): h is bf16 (was fp32). chunk_o consumes it via
+bf16 mma (Triton's tl.dot with bf16 operands emits TensorCore m16n8k16
+with fp32 accumulator — vs the bf16 × fp32 path which Triton promoted
+to fp32 × fp32). Saves ~36% of chunk_o HBM traffic (~0.23 ms / 1.28×
+at prod shape). cos=1.0 / med_rel=0.0 vs fp32-h at all tested shapes;
+max_rel ≤ 12% in the tail (within bf16 mma precision bound for K=128
+reductions). See test/_tmp/test_chunk_o_bf16_h.py.
 """
 from __future__ import annotations
 
@@ -29,7 +37,7 @@ def _chunk_o_kernel(
     v_new,              # [T_total, HV, V] bf16
     g,                  # [T_total, HV, K] bf16
     A_qk,               # [num_chunks, HV, BT, BT] bf16
-    h,                  # [num_chunks, HV, K, V]   fp32
+    h,                  # [num_chunks, HV, K, V]   bf16  (Lever B: was fp32)
     o,                  # [T_total, HV, V] bf16
     chunk_token_base,   # [num_chunks] int32
     q_token_stride,     # = H * K
@@ -79,14 +87,13 @@ def _chunk_o_kernel(
         b_g = tl.load(
             g_p + offs_i[:, None] * g_token_stride + offs_k[None, :]
         ).to(tl.float32)
-        # b_qg = b_q * exp2(b_g), bf16
-        b_qg = (b_q * tl.exp2(b_g)).to(b_q.dtype)
-        # h[BK, BV] with stride (V, 1)
-        b_h = tl.load(
-            h_p + offs_k[:, None] * V + offs_v[None, :]
-        ).to(tl.float32)
-        # b_o += (b_qg @ b_h) * scale
-        b_o += tl.dot(b_qg, b_h, out_dtype=tl.float32)
+        # b_qg = b_q * exp2(b_g), cast to bf16 explicitly so that
+        # tl.dot(b_qg, b_h) below uses bf16 mma (Lever B).
+        b_qg = (b_q * tl.exp2(b_g)).to(tl.bfloat16)
+        # h[BK, BV] bf16 — load directly, NO fp32 cast (Lever B).
+        b_h_bf16 = tl.load(h_p + offs_k[:, None] * V + offs_v[None, :])
+        # b_o += (b_qg @ b_h_bf16) — bf16 × bf16 → fp32 accum (TensorCore).
+        b_o += tl.dot(b_qg, b_h_bf16, out_dtype=tl.float32)
 
     b_o *= scale
 
