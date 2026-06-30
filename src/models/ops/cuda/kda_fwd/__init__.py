@@ -311,79 +311,29 @@ def chunk_kda_fwd(
     beta_per = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).contiguous()  # [NC, HV, BT]
 
     # ----- Cast q, k to fp32 ONCE (was the per-pair bottleneck) -----
-    # The bmm loop reads q[s_i*BC:(s_i+1)*BC] and k[s_j*BC:(s_j+1)*BC] per pair
-    # (10 pairs × 3 tensors = 30 casts of [num_chunks*HV, BC, K] per fwd).
-    # Casting the full q_per, k_per once at the top and slicing inside the loop
-    # turns 30 device-to-device copies into 2 (one per tensor).
-    # At prod shape (T=16384, H=12, K=128), each full-tensor cast is ~5ms of
-    # CPU launch overhead; the per-pair casts summed to ~150ms (see
-    # bench/kda_fwd_profile.py — `aten::copy_` was 89% of self-CPU).
-    q_per_fp32 = q_per.float()  # [NC, HV, BT, K] fp32 — done ONCE
-    k_per_fp32 = k_per.float()  # [NC, HV, BT, K] fp32
+    # Lever H (June 2026-30): the fused Triton intra_solve kernel reads q/k
+    # as bf16 and casts to fp32 IN REGISTERS (free — no HBM cost). This
+    # eliminates the two big fp32 pre-casts (~2.6 ms at prod) and replaces
+    # the 10-pair Python bmm loop (~17 ms at prod) with a single Triton
+    # launch. A_qk comes back bf16 with scale baked in; A_kk_fp32 stays
+    # fp32 for forward_sub (which requires fp32). See triton_intra_solve.py
+    # for the kernel and the (cos=0.999995, med_rel<0.1%) verification.
+    from .triton_intra_solve import triton_intra_solve
+    A_qk_bf16, A_kk_unscaled = triton_intra_solve(q_per, k_per, g_per, scale, BT, BC)
 
-    # Pre-compute per-sub-chunk q and k blocks: [NC, num_chunks, HV, BC, K]
-    # Use reshape then narrow along BT.
-    # We'll loop over (s_i, s_j) pairs and use bmm with batch = num_chunks * HV.
-    A_qk = torch.zeros(num_chunks * HV, BT, BT, device=q.device, dtype=torch.float32)
-    A_kk = torch.zeros(num_chunks * HV, BT, BT, device=q.device, dtype=torch.float32)
-
-    # Build (s_i, s_j) pair list: diagonal first, then off-diag.
-    pairs = [(s, s) for s in range(NC)] + [(s_i, s_j) for s_i in range(NC) for s_j in range(s_i)]
-
-    for s_i, s_j in pairs:
-        # Row slice: positions [s_i*BC, (s_i+1)*BC) in the chunk
-        # Col slice: positions [s_j*BC, (s_j+1)*BC) in the chunk
-        # Anchor selection:
-        if s_i == s_j:
-            anchor_pos = s_i * BC + (BC // 2)  # sub-chunk MIDDLE
-        else:
-            anchor_pos = s_i * BC                # ROW sub-chunk start
-        # Anchor g_cum at anchor_pos, shape [num_chunks, HV, K] fp32
-        g_anchor = g_per[:, :, anchor_pos, :]  # [num_chunks, HV, K]
-        # r block: exp2(g_cum[i] - g_anchor) for i in [s_i*BC, (s_i+1)*BC)
-        # c block: exp2(g_anchor - g_cum[j]) for j in [s_j*BC, (s_j+1)*BC)
-        g_row = g_per[:, :, s_i*BC:(s_i+1)*BC, :]  # [NC, HV, BC, K]
-        g_col = g_per[:, :, s_j*BC:(s_j+1)*BC, :]
-        r_block = (g_row - g_anchor.unsqueeze(2)).exp2()  # [NC, HV, BC, K] fp32
-        c_block = (g_anchor.unsqueeze(2) - g_col).exp2()
-        # q / k blocks: q for row sub-chunk s_i, k_col for col sub-chunk s_j.
-        # For A_kk, k_row is also from s_i (rows in the sub-block); for off-diag
-        # blocks (s_i > s_j), k_row and k_col are from DIFFERENT sub-chunks.
-        # Bug-fix: previously k_block (used as both row and col) was s_j only,
-        # which is wrong for off-diag A_kk. Use k_row_block = k[s_i] for rows.
-        # Slicing the pre-cast fp32 tensors — no per-pair .to(float32) copy.
-        q_block = q_per_fp32[:, :, s_i*BC:(s_i+1)*BC, :]
-        k_row_block = k_per_fp32[:, :, s_i*BC:(s_i+1)*BC, :]
-        k_col_block = k_per_fp32[:, :, s_j*BC:(s_j+1)*BC, :]
-        # Stack across (chunk, hv): [NC, HV, BC, K] -> [NC*HV, BC, K]
-        r_b = r_block.reshape(num_chunks * HV, BC, K)
-        c_b = c_block.reshape(num_chunks * HV, BC, K)
-        q_b = q_block.reshape(num_chunks * HV, BC, K)
-        k_row_b = k_row_block.reshape(num_chunks * HV, BC, K)
-        k_col_b = k_col_block.reshape(num_chunks * HV, BC, K)
-        # A_qk_block = bmm(q * r, (k_col * c).T) * scale
-        A_qk_block = torch.bmm(q_b * r_b, (k_col_b * c_b).transpose(-1, -2)) * scale  # fp32
-        # A_kk_block = bmm(k_row * r, (k_col * c).T) (no scale; beta applied below)
-        A_kk_block = torch.bmm(k_row_b * r_b, (k_col_b * c_b).transpose(-1, -2))
-        # Place into the output [num_chunks*HV, BT, BT]
-        # Slot rows [s_i*BC:(s_i+1)*BC] and cols [s_j*BC:(s_j+1)*BC]
-        A_qk[:, s_i*BC:(s_i+1)*BC, s_j*BC:(s_j+1)*BC] = A_qk_block
-        A_kk[:, s_i*BC:(s_i+1)*BC, s_j*BC:(s_j+1)*BC] = A_kk_block
-
-    # Apply beta to A_kk
+    # Apply beta to A_kk (row-side scaling).
     # beta is per-token: shape [num_chunks, HV, BT]
     # In stacked [num_chunks*HV, BT, BT] layout, beta is [num_chunks*HV, BT]
     beta_stacked = beta_per.reshape(num_chunks * HV, BT)
     # A_kk[i, m, n] *= beta[i, m] (row-side beta for the lower-tri mask)
-    A_kk = A_kk * beta_stacked.unsqueeze(-1)
+    A_kk_unscaled = A_kk_unscaled * beta_stacked.unsqueeze(-1)
     # Apply causal mask (strict lower-tri for A_kk)
     mask = torch.tril(torch.ones(BT, BT, device=q.device, dtype=torch.float32), diagonal=-1)
-    A_kk = A_kk * mask.unsqueeze(0)
+    A_kk_unscaled = A_kk_unscaled * mask.unsqueeze(0)
     # Add I on diagonal.
     eye = torch.eye(BT, device=q.device, dtype=torch.float32).unsqueeze(0)
-    A_kk_fp32 = A_kk + eye  # A = I + A_kk
-    # Cast A_qk to bf16 (storage dtype matches FLA's intra output)
-    A_qk_bf16 = A_qk.to(torch.bfloat16)
+    A_kk_fp32 = A_kk_unscaled + eye  # A = I + A_kk
+    # A_qk_bf16 already bf16 with scale baked in (from the fused kernel).
 
     # ----- forward_sub in place -----
     _forward_sub(A_kk_fp32, BT)
