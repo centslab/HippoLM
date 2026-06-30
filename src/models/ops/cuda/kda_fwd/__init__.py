@@ -327,10 +327,11 @@ def chunk_kda_fwd(
     beta_stacked = beta_per.reshape(num_chunks * HV, BT)
     # A_kk[i, m, n] *= beta[i, m] (row-side beta for the lower-tri mask)
     A_kk_unscaled = A_kk_unscaled * beta_stacked.unsqueeze(-1)
-    # Apply causal mask (strict lower-tri for A_kk)
-    mask = torch.tril(torch.ones(BT, BT, device=q.device, dtype=torch.float32), diagonal=-1)
-    A_kk_unscaled = A_kk_unscaled * mask.unsqueeze(0)
-    # Add I on diagonal.
+    # Add I on diagonal. The kernel (Lever K, June 2026-30) skips writing to
+    # the diagonal and upper-tri of A_kk_unscaled for s_i==s_j pairs, so the
+    # matmul output lives only on the strict lower-tri and we don't need the
+    # mask multiplication anymore. Saves ~0.78 ms at prod (was: mask alloc
+    # + mask multiply + the mask tensor's HBM write).
     eye = torch.eye(BT, device=q.device, dtype=torch.float32).unsqueeze(0)
     A_kk_fp32 = A_kk_unscaled + eye  # A = I + A_kk
     # A_qk_bf16 already bf16 with scale baked in (from the fused kernel).

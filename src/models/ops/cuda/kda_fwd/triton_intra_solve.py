@@ -114,7 +114,19 @@ def _intra_solve_kernel(
     # Write outputs at [pid_n, s_i*BC:(s_i+1)*BC, s_j*BC:(s_j+1)*BC]
     out_offs = row_off[:, None] * BT + col_off[None, :]
     tl.store(A_qk + pid_n * BT * BT + out_offs, A_qk_blk.to(tl.bfloat16))
-    tl.store(A_kk + pid_n * BT * BT + out_offs, A_kk_blk)
+    # Lever K (June 2026-30): for s_i == s_j pairs, the [BC, BC] sub-block
+    # includes positions both below AND above the diagonal of [BT, BT], plus
+    # the diagonal itself. We want A_kk to contain matmul values ONLY on the
+    # strict lower-tri (the diagonal will be set to 1 by `+ I` in the
+    # wrapper; the upper-tri should stay 0). Skip writing above-diag and
+    # diagonal positions — the wrapper's mask multiplication + eye add
+    # used to do this in PyTorch (~0.78 ms at prod), now done in-kernel.
+    if is_diag:
+        # row_off[i] > col_off[j] iff offs_i[i] > offs_i[j] (s_i == s_j)
+        store_mask = offs_i[:, None] > offs_i[None, :]  # [BC, BC]
+        tl.store(A_kk + pid_n * BT * BT + out_offs, A_kk_blk, mask=store_mask)
+    else:
+        tl.store(A_kk + pid_n * BT * BT + out_offs, A_kk_blk)
 
 
 def triton_intra_solve(
