@@ -1,9 +1,12 @@
-"""Per-stage GPU timing for chunk_kda_fwd.
+"""Per-stage GPU timing for chunk_kda_fwd — DEPRECATED.
 
-Wraps the CUDA wrapper with cuda.Event boundaries around each logical
-stage so we can see where the GPU time goes.
+DEPRECATED (June 2026-30): this file times the OLD Python bmm loop
+implementation, not the current Triton-fused wrappers. Kept for
+historical reference only.
 
-Stages timed:
+Use bench/kda_fwd_stage_breakdown_v2.py for current per-stage timing.
+
+Stages timed (OLD loop, not current):
   1. setup  - reshape, cumsum, exp2 of r_intra/c_intra/r_global/c_global
   2. intra  - the 10-pair bmm loop computing A_qk + A_kk
   3. fsub   - forward_sub kernel (in-place A^-1)
