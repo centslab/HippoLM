@@ -338,7 +338,7 @@ def chunk_kda_fwd(
     # ----- forward_sub in place -----
     _forward_sub(A_kk_fp32, BT)
 
-    # ----- Wy transform via bmm -----
+    # ----- Wy transform via fused Triton kernel -----
     # FLA's recompute_w_u_kda_kernel computes (matching wy_fast.py + KDA intra):
     #   u = A_inv @ (v * beta)
     #   w = A_inv @ (k * beta * exp2(g_cum))
@@ -346,18 +346,21 @@ def chunk_kda_fwd(
     # and chunk_o consumes v_new (NOT raw v) plus the q^Th contribution scaled
     # by exp2(g_cum[i]) and the local-qk contribution via Aqk (which already
     # has scale baked in).
-    # Reuse v_per from above (line ~321).
+    # Lever I (June 2026-30): fused into ONE Triton kernel (was 2 cuBLAS bmms +
+    # 4 .to() casts + 2 .contiguous() + 4 element-wise ops). Saves ~3.8 ms at
+    # prod (4.7 -> 0.9 ms). A_kk_fp32 is loaded ONCE into shmem and shared by
+    # both u and w. Element-wise intermediates (beta_v, k_with_beta_g) live in
+    # registers. See triton_wy_transform.py and test/_tmp/test_wy_fusion.py
+    # (cos=0.99999x, med_rel<0.5% at all shapes).
+    from .triton_wy_transform import wy_fused_transform
     v_per_stacked = v_per.view(num_chunks * HV, BT, V)
     k_per_stacked = k_per.view(num_chunks * HV, BT, K)
     beta_stacked = beta_per.reshape(num_chunks * HV, BT)
     g_per_stacked = g_per.view(num_chunks * HV, BT, K)
-
-    beta_v = (v_per_stacked * beta_stacked.unsqueeze(-1)).contiguous()
-    u = torch.bmm(A_kk_fp32, beta_v.to(torch.float32)).to(torch.bfloat16)  # [N, BT, V]
-    # Per-token exp2(g_cum[i, k]) per K-dim, broadcast across V.
-    g_cum_exp2 = g_per_stacked.exp2()  # [N, BT, K] fp32
-    k_with_beta_g = (k_per_stacked * beta_stacked.unsqueeze(-1) * g_cum_exp2.to(torch.bfloat16)).contiguous()
-    w = torch.bmm(A_kk_fp32, k_with_beta_g.to(torch.float32)).to(torch.bfloat16)  # [N, BT, K]
+    u, w = wy_fused_transform(
+        A_kk_fp32, v_per_stacked, k_per_stacked, g_per_stacked, beta_stacked,
+        BT=BT, BV=V, BK=K, K=K,
+    )
 
     # ----- layout tensors for the per-chunk kernels -----
     # chunk_token_base: [num_chunks] int32 = the absolute token start of each chunk.
