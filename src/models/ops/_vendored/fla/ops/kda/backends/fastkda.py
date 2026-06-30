@@ -148,7 +148,10 @@ class FastKDABackend(BaseBackend):
 
         # Workspace: prepare runs all the per-chunk work (gate
         # activation, q/k L2 norm, exp decay apply, INV via Neumann
-        # series). Returns 6 workspace tensors.
+        # series, Round-9 fold-in to Mqk_eff and K_pre). Returns 5
+        # workspace tensors (Round-9 dropped the standalone INV tensor
+        # since Mqk_eff and K_pre fully capture its information content
+        # for the recurrence).
         ws = kda_prepare_triton(
             q=q, k=k, g=g, beta=beta,
             A_log=A_log, dt_bias=dt_bias,
@@ -156,12 +159,16 @@ class FastKDABackend(BaseBackend):
         )
 
         # Recurrence: cross-chunk state evolution + per-token O.
-        # Returns (o [B, T, H, V] bf16, h_intermediate, final_state).
+        # Round-9 inputs: k_decayed (for v_residual subtraction), beta
+        # (for v_residual_b scaling), K_pre (INV @ k_restored), Mqk_eff
+        # (Mqk @ INV). Returns (o [B, T, H, V] bf16, h_intermediate, final_state).
         o, _h_intermediate, final_state = kda_recurrence_triton(
+            k_decayed=ws["k_decayed"],
             q_decayed=ws["q_decayed"],
-            k_restored=ws["k_restored"],
+            K_pre=ws["K_pre"],
             g_total=ws["g_total"],
-            mqk=ws["Mqk"],
+            mqk_eff=ws["Mqk_eff"],
+            beta=beta,
             v=v,
             initial_state=initial_state,
             output_final_state=output_final_state,

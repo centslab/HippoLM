@@ -118,7 +118,13 @@ def main():
         def _rec():
             ws = kda_prepare_triton(q, k, g, beta, A_log, dt_bias, -5.0, scale)
             kda_recurrence_triton(
-                ws["q_decayed"], ws["k_restored"], ws["g_total"], ws["Mqk"], v,
+                k_decayed=ws["k_decayed"],
+                q_decayed=ws["q_decayed"],
+                K_pre=ws["K_pre"],
+                g_total=ws["g_total"],
+                mqk_eff=ws["Mqk_eff"],
+                beta=beta,
+                v=v,
             )
         rec_total_ms = _bench(_rec, args.iters)
         rec_only_ms = max(rec_total_ms - prep_ms, 0.01)

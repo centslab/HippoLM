@@ -12,6 +12,38 @@ no SM90+ TMA, no external deps). The key idea:
     L = k_decayed @ k_inv.T           <-- single tl.dot
     Mqk = q_decayed @ k_inv.T         <-- single tl.dot
     INV = (I - L)^(-1) via Neumann    <-- 4 in-tile matmuls
+    Mqk_eff = Mqk @ INV               <-- single tl.dot  (Round-9 fix)
+    K_pre   = INV @ k_restored        <-- single tl.dot  (Round-9 fix)
+
+The Round-9 fix is what makes the recurrence numerically correct.
+The intra-chunk output of the chunk-wise GDR is:
+
+    o[t] = q_decayed[t] @ h_prev
+         + Mqk @ (INV @ ((v - k_decayed @ h_prev) * beta))
+
+where the (I - L)^-1 (i.e. INV) is applied to the v_residual * beta. The
+first draft of FastKDA computed INV but the recurrence ignored it,
+producing o = Mqk @ v directly — wrong on multiple counts (no
+v_residual subtraction, no (I - L)^-1, no beta scaling). Round-9 fixes
+this by precomputing the two "fold-into-workspace" combinations in
+prepare:
+
+    Mqk_eff = Mqk @ INV         (replaces Mqk in mqk_ptr)
+    K_pre   = INV @ k_restored  (replaces k_restored in kr_ptr)
+
+The recurrence then does:
+    v_residual = v - k_decayed @ h_prev
+    v_residual_b = v_residual * beta
+    o = Mqk_eff @ v_residual_b + q_decayed @ h_prev
+    h_new = h * exp(g_total) + K_pre^T @ v_residual_b
+
+This matches FlashKDA's reference (`tests/torch_ref.py:232-243`) and
+FLA's KDA path (chunk_kda_fwd_kernel_inter_solve_fused +
+recompute_w_u_fwd). The two extra prepare bmms cost ~5% of prepare
+time; the recurrence adds one big matmul (k_decayed @ h_prev) but
+stays at HBM peak (the v_residual matmul output is tiny and the
+k_decayed load was already in the workspace under a different
+contract — we were writing it but not reading it).
 
 Per-program work: 1 chunk (CHUNK=16 tokens) of 1 head of 1 batch.
 
@@ -24,10 +56,10 @@ Layout (row-major contiguous, stride documented inline):
                                     it with the same pid_b*NC + pid_nc scheme):
       k_decayed:       [B*NC, H, CHUNK, K]   bf16
       q_decayed:       [B*NC, H, CHUNK, K]   bf16
-      k_restored:      [B*NC, H, CHUNK, K]   bf16
+      K_pre:           [B*NC, H, CHUNK, K]   bf16   (was k_restored)
       g_total:         [B*NC, H, K]          fp32
-      INV:             [B*NC, H, CHUNK, CHUNK] bf16
-      Mqk:             [B*NC, H, CHUNK, CHUNK] bf16
+      Mqk_eff:         [B*NC, H, CHUNK, CHUNK] bf16   (was Mqk)
+      (INV is computed but NOT stored — folded into Mqk_eff and K_pre)
 """
 from __future__ import annotations
 
@@ -46,8 +78,8 @@ CHUNK: int = 16   # tokens per chunk — matches FlashKDA, FLA
 def _kda_prepare_kernel(
     q_ptr, k_ptr, g_ptr, beta_ptr,
     A_log_ptr, dt_bias_ptr,
-    # workspace outputs
-    kd_ptr, qd_ptr, kr_ptr, gt_ptr, inv_ptr, mqk_ptr,
+    # workspace outputs (note: no inv_ptr — INV is folded into Mqk_eff and K_pre)
+    kd_ptr, qd_ptr, kr_ptr, gt_ptr, mqk_ptr,
     # problem dims
     B, H, K,  # K must equal CHUNK*8 (=128 with CHUNK=16)
     T, NC,  # total tokens per batch, num chunks per batch
@@ -60,12 +92,11 @@ def _kda_prepare_kernel(
     stride_qd_nc, stride_qd_h,
     stride_kr_nc, stride_kr_h,
     stride_gt_nc, stride_gt_h,
-    stride_inv_nc, stride_inv_h,
     stride_mqk_nc, stride_mqk_h,
     # scalars
     scale,
     a_log_exp_per_head_ptr,  # precomputed exp(A_log) per head, [H] fp32
-    gate_scale,  # lower_bound * ln(2)
+    gate_scale,  # lower_bound (natural-log convention; see kernel comment)
     # block sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,  # K dim = 128
@@ -194,12 +225,28 @@ def _kda_prepare_kernel(
     # 4 iterations: (I + L + L^2 + L^3 + L^4) approximation
     for _ in range(4):
         INV_f32 = tl.dot(INV_f32, I_plus_L, out_dtype=tl.float32)
-    INV = INV_f32.to(tl.bfloat16)
+    # INV is computed in fp32 — use the high-precision version for the
+    # Round-9 fold-ins (Mqk_eff, K_pre) below. INV itself is NOT stored to
+    # gmem; its information content is fully captured by the two
+    # pre-multiplied products.
+    #
+    # ---------------- Fold INV into the recurrence inputs ---------------- #
+    # Mqk_eff = Mqk @ INV   shape [CHUNK, CHUNK] bf16
+    #   The recurrence does o_attn = Mqk_eff @ v_residual_b. Mqk was stored
+    #   as bf16 above, so we promote to fp32 for the matmul (matches
+    #   FlashKDA's fp32 matmul_acc path for the highest precision step).
+    Mqk_f32 = Mqk.to(tl.float32)
+    Mqk_eff = tl.dot(Mqk_f32, INV_f32, out_dtype=tl.float32).to(tl.bfloat16)
+    # K_pre = INV @ k_restored   shape [CHUNK, K] bf16
+    #   The recurrence does h_contrib = K_pre^T @ v_residual_b. k_restored
+    #   was stored as bf16 above; promote for the matmul.
+    k_restored_f32 = k_restored.to(tl.float32)
+    K_pre = tl.dot(INV_f32, k_restored_f32, out_dtype=tl.float32).to(tl.bfloat16)
 
     # ---------------- Store workspace outputs ---------------- #
     # Flat (b, c) → single index = pid_b * NC + pid_nc; workspace is [B*NC, H, ...]
     nc_idx = pid_b * NC + pid_nc
-    # k_decayed, q_decayed, k_restored: [BLOCK_M, BLOCK_N] bf16
+    # k_decayed, q_decayed, K_pre: [BLOCK_M, BLOCK_N] bf16
     kd_off = nc_idx * stride_kd_nc + pid_h * stride_kd_h
     qd_off = nc_idx * stride_qd_nc + pid_h * stride_qd_h
     kr_off = nc_idx * stride_kr_nc + pid_h * stride_kr_h
@@ -207,18 +254,21 @@ def _kda_prepare_kernel(
     store_2d = offs_m_local[:, None] * BLOCK_N + offs_n[None, :]
     tl.store(kd_ptr + kd_off + store_2d, k_decayed)
     tl.store(qd_ptr + qd_off + store_2d, q_decayed)
-    tl.store(kr_ptr + kr_off + store_2d, k_restored)
+    # Round-9: kr_ptr now stores K_pre = INV @ k_restored, not k_restored
+    # itself. The recurrence needs K_pre for the h_new update; the
+    # original k_restored is recoverable as (I - L) @ K_pre but that
+    # would cost more than just precomputing K_pre once.
+    tl.store(kr_ptr + kr_off + store_2d, K_pre)
 
     # g_total: [BLOCK_N] fp32
     gt_off = nc_idx * stride_gt_nc + pid_h * stride_gt_h
     tl.store(gt_ptr + gt_off + offs_n, g_total)
 
-    # INV, Mqk: [BLOCK_M, BLOCK_M] bf16
+    # Mqk_eff: [BLOCK_M, BLOCK_M] bf16 (was Mqk before Round-9; INV was
+    # also stored here but is now folded in)
     store_2d_small = offs_m_local[:, None] * BLOCK_M + offs_m_local[None, :]
-    inv_off = nc_idx * stride_inv_nc + pid_h * stride_inv_h
     mqk_off = nc_idx * stride_mqk_nc + pid_h * stride_mqk_h
-    tl.store(inv_ptr + inv_off + store_2d_small, INV)
-    tl.store(mqk_ptr + mqk_off + store_2d_small, Mqk)
+    tl.store(mqk_ptr + mqk_off + store_2d_small, Mqk_eff)
 
 
 # ===================================================================== #
@@ -238,6 +288,14 @@ def kda_prepare_triton(
     """Returns dict of per-chunk workspace tensors for use by the
     recurrence step. All workspace is bf16 (small matrices) or fp32
     (g_total, used for the recurrence's state decay).
+
+    Round-9 change: INV is no longer returned/stored. Instead, the two
+    INV-premultiplied products are returned in its place:
+        "Mqk_eff" — replaces "Mqk"  (Mqk @ INV, for the o matmul)
+        "K_pre"   — replaces "k_restored"  (INV @ k_restored, for h update)
+    The recurrence reads k_decayed (still in the workspace) to form the
+    v_residual = v - k_decayed @ h_prev subtraction before applying the
+    pre-folded Mqk_eff and K_pre.
 
     Workspace layout: [B*NC, H, ...] (batch-major then chunk-major),
     so the recurrence can read it with the same pid_b * NC + pid_nc
@@ -266,26 +324,37 @@ def kda_prepare_triton(
 
     # Workspace allocation — flat [B*NC, H, ...] so the kernel uses one
     # `nc_idx = pid_b * NC + pid_nc` index for the leading dim.
+    # Round-9: dropped `inv` (5 tensors total; INV info folded into the
+    # other two). The HBM savings are small but the recurrence no longer
+    # needs to read or stash a 16x16 bf16 matrix it doesn't use.
     kd = torch.empty(B * NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
     qd = torch.empty(B * NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
     kr = torch.empty(B * NC, H, CHUNK, K, dtype=torch.bfloat16, device=device)
     gt = torch.empty(B * NC, H, K, dtype=torch.float32, device=device)
-    inv = torch.empty(B * NC, H, CHUNK, CHUNK, dtype=torch.bfloat16, device=device)
     mqk = torch.empty(B * NC, H, CHUNK, CHUNK, dtype=torch.bfloat16, device=device)
 
     a_log_exp = torch.exp(A_log.float()).contiguous()
-    # gate_scale = lower_bound * ln(2) so that:
-    #   g_activated_natural = lower_bound * sigmoid(...) * ln(2)
-    #   exp(g_activated_natural) = 2^(lower_bound * sigmoid(...))
-    # which matches FLA's safe_gate convention (g = lower_bound * sigmoid(...)
-    # in log2 space, then exp2(g) gives the multiplier).
-    gate_scale = lower_bound * 0.6931471805599453  # ln(2) ≈ 0.6931
+    # FLA's safe_gate path (gate.py:407 + chunk_fwd.py:51, with
+    # kda_gate_chunk_cumsum applying scale=RCP_LN2 after the
+    # sigmoid) computes:
+    #   g_val = lower_bound * sigmoid(exp(A_log) * (g + bias))
+    #   decay = exp2(cumsum(g_val)) = 2^(lower_bound * LOG2E * X)
+    # where X = cumsum_sigmoid(exp(A_log) * (g + bias)).
+    #
+    # We replicate this in natural log space: gate_scale = lower_bound,
+    # then exp(cumsum(g_val)) = exp(lower_bound * X)
+    #                       = 2^(lower_bound * LOG2E * X).
+    # Mathematically identical to FLA's exp2 path; equivalent to
+    # FlashKDA reference's log2-space path on the sigmoid input
+    # (FastKDA kept exp(A_log) inside sigmoid to match FLA's
+    # chunk_kda_safe_gate, not FlashKDA's 2^A_log convention).
+    gate_scale = float(lower_bound)
 
     grid = (NC, H, B)
     _kda_prepare_kernel[grid](
         q, k, g, beta,
         A_log, dt_bias,
-        kd, qd, kr, gt, inv, mqk,
+        kd, qd, kr, gt, mqk,
         B, H, K, T, NC,
         # B strides (may equal T-stride for B=1, but we pass it
         # unconditionally so the kernel works for any B).
@@ -297,7 +366,6 @@ def kda_prepare_triton(
         qd.stride(0), qd.stride(1),
         kr.stride(0), kr.stride(1),
         gt.stride(0), gt.stride(1),
-        inv.stride(0), inv.stride(1),
         mqk.stride(0), mqk.stride(1),
         float(scale),
         a_log_exp,
@@ -306,6 +374,9 @@ def kda_prepare_triton(
         BLOCK_N=K,
     )
     return {
-        "k_decayed": kd, "q_decayed": qd, "k_restored": kr,
-        "g_total": gt, "INV": inv, "Mqk": mqk,
+        "k_decayed": kd,
+        "q_decayed": qd,
+        "K_pre": kr,
+        "g_total": gt,
+        "Mqk_eff": mqk,
     }
