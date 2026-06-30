@@ -1,4 +1,4 @@
-"""Lever M + O — strided reads + direct u output (June 2026-30).
+"""Lever M + O + P — strided reads + direct u + fused beta/I (June 2026-30).
 
 Lever M (June 2026-30): verifies the strided-read refactor of intra_solve
 and wy_fused_transform keeps correctness vs FLA, and removes the 4
@@ -8,6 +8,11 @@ Lever O (June 2026-30): wy_fused_transform writes u directly to
 [T_total, HV, V] strided layout, eliminating the downstream
 transpose+contiguous() in __init__.py:405. delta_h reads u via the same
 stride pattern, so no consumer change is needed.
+
+Lever P (June 2026-30): intra_solve kernel applies beta row-wise and adds
+1.0 on the diagonal — A_kk_fp32 is direct output of `A = I + A_kk * beta`
+(lower-tri entries). Saves the wrapper's post-intra `A_kk * beta` (0.40 ms)
+and `+ eye` (0.32 ms) at prod.
 
 Setup (mirrors bench/kda_fwd_bench.py inputs):
   * q, k: L2-normalized bf16 (matches production)
@@ -20,6 +25,8 @@ Pass criteria (matches docs/verification_thresholds.md):
   * No NaN / Inf
   * Determinism: bit-exact across two runs
   * u comes back in [T, HV, V] shape (Lever O)
+  * A_kk_fp32 has correct diagonal = 1.0 (Lever P — implicit via end-to-end
+    cos/med_rel vs FLA)
 
 Shapes tested: small, medium, k128, prod.
 """
@@ -142,9 +149,7 @@ def test_lever_o_direct_u_layout():
 
     # Run enough of the pipeline to get A_inv.
     _, g_cum_tok = g_cumsum_fused(g_tok, num_chunks, HV, K, BT)
-    A_qk, A_kk = triton_intra_solve(q_tok, k_tok, g_cum_tok, scale, BT, BC, H=H)
-    beta_stacked = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).reshape(num_chunks * HV, BT)
-    A_kk_fp32 = A_kk * beta_stacked.unsqueeze(-1) + torch.eye(BT, device=device, dtype=torch.float32).unsqueeze(0)
+    A_qk, A_kk_fp32 = triton_intra_solve(q_tok, k_tok, g_cum_tok, beta_tok, scale, BT, BC, H=H)
     from src.models.ops.cuda.kda_fwd import _forward_sub
     _forward_sub(A_kk_fp32, BT)
 
@@ -167,4 +172,4 @@ if __name__ == "__main__":
     test_strided_correctness()
     test_strided_determinism()
     test_lever_o_direct_u_layout()
-    print("\nAll Lever M + O tests PASSED")
+    print("\nAll Lever M + O + P tests PASSED")

@@ -323,26 +323,19 @@ def chunk_kda_fwd(
     # kernel and the (cos=0.999995, med_rel<0.1%) verification.
     # Lever M (June 2026-30): strided reads from [T, H, K] natural layout —
     # eliminates 4 .contiguous() calls (~0.5 ms at prod).
+    # Lever P (June 2026-30): the kernel now applies beta row-wise and
+    # adds 1.0 on the diagonal — `A_kk_fp32` is direct output of
+    # `A = I + A_kk * beta` (lower-tri entries). Saves the wrapper from
+    # doing the post-intra `A_kk * beta` (0.40 ms) and `+ eye` (0.32 ms)
+    # at prod. Total Lever P savings: ~0.72 ms.
     from .triton_intra_solve import triton_intra_solve
-    A_qk_bf16, A_kk_unscaled = triton_intra_solve(q_tok, k_tok, g_cum_tok, scale, BT, BC, H=H)
-
-    # Apply beta to A_kk (row-side scaling).
-    # beta is per-token: shape [T_total, HV]. We need it stacked as
-    # [num_chunks*HV, BT] for the row-side multiply. The order matches
-    # pid_n = chunk_idx * HV + hv_idx, so we reorder via the natural
-    # per-token layout: beta_tok[t, hv] for t in [chunk*BT, (chunk+1)*BT)
-    # → beta_stacked[chunk*HV + hv, t - chunk*BT].
-    beta_stacked = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).reshape(num_chunks * HV, BT)
-    # A_kk[i, m, n] *= beta[i, m] (row-side beta for the lower-tri mask)
-    A_kk_unscaled = A_kk_unscaled * beta_stacked.unsqueeze(-1)
-    # Add I on diagonal. The kernel (Lever K, June 2026-30) skips writing to
-    # the diagonal and upper-tri of A_kk_unscaled for s_i==s_j pairs, so the
-    # matmul output lives only on the strict lower-tri and we don't need the
-    # mask multiplication anymore. Saves ~0.78 ms at prod (was: mask alloc
-    # + mask multiply + the mask tensor's HBM write).
-    eye = torch.eye(BT, device=q.device, dtype=torch.float32).unsqueeze(0)
-    A_kk_fp32 = A_kk_unscaled + eye  # A = I + A_kk
+    A_qk_bf16, A_kk_fp32 = triton_intra_solve(
+        q_tok, k_tok, g_cum_tok, beta_tok,
+        scale, BT, BC, H=H,
+    )
     # A_qk_bf16 already bf16 with scale baked in (from the fused kernel).
+    # A_kk_fp32 is fp32 with A = I + A_kk * beta on the strict lower-tri
+    # (+ diagonal entries = 1.0). Forward_sub consumes this directly.
 
     # ----- forward_sub in place -----
     _forward_sub(A_kk_fp32, BT)

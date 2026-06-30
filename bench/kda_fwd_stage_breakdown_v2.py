@@ -81,10 +81,7 @@ def main():
     # ---- warmup ----
     for _ in range(5):
         g_per, g_cum_tok = g_cumsum_fused(g_tok, num_chunks, HV, K, BT)
-        A_qk, A_kk = triton_intra_solve(q_tok, k_tok, g_cum_tok, scale, BT, BC, H=H)
-        beta_stacked = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).reshape(num_chunks * HV, BT)
-        A_kk_unscaled = A_kk * beta_stacked.unsqueeze(-1)
-        A_kk_fp32 = A_kk_unscaled + eye
+        A_qk, A_kk_fp32 = triton_intra_solve(q_tok, k_tok, g_cum_tok, beta_tok, scale, BT, BC, H=H)
         _forward_sub(A_kk_fp32, BT)
         u, w = wy_fused_transform(A_kk_fp32, v_tok, k_tok, g_cum_tok, beta_tok,
                                   T=T, BT=BT, BV=V, BK=K, K=K, V=V, H=H)
@@ -115,12 +112,9 @@ def main():
         g_per, g_cum_tok = g_cumsum_fused(g_tok, num_chunks, HV, K, BT)
 
         e1.record()
-        A_qk, A_kk = triton_intra_solve(q_tok, k_tok, g_cum_tok, scale, BT, BC, H=H)
+        A_qk, A_kk_fp32 = triton_intra_solve(q_tok, k_tok, g_cum_tok, beta_tok, scale, BT, BC, H=H)
 
         e2.record()
-        beta_stacked = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).reshape(num_chunks * HV, BT)
-        A_kk_unscaled = A_kk * beta_stacked.unsqueeze(-1)
-        A_kk_fp32 = A_kk_unscaled + eye
         _forward_sub(A_kk_fp32, BT)
 
         e3.record()
@@ -166,10 +160,7 @@ def main():
         e0 = _event(); e1 = _event()
         # Need state from prior run; do another full pipeline but only time last stage
         g_per, g_cum_tok = g_cumsum_fused(g_tok, num_chunks, HV, K, BT)
-        A_qk, A_kk = triton_intra_solve(q_tok, k_tok, g_cum_tok, scale, BT, BC, H=H)
-        beta_stacked = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).reshape(num_chunks * HV, BT)
-        A_kk_unscaled = A_kk * beta_stacked.unsqueeze(-1)
-        A_kk_fp32 = A_kk_unscaled + eye
+        A_qk, A_kk_fp32 = triton_intra_solve(q_tok, k_tok, g_cum_tok, beta_tok, scale, BT, BC, H=H)
         _forward_sub(A_kk_fp32, BT)
         u, w = wy_fused_transform(A_kk_fp32, v_tok, k_tok, g_cum_tok, beta_tok,
                                   T=T, BT=BT, BV=V, BK=K, K=K, V=V, H=H)
