@@ -364,9 +364,13 @@ def chunk_kda_fwd(
     # Lever M (June 2026-30): strided reads from [T, H, K] / [T, HV, V] natural
     # layouts — eliminates 4 .contiguous() calls in v_per/k_per/beta_per
     # (~0.4 ms at prod).
+    # Lever O (June 2026-30): u is written DIRECTLY into [T_total, HV, V]
+    # strided layout by the kernel — no downstream transpose+contiguous()
+    # needed. Saves ~0.30 ms at prod.
     from .triton_wy_transform import wy_fused_transform
     u, w = wy_fused_transform(
         A_kk_fp32, v_tok, k_tok, g_cum_tok, beta_tok,
+        T=T_total,
         BT=BT, BV=V, BK=K, K=K, V=V, H=H,
     )
 
@@ -396,13 +400,12 @@ def chunk_kda_fwd(
     V_TILE_DELTA = 32
     V_TILE_O = 64
     NV = V // V_TILE_DELTA
-    # Reshape w and u from [N=NC*HV, BT, ...] to [NC, HV, BT, ...] for delta_h.
-    # w: [num_chunks, HV, BT, K]. u: [num_chunks, HV, BT, V].
+    # Reshape w from [N=NC*HV, BT, K] to [NC, HV, BT, K] for delta_h.
+    # w_per_hv[c, hv, i, k] — contiguous within (c, hv) tile.
     w_per_hv = w.view(num_chunks, HV, BT, K).contiguous()
-    # u is per-chunk, per-hv, per-token. Reshape to per-token [T_total, HV, V].
-    # u_per_chunk[c, hv, i, v] = u_tok[c*BT + i, hv, v]
-    u_per_chunk = u.view(num_chunks, HV, BT, V)
-    u_tok = u_per_chunk.transpose(1, 2).contiguous().view(T_total, HV, V)
+    # u is already in [T_total, HV, V] strided layout (Lever O, written
+    # directly by wy_fused_kernel). delta_h reads it with stride HV*V.
+    u_tok = u  # alias for clarity (already shape [T_total, HV, V])
     v_new_tok = torch.empty(T_total, HV, V, dtype=torch.bfloat16, device=q.device)
     h_per_chunk, h_final = _delta_h(
         k_tok, u_tok, w_per_hv, g_cum_tok,

@@ -1,19 +1,20 @@
 """Lever I — fused wy_transform Triton kernel (replaces the 4.7 ms 2-bmm loop).
 
-Strided-read layout (Lever M, June 2026-30):
+Lever I + M + O (June 2026-30):
   * A_kk_fp32: [N, BT, BT] fp32  (post-forward_sub = A_inv, contiguous)
   * v_tok:     [T, HV, V] bf16   (strided; natural [B, T, HV, V] flattened)
   * k_tok:     [T, H, K]  bf16   (strided)
   * g_cum_tok: [T, H, K]  bf16   (strided; cumsum, log2)
   * beta_tok:  [T, HV]    bf16   (strided)
-  * u:         [N, BT, BV] bf16
-  * w:         [N, BT, BK] bf16
+  * u_out:     [T, HV, V] bf16   (strided WRITE; direct [T, HV, V] layout,
+                                  no transpose+contiguous needed downstream)
+  * w_out:     [N, BT, BK] bf16  (contiguous; delta_h reads w as [N, BT, K])
 
 Grid: (1, N). One program per (chunk, hv).
 
 Computation (matches FLA wy_fast):
   beta_v = v * beta                       [BT, BV] (registers)
-  u = A_inv @ beta_v                      [BT, BV] bf16
+  u = A_inv @ beta_v                      [BT, BV] bf16  → u_out[strided]
   k_with_beta_g = k * beta * exp2(g)      [BT, BK] (registers)
   w = A_inv @ k_with_beta_g               [BT, BK] bf16
 
@@ -23,6 +24,10 @@ Lever I savings at prod (B=1 T=16384 H=12 K=V=128):
   Net:       ~3.8 ms saved at prod.
 Lever M savings (strided reads): ~0.4 ms (eliminates v/k/beta per-tile
   .contiguous() calls in the wrapper).
+Lever O savings (direct u_out write): ~0.30 ms at prod (eliminates the
+  transpose+contiguous of the 32 MB u_tok buffer in __init__.py:405).
+  delta_h already reads strided u via `u + (token_base * HV + i_h) * V`,
+  so no kernel change is needed on the consumer side.
 """
 from __future__ import annotations
 
@@ -38,7 +43,8 @@ def _wy_fused_kernel(
     k_tok,                    # [T, H, K]  bf16 (strided)
     g_cum_tok,                # [T, H, K]  bf16 (strided; cumsum, log2)
     beta_tok,                 # [T, HV]    bf16 (strided)
-    u_out,                    # [N, BT, BV] bf16 (output, contiguous)
+    u_out,                    # [T, HV, V] bf16 (strided WRITE; per-token
+                              #   layout = u_out[(chunk_start + i) * HV*V + hv_idx*V + v])
     w_out,                    # [N, BT, BK] bf16 (output, contiguous)
     H: tl.constexpr,          # == HV in this wrapper
     HV: tl.constexpr,
@@ -94,8 +100,21 @@ def _wy_fused_kernel(
     # ---- w = A @ k_with_beta_g ----
     w_blk = tl.dot(A_bf16, kbg_bf16, out_dtype=tl.float32).to(tl.bfloat16)
 
-    # ---- Write u and w (output buffers are contiguous [N, BT, BV/BK]) ----
-    tl.store(u_out + pid_n * BT * BV + offs_i[:, None] * BV + offs_b[None, :], u_blk)
+    # ---- Write u and w ----
+    # Lever O (June 2026-30): u is written directly to [T, HV, V] strided
+    # layout — per-token offset is (chunk_start + i) * HV*V + hv_idx*V.
+    # This eliminates the downstream transpose+contiguous() in
+    # __init__.py:405 (~0.30 ms at prod). delta_h already reads u with
+    # stride HV*V via `u + (token_base * HV + i_h) * V`, so the consumer
+    # doesn't need any change.
+    u_token_stride = HV * V
+    tl.store(
+        u_out + (chunk_start + offs_i[:, None]) * u_token_stride
+        + hv_idx * V + offs_b[None, :],
+        u_blk,
+    )
+    # w stays in contiguous [N, BT, BK] layout — delta_h reads it as
+    # `w_c[i * K + k]` (stride 1 within row), which matches contiguous.
     tl.store(w_out + pid_n * BT * BK + offs_i[:, None] * BK + offs_b[None, :], w_blk)
 
 
@@ -105,6 +124,7 @@ def wy_fused_transform(
     k_tok: torch.Tensor,           # [T, H, K]  bf16 (strided)
     g_cum_tok: torch.Tensor,       # [T, H, K]  bf16 (strided; cumsum, log2)
     beta_tok: torch.Tensor,        # [T, HV]    bf16 (strided)
+    T: int,                        # total tokens = num_chunks * BT
     BT: int = 64,
     BV: int = 128,
     BK: int = 128,
@@ -112,9 +132,13 @@ def wy_fused_transform(
     V: int = 128,
     H: int = 12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (u_bf16 [N, BT, V], w_bf16 [N, BT, K]).
+    """Returns (u_bf16 [T, HV, V] strided, w_bf16 [N, BT, K] contiguous).
 
     Strided reads (Lever M): no per-(chunk, hv) .contiguous() needed.
+    Direct u write to [T, HV, V] strided layout (Lever O): eliminates
+    the downstream transpose+contiguous() that used to convert u from
+    [N, BT, V] to [T, HV, V] in __init__.py:405.
+
     Replaces the original 2-bmm + 4 .to() + 2 .contiguous() + 4
     element-wise ops with one Triton launch.
 
@@ -130,9 +154,13 @@ def wy_fused_transform(
     assert K % 16 == 0
 
     N = A_kk_fp32.shape[0]
-    T = v_tok.shape[0]
     HV = v_tok.shape[1]
-    u = torch.empty(N, BT, BV, device=A_kk_fp32.device, dtype=torch.bfloat16)
+    num_chunks = T // BT
+    assert N == num_chunks * HV, f"N must equal num_chunks*HV (got N={N}, num_chunks={num_chunks}, HV={HV})"
+    # Lever O: u_out is allocated as [T, HV, V] with the natural per-token
+    # stride (HV*V). delta_h reads it via the same stride pattern, so no
+    # downstream reshape is needed.
+    u = torch.empty(T, HV, V, device=A_kk_fp32.device, dtype=torch.bfloat16)
     w = torch.empty(N, BT, BK, device=A_kk_fp32.device, dtype=torch.bfloat16)
 
     grid = (1, N)
