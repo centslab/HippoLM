@@ -198,13 +198,34 @@ Estimated savings:
 
 ### 4b. forward_sub + wy_transform fusion (5.4 ms combined)
 
-forward_sub (0.65 ms) inverts A_kk in place. Could be inlined into the
-wy_transform kernel:
-- Saves the forward_sub launch (~0.65 ms)
-- Doesn't save HBM (forward_sub is in-place on A_kk_fp32, which is already
-  in HBM before wy_transform reads it)
+**Attempted 2026-06-30 as Lever J. RESULT: LOSS (-0.42 ms at prod).**
 
-Net: ~0.65 ms savings. Smaller than 4a but clean.
+Tried to inline forward_sub into the wy_transform kernel via tl.static_range(64)
+loop with 2D reductions. Input changed from POST-inverse A_inv to PRE-inverse
+A = I + A_kk_unscaled.
+
+Measured at prod (N=3072, BT=64, V=K=128):
+- Old: _forward_sub(CUDA, 0.65 ms) + wy_fused_transform(Triton, 0.9 ms) = 1.77 ms
+- New: wy_fused_transform_with_inv (Triton fused forward_sub + wy) = 2.19 ms
+- Delta: **-0.42 ms LOSS**
+
+Numerical correctness: cos=0.99999x, med_rel<0.5% (PASS at all 3 shapes).
+
+**Why it failed:** The custom CUDA forward_sub is highly optimized for the
+sequential-within-row access pattern. It processes 64 rows in parallel (one
+row per thread), each doing simple cumulative updates. Triton's general
+2D-reduction-via-`tl.where`-masks adds ~1.3 ms of work that the CUDA kernel
+avoids. The fusion saves the launch overhead (~0.65 ms) but adds ~1.3 ms of
+Triton-side forward_sub work, net -0.65 ms vs separate kernels.
+
+**Lesson:** Fusion is NOT a win when the replaced kernel is highly optimized
+for its specific access pattern. forward_sub's pattern is: 64 sequential rows,
+each with simple cumulative updates — perfectly matched to CUDA threads.
+Triton's general-purpose 2D reductions add overhead the specialized kernel
+doesn't have.
+
+**Tried-and-reverted. Files kept:** `src/models/ops/cuda/kda_fwd/triton_wy_transform_with_inv.py`
+and `test/_tmp/test_wy_with_inv.py` for reference (delete before commit).
 
 ### 4c. post (beta/mask/eye = 0.7 ms) — REMOVE, not fuse
 
