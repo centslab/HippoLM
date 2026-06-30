@@ -1,0 +1,26 @@
+extends: ../base.yml
+
+use_dummy_data: true
+
+num_layers: 2
+num_blocks: 2
+num_heads: 2
+head_dim: 32
+hidden_size: 64
+intermediate_size: 128
+vocab_size: 256
+
+batch_size: 4
+seq_len: 256
+gradient_accumulation_steps: 4
+max_steps: 30
+
+output_dir: output/long_test
+log_interval: 1
+checkpoint_interval: 0
+
+lr_warmup_steps: 0
+lr_decay_steps: 0
+
+learning_rate: 0.01
+muon_lr: 0.02
