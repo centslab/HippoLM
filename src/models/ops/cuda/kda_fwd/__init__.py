@@ -278,12 +278,15 @@ def chunk_kda_fwd(
     # cumsum over BT (the chunk dim). We do the cumsum in **fp32** for
     # numerical stability (matching FLA's chunk_local_cumsum output_dtype
     # default of fp32) and cast back to bf16 only at the kernel boundary.
-    RCP_LN2 = 1.4426950408889634
-    g_log2_chunks_fp32 = (g_tok.float() * RCP_LN2).view(num_chunks, BT, HV, K)
-    g_cum_fp32 = g_log2_chunks_fp32.cumsum(dim=1)  # [num_chunks, BT, HV, K] fp32
-    g_cum_tok = g_cum_fp32.to(torch.bfloat16).view(T_total, HV, K).contiguous()
-    # g_last per chunk: [num_chunks, HV, K] = g_cum[:, BT-1, :, :] (in fp32)
-    g_last = g_cum_fp32[:, BT - 1, :, :].contiguous()  # [num_chunks, HV, K] fp32
+    #
+    # Lever L (June 2026-30): fused into ONE Triton kernel that reads g_tok
+    # bf16, casts to fp32 + scales by RCP_LN2, does cumsum over BT (axis=0)
+    # via tl.cumsum (parallel scan), and writes BOTH g_per (fp32 [NC,H,BT,K]
+    # for intra_solve) and g_cum_tok (bf16 [T,H,K] for delta_h+chunk_o).
+    # Saves ~1.77 ms at prod (was 4 ops + 1 contiguous; now 1 launch).
+    # See triton_g_cumsum.py.
+    from .triton_g_cumsum import g_cumsum_fused
+    g_per_cum_fp32, g_cum_tok = g_cumsum_fused(g_tok, num_chunks, HV, K, BT)
 
     # (The middle-aligned r/c scales for the intra loop are computed
     # inline below in the (s_i, s_j) pair loop — no need to precompute
@@ -307,7 +310,9 @@ def chunk_kda_fwd(
     q_per = q_tok.view(num_chunks, BT, H, K).transpose(1, 2).contiguous()  # [NC, H, BT, K]
     k_per = k_tok.view(num_chunks, BT, H, K).transpose(1, 2).contiguous()
     v_per = v_tok.view(num_chunks, BT, HV, V).transpose(1, 2).contiguous()
-    g_per = g_cum_fp32.view(num_chunks, BT, HV, K).transpose(1, 2).contiguous()  # fp32
+    # g_per (fp32 [NC, H, BT, K]) is now produced by g_cumsum_fused above —
+    # saves the cast + scale + cumsum + bf16 cast + contiguous in the wrapper.
+    g_per = g_per_cum_fp32
     beta_per = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).contiguous()  # [NC, HV, BT]
 
     # ----- Cast q, k to fp32 ONCE (was the per-pair bottleneck) -----
