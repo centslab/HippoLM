@@ -264,11 +264,17 @@ def chunk_kda_fwd(
     )
 
     # ----- flatten to per-token layout: [T_total, H_or_HV, K_or_V] -----
-    q_tok = q_flat.view(T_total, H, K).contiguous()
-    k_tok = k_flat.view(T_total, H, K).contiguous()
-    v_tok = v_flat.view(T_total, HV, V).contiguous()
-    g_tok = g_flat.view(T_total, HV, K).contiguous()
-    beta_tok = beta_flat.view(T_total, HV).contiguous()
+    # The q/k/v/g/beta tensors enter as [B, T, H, K] etc. — already contiguous
+    # in the user's frame. View them as [T_total, ...] without copying; the
+    # per-token axis gets stride H*K (or HV*V) which we handle with strided
+    # reads in the kernels (Lever M, June 2026-30). This eliminates the
+    # 4 .contiguous() calls that used to materialize [NC, HV, BT, K] per-tile
+    # views (~0.5 ms at prod).
+    q_tok = q_flat.view(T_total, H, K)
+    k_tok = k_flat.view(T_total, H, K)
+    v_tok = v_flat.view(T_total, HV, V)
+    g_tok = g_flat.view(T_total, HV, K)
+    beta_tok = beta_flat.view(T_total, HV)
 
     # ----- chunk-local cumsum of g (per chunk, per K-dim) -----
     # FLA user contract: g is in NATURAL log. Kernels use exp2 internally,
@@ -281,19 +287,21 @@ def chunk_kda_fwd(
     #
     # Lever L (June 2026-30): fused into ONE Triton kernel that reads g_tok
     # bf16, casts to fp32 + scales by RCP_LN2, does cumsum over BT (axis=0)
-    # via tl.cumsum (parallel scan), and writes BOTH g_per (fp32 [NC,H,BT,K]
-    # for intra_solve) and g_cum_tok (bf16 [T,H,K] for delta_h+chunk_o).
+    # via tl.cumsum (parallel scan), and writes g_cum_tok (bf16 [T,HV,K] for
+    # intra_solve + delta_h + chunk_o). The previous fp32 [NC,HV,BT,K] buffer
+    # was retired (Lever M): intra_solve now reads g_cum_tok and casts to
+    # fp32 in registers (free). Saves the 50 MB fp32 buffer allocation.
     # Saves ~1.77 ms at prod (was 4 ops + 1 contiguous; now 1 launch).
     # See triton_g_cumsum.py.
     from .triton_g_cumsum import g_cumsum_fused
-    g_per_cum_fp32, g_cum_tok = g_cumsum_fused(g_tok, num_chunks, HV, K, BT)
+    _, g_cum_tok = g_cumsum_fused(g_tok, num_chunks, HV, K, BT)
 
     # (The middle-aligned r/c scales for the intra loop are computed
     # inline below in the (s_i, s_j) pair loop — no need to precompute
     # them here.)
     BC = 16  # sub-chunk width — matches FLA chunk_intra's token_parallel path
 
-    # ----- batched matmuls for A_qk and A_kk (block-by-block, FLA-exact) -----
+    # ----- Fused Triton intra_solve (strided reads, Lever M) -----
     # FLA's intra splits the [BT, BT] causal matrix into BC x BC sub-chunks.
     # For BT=64, BC=16 there are 4 sub-chunks per chunk and 10 (s_i, s_j) pairs
     # where s_i >= s_j. The decay anchor differs by pair type:
@@ -306,30 +314,25 @@ def chunk_kda_fwd(
     # This per-block anchor keeps exp2 arguments bounded by ~BC * max|g| ≈ 70 in log2,
     # well within bf16's ±3.4e38 range. Using a single chunk-level anchor (g_last)
     # would overflow for the early positions of any chunk with a large cumulative g.
-    NC = BT // BC  # 4 sub-chunks per chunk
-    q_per = q_tok.view(num_chunks, BT, H, K).transpose(1, 2).contiguous()  # [NC, H, BT, K]
-    k_per = k_tok.view(num_chunks, BT, H, K).transpose(1, 2).contiguous()
-    v_per = v_tok.view(num_chunks, BT, HV, V).transpose(1, 2).contiguous()
-    # g_per (fp32 [NC, H, BT, K]) is now produced by g_cumsum_fused above —
-    # saves the cast + scale + cumsum + bf16 cast + contiguous in the wrapper.
-    g_per = g_per_cum_fp32
-    beta_per = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).contiguous()  # [NC, HV, BT]
-
-    # ----- Cast q, k to fp32 ONCE (was the per-pair bottleneck) -----
-    # Lever H (June 2026-30): the fused Triton intra_solve kernel reads q/k
-    # as bf16 and casts to fp32 IN REGISTERS (free — no HBM cost). This
-    # eliminates the two big fp32 pre-casts (~2.6 ms at prod) and replaces
-    # the 10-pair Python bmm loop (~17 ms at prod) with a single Triton
-    # launch. A_qk comes back bf16 with scale baked in; A_kk_fp32 stays
-    # fp32 for forward_sub (which requires fp32). See triton_intra_solve.py
-    # for the kernel and the (cos=0.999995, med_rel<0.1%) verification.
+    #
+    # Lever H (June 2026-30): the fused Triton intra_solve kernel reads q/k/g
+    # as bf16 and casts to fp32 IN REGISTERS (free — no HBM cost). Replaces
+    # the 10-pair Python bmm loop (~17 ms at prod) with a single Triton launch.
+    # A_qk comes back bf16 with scale baked in; A_kk_fp32 stays fp32 for
+    # forward_sub (which requires fp32). See triton_intra_solve.py for the
+    # kernel and the (cos=0.999995, med_rel<0.1%) verification.
+    # Lever M (June 2026-30): strided reads from [T, H, K] natural layout —
+    # eliminates 4 .contiguous() calls (~0.5 ms at prod).
     from .triton_intra_solve import triton_intra_solve
-    A_qk_bf16, A_kk_unscaled = triton_intra_solve(q_per, k_per, g_per, scale, BT, BC)
+    A_qk_bf16, A_kk_unscaled = triton_intra_solve(q_tok, k_tok, g_cum_tok, scale, BT, BC, H=H)
 
     # Apply beta to A_kk (row-side scaling).
-    # beta is per-token: shape [num_chunks, HV, BT]
-    # In stacked [num_chunks*HV, BT, BT] layout, beta is [num_chunks*HV, BT]
-    beta_stacked = beta_per.reshape(num_chunks * HV, BT)
+    # beta is per-token: shape [T_total, HV]. We need it stacked as
+    # [num_chunks*HV, BT] for the row-side multiply. The order matches
+    # pid_n = chunk_idx * HV + hv_idx, so we reorder via the natural
+    # per-token layout: beta_tok[t, hv] for t in [chunk*BT, (chunk+1)*BT)
+    # → beta_stacked[chunk*HV + hv, t - chunk*BT].
+    beta_stacked = beta_tok.view(num_chunks, BT, HV).transpose(1, 2).reshape(num_chunks * HV, BT)
     # A_kk[i, m, n] *= beta[i, m] (row-side beta for the lower-tri mask)
     A_kk_unscaled = A_kk_unscaled * beta_stacked.unsqueeze(-1)
     # Add I on diagonal. The kernel (Lever K, June 2026-30) skips writing to
@@ -358,14 +361,13 @@ def chunk_kda_fwd(
     # both u and w. Element-wise intermediates (beta_v, k_with_beta_g) live in
     # registers. See triton_wy_transform.py and test/_tmp/test_wy_fusion.py
     # (cos=0.99999x, med_rel<0.5% at all shapes).
+    # Lever M (June 2026-30): strided reads from [T, H, K] / [T, HV, V] natural
+    # layouts — eliminates 4 .contiguous() calls in v_per/k_per/beta_per
+    # (~0.4 ms at prod).
     from .triton_wy_transform import wy_fused_transform
-    v_per_stacked = v_per.view(num_chunks * HV, BT, V)
-    k_per_stacked = k_per.view(num_chunks * HV, BT, K)
-    beta_stacked = beta_per.reshape(num_chunks * HV, BT)
-    g_per_stacked = g_per.view(num_chunks * HV, BT, K)
     u, w = wy_fused_transform(
-        A_kk_fp32, v_per_stacked, k_per_stacked, g_per_stacked, beta_stacked,
-        BT=BT, BV=V, BK=K, K=K,
+        A_kk_fp32, v_tok, k_tok, g_cum_tok, beta_tok,
+        BT=BT, BV=V, BK=K, K=K, V=V, H=H,
     )
 
     # ----- layout tensors for the per-chunk kernels -----
