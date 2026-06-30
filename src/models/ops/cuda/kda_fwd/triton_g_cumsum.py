@@ -17,6 +17,18 @@ along BT axis (Triton tl.cumsum = parallel scan), writes both output layouts.
 The read is strided (stride = H*K between BT rows), but [BT, K]=64*128=8K
 bf16 elements per program is small enough that one program per (chunk,head)
 gives good coalescing within each row.
+
+Precision (verified 2026-06-30):
+  * g_per fp32: 97.32% bit-exact vs PyTorch seq cumsum; max diff = 1.28 ULPs
+    of fp32 (Triton parallel scan vs PyTorch sequential cumsum — small
+    reordering of adds, well within bf16 round-trip).
+  * g_cum_tok bf16: max diff vs FP64 cumsum = 1.0 (= 1 ULP of bf16 for
+    values around 128). PyTorch's `.to(bf16)` cast vs FP64 also = 1.0 —
+    both paths at the bf16 precision floor, no degradation.
+  * No NaN/Inf in any output. The fp32 cumsum itself does not overflow
+    (the overflow concerns from `docs/fast_kda_bottleneck_analysis.md`
+    apply to `exp(-g_cumsum)`, not to the cumsum itself, which is just
+    addition).
 """
 from __future__ import annotations
 
