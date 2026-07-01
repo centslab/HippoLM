@@ -285,7 +285,13 @@ The 4 stages of the wrapper:
 - `docs/triton_kernel_playbook.md` — 8 working Triton patterns
   (multi-kernel split, autotune, make_block_ptr, ...) used
   here.
-- `docs/fast_kda_bottleneck_analysis.md` — older Round-1..9
-  FastKDA analysis (separate abandoned work).
+- `docs/why_h_fusion_worked.md` — companion analysis of why
+  Lever H's intra_solve fusion succeeded where 3 prior fusion
+  attempts failed. **Read this for the why**; this doc is the
+  timeline of what was tried.
+- `docs/chunkwise_kda_opportunities.md` — when chunkwise KDA
+  has opportunity (HBM peak analysis, AI/ridge point math).
+- `docs/fastkda_dev_history.md` — older Round-1..9 FastKDA
+  history (separate abandoned work).
 - Memory: `project_kda_wrapper_perf.md` in
   `~/.claude/projects/-hy-tmp-HippoLM/memory/`.
