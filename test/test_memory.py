@@ -14,6 +14,13 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+# Module is a script-style utility (functions called from the
+# ``if __name__ == "__main__":`` block at the bottom with a manually
+# built ``config`` argument), NOT a pytest test. Without this opt-out,
+# pytest tries to collect ``test_memory_efficient_training`` as a test
+# and fails because ``config`` is not a fixture.
+__test__ = False
+
 
 class MemoryMonitor:
     """Monitor GPU memory usage during training."""
@@ -22,7 +29,7 @@ class MemoryMonitor:
         self.device = device
         self.peak_memory = 0
         self.baseline_memory = 0
-        self snapshots = []
+        self.snapshots = []
 
     def reset(self):
         """Reset memory tracking."""
@@ -282,7 +289,8 @@ def measure_activation_memory(config, batch_size=2, seq_len=512, logger=None):
 
 if __name__ == "__main__":
     import sys
-    sys.path.insert(0, "/home/wlx/HippoLM")
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     from src.models import HippoConfig
 

@@ -1,8 +1,15 @@
 """Tests for HippoLM model architecture."""
 import sys
+from pathlib import Path
+
 import torch
 
-sys.path.insert(0, "/home/wlx/HippoLM")
+# Resolve repo root whether the file is run via pytest (auto-resolves
+# rootdir) or directly via ``python test/test_model.py`` (which needs
+# the repo on sys.path for ``from src...`` imports to work).
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 from src.models import HippoConfig
 from src.models.model import HippoModel, HippoLayer
@@ -28,13 +35,16 @@ def test_kda_shape():
 
 def test_block_attn_res():
     """BlockAttnRes takes only ``blocks`` (no partial_block)."""
+    if not torch.cuda.is_available():
+        print("[SKIP] test_block_attn_res (CUDA required for Triton kernel in BlockAttnRes.norm)")
+        return
     config = HippoConfig()
-    module = BlockAttnRes(config)
+    module = BlockAttnRes(config).cuda()
 
     B, T, D = 2, 8, config.hidden_size
     blocks = [
-        torch.randn(B, T, D),
-        torch.randn(B, T, D),
+        torch.randn(B, T, D, device="cuda"),
+        torch.randn(B, T, D, device="cuda"),
     ]
 
     out = module(blocks)

@@ -8,9 +8,16 @@ no ``partial_block``) and the surrounding layer/model
 structure changes that come with it.
 """
 import sys
+from pathlib import Path
+
 import torch
 
-sys.path.insert(0, "/home/wlx/HippoLM")
+# Allow running this file both as ``python -m pytest test/test_attn_res.py``
+# (pytest rootdir resolves the repo root) and as ``python test/test_attn_res.py``
+# (in which case we add the repo root to sys.path explicitly).
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 from src.models import HippoConfig
 from src.models.model import HippoLayer, HippoModel
@@ -19,13 +26,16 @@ from src.models.ops.attn_res import BlockAttnRes
 
 def test_block_attn_res_takes_only_blocks():
     """BlockAttnRes.forward accepts a list of block tensors (no partial_block)."""
+    if not torch.cuda.is_available():
+        print("[SKIP] test_block_attn_res_takes_only_blocks (CUDA required for Triton kernel)")
+        return
     config = HippoConfig()
-    module = BlockAttnRes(config)
+    module = BlockAttnRes(config).cuda()
 
     B, T, D = 2, 8, config.hidden_size
     blocks = [
-        torch.randn(B, T, D),
-        torch.randn(B, T, D),
+        torch.randn(B, T, D, device="cuda"),
+        torch.randn(B, T, D, device="cuda"),
     ]
 
     # New interface: pass the blocks list directly.
@@ -36,14 +46,17 @@ def test_block_attn_res_takes_only_blocks():
 
 def test_block_attn_res_uniform_with_zero_query():
     """With zero pseudo-query, attention weights are uniform, output is mean(blocks)."""
+    if not torch.cuda.is_available():
+        print("[SKIP] test_block_attn_res_uniform_with_zero_query (CUDA required for Triton kernel)")
+        return
     config = HippoConfig()
-    module = BlockAttnRes(config)
+    module = BlockAttnRes(config).cuda()
 
     B, T, D = 1, 4, config.hidden_size
     blocks = [
-        torch.randn(B, T, D),
-        torch.randn(B, T, D),
-        torch.randn(B, T, D),
+        torch.randn(B, T, D, device="cuda"),
+        torch.randn(B, T, D, device="cuda"),
+        torch.randn(B, T, D, device="cuda"),
     ]
 
     module.query.data.zero_()

@@ -32,7 +32,8 @@ sys.path.insert(0, str(_REPO))
 
 from src.models import HippoConfig
 from src.models.tp_layers import ColumnParallelLinear, RowParallelLinear, init_tp
-from src.models.tp_model import TPKDA, TPSwiGLU, TPHippoLayer, RMSNorm
+from src.models.tp_model import TPKDA, TPSwiGLU, TPHippoLayer
+from src.models.norms import RMSNorm
 from src.models.ops._vendored.fla.modules import ShortConvolution
 
 
