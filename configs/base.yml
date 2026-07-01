@@ -154,3 +154,13 @@ empty_cache_between_mb: true
 # chunk_kda_fwd_intra. Trades a small bwd time increase for ~32 MiB
 # of saved-tensor memory per KDA layer (~1 GB at 30 layers).
 kda_skip_aqk_akk_saved: false
+
+# W4A16 NVFP4 FFN (research path). When True, every FFN linear
+# stores its weight in NVFP4 packed format (E2M1 + FP8-e4m3fn 1x16
+# microblock scales). Activation stays in BF16; the matmul itself
+# runs in BF16 (dequantize-on-fwd) since PyTorch 2.9.1's
+# ``torch._scaled_mm`` NVFP4 path requires both A and B to be FP4.
+# Memory saving: ~3.5x on FFN weights (the dominant FFN cost on
+# the 16 GB target). The optimizer updates the BF16 master weight;
+# ``repack_nvfp4_weights`` re-quantizes after each step.
+ffn_nvfp4: true

@@ -274,6 +274,7 @@ def _setup_worker(
         pack_chunk_size=args.pack_chunk_size,
         pack_buffer_size=args.pack_buffer_size,
         kda_skip_aqk_akk_saved=getattr(args, "kda_skip_aqk_akk_saved", False),
+        ffn_nvfp4=getattr(args, "ffn_nvfp4", False),
     )
     if rank == 0:
         logger.info(f"Model config: {config}")
@@ -842,6 +843,20 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                                 state=adamw_opt.state,
                             )
                         zero_cpu_grad_accum([muon_opt, adamw_opt])
+                        # W4A16 NVFP4 hook: re-quantize the BF16
+                        # master weights (now updated by the optimizer)
+                        # into the NVFP4 packed buffers, so the next
+                        # forward's dequantize-on-fwd sees the latest
+                        # values. No-op when NVFP4 is disabled (the
+                        # walker finds 0 NVFP4 modules and returns 0).
+                        if getattr(args, "ffn_nvfp4", False):
+                            from src.models.ops.nvfp4_linear import repack_nvfp4_weights
+                            n_repacked = repack_nvfp4_weights(model)
+                            if global_step < _DIAG_STEPS and rank == 0:
+                                logger.info(
+                                    "[nvfp4] step=%d repacked %d NVFP4 weight(s)",
+                                    global_step, n_repacked,
+                                )
                     else:
                         total_norm = float("nan")
                     scaler.update()

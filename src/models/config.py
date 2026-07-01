@@ -69,6 +69,19 @@ class HippoConfig:
     # of bwd wall-clock. Default False (legacy behavior).
     kda_skip_aqk_akk_saved: bool = False
 
+    # W4A16 NVFP4 FFN (research path). When True, every FFN
+    # linear (``gate_proj``, ``up_proj``, ``down_proj`` in the
+    # single-GPU path; the column-/row-parallel equivalents in the
+    # TP path) stores its weight in NVFP4 packed format
+    # (E2M1 + FP8-e4m3fn 1x16 microblock scales). The forward
+    # dequantizes to BF16 and runs a BF16 matmul (since PyTorch
+    # 2.9.1's ``torch._scaled_mm`` NVFP4 path requires BOTH A
+    # and B to be FP4-packed). The optimizer updates the BF16
+    # master weight; ``repack_weights`` re-quantizes it after each
+    # step. Memory saving on FFN weights alone: ~3.5x.
+    # Default False (legacy BF16 path).
+    ffn_nvfp4: bool = False
+
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
             f"num_layers ({self.num_layers}) must be divisible by num_blocks ({self.num_blocks})"
@@ -96,4 +109,10 @@ class HippoConfig:
             self.pack_chunk_size = ((self.pack_chunk_size + 63) // 64) * 64
         assert self.pack_buffer_size >= 1, (
             f"pack_buffer_size must be >= 1, got {self.pack_buffer_size}"
+        )
+        # NVFP4 FFN: currently supports only block_size=16 (the NVFP4
+        # spec). The block_size is hardcoded in NVFP4Linear; the only
+        # constraint here is a sanity check that the flag is a bool.
+        assert isinstance(self.ffn_nvfp4, bool), (
+            f"ffn_nvfp4 must be bool, got {type(self.ffn_nvfp4).__name__}"
         )

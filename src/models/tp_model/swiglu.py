@@ -4,6 +4,13 @@ Fused gate+up projection (one ``ColumnParallelLinear`` with
 output = ``2 * intermediate_size``) + row-parallel down projection
 with all-reduce. Saves 1 kernel launch per SwiGLU vs the unfused
 3-projection baseline.
+
+When ``config.ffn_nvfp4`` is True, the projections use
+:class:`NVFP4ColumnParallelLinear` / :class:`NVFP4RowParallelLinear`
+instead of the BF16 versions. Weight storage is NVFP4 packed; the
+matmul still runs in BF16 (dequant-on-fwd). The optimizer updates
+the BF16 master weight; :func:`repack_nvfp4_weights` re-quantizes
+it after each step.
 """
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.tp_layers import ColumnParallelLinear, RowParallelLinear
+from src.models.ops.nvfp4_tp import NVFP4ColumnParallelLinear, NVFP4RowParallelLinear
 
 
 class TPSwiGLU(nn.Module):
@@ -24,6 +32,11 @@ class TPSwiGLU(nn.Module):
 
     def __init__(self, config, device=None, dtype=None) -> None:
         super().__init__()
+        if getattr(config, "ffn_nvfp4", False):
+            ColCls, RowCls = NVFP4ColumnParallelLinear, NVFP4RowParallelLinear
+        else:
+            ColCls, RowCls = ColumnParallelLinear, RowParallelLinear
+
         # Fused gate+up projection: one ColumnParallelLinear with
         # output = 2 * intermediate_size. The first ``intermediate``
         # output channels are the gate, the next ``intermediate``
@@ -33,11 +46,11 @@ class TPSwiGLU(nn.Module):
         # is one tensor of size ``2 * intermediate_per_partition``
         # on this rank (gate half then up half); we expose it as
         # ``self.gate_up_bias`` so the forward can split it.
-        self.gate_up_proj = ColumnParallelLinear(
+        self.gate_up_proj = ColCls(
             config.hidden_size, 2 * config.intermediate_size,
             bias=config.use_bias, device=device, dtype=dtype,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowCls(
             config.intermediate_size, config.hidden_size,
             bias=config.use_bias, device=device, dtype=dtype,
         )
