@@ -75,7 +75,7 @@ pack_chunk_size: 64
 # prefetch latency. With default B=1 and pack_buffer_size=8 we only
 # pull 8 docs per window, which under-fills a T=16384 pack; raise
 # to 32-64 if you see sparse packs in the First-batch heartbeat.
-pack_buffer_size: 128
+pack_buffer_size: 2048
 
 # Optimizer
 muon_lr: 0.02            # Muon (2D matrices) learning rate
@@ -153,7 +153,7 @@ use_dummy_data: false
 # Output
 output_dir: output
 log_interval: 1
-checkpoint_interval: 1
+checkpoint_interval: 100
 # After each save, prune older checkpoint_step_*.pt files so at most
 # N remain (newest N kept). null/None keeps all. Set to 0 to keep
 # only the just-saved file.
