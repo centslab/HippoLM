@@ -788,13 +788,29 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # (carried as a list of per-layer final-state tensors
                 # from the previous chunk's forward). For chunk 0
                 # the state is ``None`` — each layer starts from
-                # zeros. We accumulate all chunk losses and call
-                # backward ONCE at the end of the step so the
-                # autograd graph connects across chunks via the
-                # carried state (full BPTT — gradient of later
-                # chunks flows back to earlier chunks' params).
+                # zeros.
+                #
+                # The state is DETACHED between chunks: chunk i+1's
+                # forward receives the numerical final-state of chunk i
+                # but does NOT extend the autograd graph back through it.
+                # This is **truncated BPTT** — the standard pattern for
+                # recurrent nets when full BPTT activation memory blows
+                # the VRAM budget. Gradients still accumulate across
+                # chunks at the optimizer state (the per-param CPU
+                # accumulator in :func:`build_param_groups` folds each
+                # chunk's bwd into the running total). The fix was
+                # forced by the b173879 OOM: at 16 chunks of T=16384,
+                # full BPTT retains all N chunks' saved-tensor activations
+                # simultaneously (~93 GB); per-chunk bwd+detach bounds
+                # the peak to one chunk (~12.6 GB at production). See
+                # ``docs/gradient_checkpointing.md`` for the per-component
+                # breakdown.
+                #
+                # After chunk i's bwd completes, the freed memory is
+                # reusable for chunk i+1's fwd — the autograd graph is
+                # severed.
                 kda_states: list[torch.Tensor | None] | None = None
-                chunk_losses: list[torch.Tensor] = []
+                step_loss_chunk_sum = 0.0
                 for ci in range(n_chunks):
                     s = ci * micro_batch_size
                     e = s + micro_batch_size
@@ -815,26 +831,46 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                             cu_seqlens=chunk_cu,
                             kda_states=kda_states,
                         )
-                        chunk_loss = outputs["loss"]
-                    chunk_losses.append(chunk_loss)
-                    # Carry forward: the new per-layer KDA states
-                    # become the next chunk's initial states. The
-                    # state tensors are part of the autograd graph
-                    # (they depend on the chunk's input + the prior
-                    # state), so we must NOT detach — the chain rule
-                    # must flow back through them during backward.
-                    kda_states = outputs["kda_states"]
+                        # Divide by n_chunks so the sum of per-chunk
+                        # losses equals the full-sequence mean cross-
+                        # entropy (each chunk covers 1/n_chunks of the
+                        # tokens). The /n_chunks rescales the gradient
+                        # consistently — the optimizer's CPU grad
+                        # accumulator adds per-chunk grads, and the
+                        # /n_chunks makes the effective LR-per-step
+                        # equal to LR/n_chunks (matching the legacy
+                        # grad-accumulation semantics).
+                        chunk_loss = outputs["loss"] / n_chunks
+                    # Accumulate the *detached* loss for logging.
+                    # ``step_loss_chunk_sum`` is a plain float; safe to
+                    # hold without retaining the graph.
+                    step_loss_chunk_sum += chunk_loss.item()
+                    # Carry forward, then detach. Detach preserves the
+                    # numerical state (chunk i+1 sees the same h-vector
+                    # values) but breaks the autograd graph chain so
+                    # the backward of chunk i+1 does NOT traverse back
+                    # into chunk i.
+                    kda_states = [
+                        st.detach() if st is not None else None
+                        for st in outputs["kda_states"]
+                    ]
                     del outputs
+                    # Per-chunk immediate backward. Per-param
+                    # accumulate-grad hooks fire as the autograd graph
+                    # walks; flush_pending_grads syncs the D2H
+                    # transfers into the CPU accumulator.
+                    chunk_loss.backward()
+                    flush_pending_grads(sync_device=gpus[rank])
+                    flush_manual_flush_params([muon_opt, adamw_opt])
+                    if getattr(args, "empty_cache_between_mb", True):
+                        torch.cuda.empty_cache()
 
-                # Total loss = mean of chunk losses (equivalent to
-                # the per-step mean cross-entropy because each
-                # chunk has the same number of tokens).
-                loss = torch.stack(chunk_losses).mean()
                 torch.cuda.synchronize(gpus[rank])
                 _mb_t_fwd_end = time.perf_counter()
-                # Per-step loss for logging (detach to avoid
-                # retaining the graph after this line).
-                step_loss = loss.detach().float().item()
+                # Per-step loss for logging (already detached; sum of
+                # per-chunk losses divided by n_chunks = mean per-token
+                # loss across the full step).
+                step_loss = step_loss_chunk_sum
                 accumulated_loss += step_loss
                 if rank == 0 and (
                     global_step < _DIAG_STEPS or not math.isfinite(step_loss)
@@ -843,32 +879,20 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         f"  [diag] step={global_step} loss={step_loss:.6e}"
                     )
 
-                # Single backward at end of step: chain rule flows
-                # through the carried KDA states from chunk
-                # n_chunks-1 back to chunk 0 (full BPTT).
-                loss.backward()
-                torch.cuda.synchronize(gpus[rank])
-                _mb_t_bwd_end = time.perf_counter()
-
-                # Per-step flush. The per-param post-accumulate-grad
-                # hooks (see :func:`register_grad_offload_hooks`)
-                # issued D2H transfers during ``backward()``; we
-                # sync the current device's stream and fold the CPU
-                # src tensors into the per-param accumulator. Same
-                # semantics as the per-microbatch flush in the
-                # legacy path; just consolidated to once-per-step
-                # because we now do a single backward.
-                flush_pending_grads(sync_device=gpus[rank])
-                flush_manual_flush_params([muon_opt, adamw_opt])
-
-                if getattr(args, "empty_cache_between_mb", True):
-                    torch.cuda.empty_cache()
-
-                _mb_t_sync_end = time.perf_counter()
+                # With per-chunk backward (above) the fwd and bwd are
+                # interleaved; the per-step timing breakdown collapses
+                # them into a single "compute" interval measured by
+                # ``_mb_t_fwd_end - _mb_t_data_end``. The legacy
+                # ``fwd_ms / bwd_ms / sync_ms`` columns become
+                # ``compute_ms = fwd+bwd_ms / cache_ms = empty_cache+flush``.
+                _mb_t_bwd_end = _mb_t_fwd_end
+                _mb_t_sync_end = _mb_t_fwd_end
 
                 # Per-step timing log (chunked path: one row per
                 # step, not per chunk). The breakdown is the same
-                # data_ms / fwd_ms / bwd_ms / sync_ms columns.
+                # data_ms / fwd_ms / bwd_ms / sync_ms columns but
+                # with fwd+bwd fused because the per-chunk loop
+                # interleaves them.
                 mb_timing = getattr(args, "mb_timing", 0)
                 if rank == 0 and mb_timing > 0 and batch_idx < mb_timing:
                     n_real_docs = (
@@ -879,15 +903,13 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         f"  [mb-time] step={global_step}"
                         f" n_chunks={n_chunks}/{n_chunks}"
                         f" data_ms={(_mb_t_data_end - _mb_t_loop_start) * 1000:6.1f}"
-                        f" fwd_ms={(_mb_t_fwd_end - _mb_t_data_end) * 1000:6.1f}"
-                        f" bwd_ms={(_mb_t_bwd_end - _mb_t_fwd_end) * 1000:6.1f}"
-                        f" sync_ms={(_mb_t_sync_end - _mb_t_bwd_end) * 1000:6.1f}"
+                        f" compute_ms={(_mb_t_fwd_end - _mb_t_data_end) * 1000:6.1f}"
                         f" shape={tuple(input_ids.shape)}"
                         f" cu_seqlens=[{cu_seqlens.tolist() if cu_seqlens is not None else 'None'}]"
                         f" real_docs={n_real_docs}"
                     )
 
-                del loss, chunk_losses, input_ids, labels
+                del input_ids, labels
                 # Free the chunk-local cu_seqlens tensors and the
                 # final KDA state list; they go out of scope when
                 # we move past the next loop iteration, but
