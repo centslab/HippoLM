@@ -44,6 +44,15 @@ def amax_cpu(t: Optional[torch.Tensor]) -> float:
     """
     if t is None:
         return 0.0
+    # FP8 dtypes (mxfp8 Muon: E4M3 ``mom_buf`` / E8M0
+    # ``mom_scale``) have no CPU reduction kernels in PyTorch
+    # 2.9.1 (``NotImplementedError: max_all not implemented for
+    # 'Float8_e4m3fn'``). Cast to BF16 first — the round-trip is
+    # free on CPU and the abs/max reduction is the same cost as
+    # in the original dtype.
+    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
+                    torch.float8_e8m0fnu):
+        t = t.to(torch.bfloat16)
     return t.detach().abs().max().item()
 
 

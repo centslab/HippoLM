@@ -141,8 +141,16 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     the accumulator by ``clip_coef = max_norm / (total_norm +
     1e-6)`` only when the norm exceeds the cap, so well-behaved
     steps are no-ops.
+
+    FP8 storage path (mxfp8 Muon: E4M3 ``mom_buf`` + E8M0
+    ``mom_scale``): ``.mul_`` is not implemented for FP8 dtypes
+    on CPU, so the in-place scale has to round-trip through
+    FP32: dequant → mul → requant. We do that via
+    :func:`_scale_mxfp8_mom_buf` so the per-mb / per-step
+    requantize paths share the same dequant/requant logic.
     """
     import torch.distributed as dist
+    from src.training.param_offload import _scale_mxfp8_mom_buf
 
     local_sq = torch.zeros(1)
     for opt in opts:
@@ -164,8 +172,11 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
         clip_coef = max_norm / (total_norm + 1e-6)
         for opt in opts:
             for s in opt.state.values():
-                accum = s.m if s.kind == "adamw" else s.mom_buf
-                accum.mul_(clip_coef)
+                if s.kind == "muon" and s.mxfp8_block_size is not None:
+                    _scale_mxfp8_mom_buf(s, clip_coef)
+                else:
+                    accum = s.m if s.kind == "adamw" else s.mom_buf
+                    accum.mul_(clip_coef)
     return total_norm
 
 
@@ -505,22 +516,43 @@ def _setup_worker(
     #
     # Muon's momentum storage dtype is configurable
     # (``precision.muon_momentum``): int8 with a BF16 per-row
-    # scale, or full-precision bf16/fp16/fp32 (no scale). We
-    # read the actual dtype off the first state entry rather
-    # than hardcoding, so the log message reflects whatever the
-    # user configured.
+    # scale, mxfp8 with an E8M0 per-block scale (1 byte per
+    # ``block_size`` elements, default 32), or full-precision
+    # bf16/fp16/fp32 (no scale). We read the actual dtype off
+    # the first state entry rather than hardcoding, so the log
+    # message reflects whatever the user configured.
     muon_states = list(muon_opt.state.values())
     if muon_states:
         muon_mom_dtype = muon_states[0].mom_buf.dtype
         muon_mom_bytes_per_elt = muon_mom_dtype.itemsize
-        # Scale tensor exists only for int8 storage (None for fp*).
+        # Scale tensor exists for int8 AND mxfp8 (None for fp*).
         muon_has_scale = muon_states[0].mom_scale is not None
+        # mxfp8: per-block E8M0 scale; total scale bytes is
+        # ``ceil(cols / block_size)`` per row, 1 byte per entry.
+        mxfp8_block_size = muon_states[0].mxfp8_block_size
     else:
         muon_mom_dtype = torch.int8
         muon_mom_bytes_per_elt = 1
         muon_has_scale = False
+        mxfp8_block_size = None
     muon_mom = n_muon * muon_mom_bytes_per_elt
-    muon_scale = (n_muon_rows * 2) if muon_has_scale else 0
+    if muon_has_scale:
+        if mxfp8_block_size is not None:
+            # mxfp8: scale bytes = rows * ceil(cols / block_size)
+            # summed over all muon params. We approximate by
+            # summing per-state contributions; for the typical
+            # case (all params share the same block_size and
+            # similar cols) this is close to the true total.
+            n_muon_scale_entries = sum(
+                (s.shape[1] + mxfp8_block_size - 1) // mxfp8_block_size
+                for s in muon_states
+            )
+            muon_scale = n_muon_scale_entries * 1  # 1 byte / E8M0
+        else:
+            # int8: per-row BF16 scale.
+            muon_scale = n_muon_rows * 2
+    else:
+        muon_scale = 0
     adamw_m = n_adamw * 2
     adamw_v = n_adamw * 2
     muon_bytes = muon_mom + muon_scale
@@ -528,10 +560,17 @@ def _setup_worker(
     muon_mom_label = (
         f"{str(muon_mom_dtype).replace('torch.', '')}_mom"
     )
-    muon_scale_str = (
-        f" + bf16_scale={muon_scale / 1024**3:.3f} GB"
-        if muon_has_scale else ""
-    )
+    if mxfp8_block_size is not None:
+        muon_scale_str = (
+            f" + e8m0_scale(bs={mxfp8_block_size})="
+            f"{muon_scale / 1024**3:.3f} GB"
+        )
+    elif muon_has_scale:
+        muon_scale_str = (
+            f" + bf16_scale={muon_scale / 1024**3:.3f} GB"
+        )
+    else:
+        muon_scale_str = ""
     logger.info(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
         f" ({muon_bytes / 1024**3:.2f} GB total:"
@@ -785,7 +824,17 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     for opt_name, opt in (("muon", muon_opt), ("adamw", adamw_opt)):
                         for sid, s in opt.state.items():
                             accum = s.m if s.kind == "adamw" else s.mom_buf
-                            n_nan = (~torch.isfinite(accum)).sum().item()
+                            # Cast to BF16 before ``isfinite`` — FP8
+                            # storage (mxfp8 muon: E4M3 / E8M0) has no
+                            # direct ``isfinite`` implementation in
+                            # PyTorch 2.9.1 and raises
+                            # ``NotImplementedError``. The bf16
+                            # round-trip is lossless for the
+                            # non-NaN/Inf values we're trying to
+                            # detect; NaN in FP8 is a deliberate
+                            # 0x7F / 0xFF byte pattern that decodes
+                            # to NaN in BF16 too.
+                            n_nan = (~torch.isfinite(accum.to(torch.bfloat16))).sum().item()
                             n_nan_accum_total += n_nan
                             if n_nan > 0 and not found_inf:
                                 found_inf = True

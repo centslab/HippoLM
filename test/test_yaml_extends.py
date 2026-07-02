@@ -201,7 +201,7 @@ def test_real_test_yml_inherits_base():
     merged = _load_yaml_with_extends(str(quick))
     # Inherited from base:
     assert "precision" in merged
-    assert merged["precision"]["muon_momentum"]["dtype"] == "bf16"
+    assert merged["precision"]["muon_momentum"]["dtype"] == "mxfp8"
     # Overridden by the child:
     assert merged["num_layers"] == 2
     # The extends key itself is consumed.

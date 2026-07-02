@@ -72,7 +72,19 @@ seed: 42                 # RNG seed for replicated-param init on each device.
 # Each entry sets the storage dtype for a tensor class. Supported dtypes:
 #   fp32, fp16, bf16   - floating point; no scaling needed
 #   int8, int4         - integer; require a scale mode
-# Scale modes (int8/int4 only; ignored for fp*):
+#   mxfp8              - OCP Microscaling FP8: E4M3 elements +
+#                        per-block E8M0 scale. ``block_size``
+#                        defaults to 32 when not given; ``scale``
+#                        is implicitly ``'block'``. Currently
+#                        only used for ``muon_momentum`` — the
+#                        per-block scale gives finer within-row
+#                        granularity than per-row int8 without a
+#                        separate accumulator buffer. See
+#                        :class:`src.training.precision_config.TensorPrecision`
+#                        for the validation rules and
+#                        :mod:`docs.mxfp8_3_bugs` for the three
+#                        latent bugs caught while shipping this.
+# Scale modes (int8/int4 only; ignored for fp* and mxfp8):
 #   no                 - no scaling (raw integer values)
 #   tensor             - one scale per tensor
 #   per-channel        - one scale per output channel (per-row for 2D weights)
@@ -84,7 +96,7 @@ precision:
   model_weights: { dtype: bf16 }
   gradients:     { dtype: bf16 }
   activations:   { dtype: bf16 }
-  muon_momentum: { dtype: bf16 }
+  muon_momentum: { dtype: mxfp8 }   # E4M3 elements + E8M0 per-32 scale
   adamw_m:       { dtype: bf16 }
   adamw_v:       { dtype: bf16 }
 

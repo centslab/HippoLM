@@ -13,14 +13,24 @@ the scale mode. The yml schema in :file:`configs/base.yml` is::
 
 The keys under each entry:
 
-  - ``dtype``: one of ``fp32``, ``fp16``, ``bf16``, ``int8``, ``int4``.
-    For ``activations``, only ``fp32``, ``fp16``, ``bf16`` are
-    accepted — integer dtypes are rejected because activations
-    are continuous-valued and autocast does not consume an
-    int dtype anyway.
+  - ``dtype``: one of ``fp32``, ``fp16``, ``bf16``, ``int8``,
+    ``int4``, ``mxfp8``. For ``activations``, only ``fp32``,
+    ``fp16``, ``bf16`` are accepted — integer and FP8 dtypes are
+    rejected because activations are continuous-valued and
+    autocast does not consume an int / FP8 dtype anyway.
+    ``mxfp8`` (OCP Microscaling FP8) is currently only used by
+    ``muon_momentum`` — see
+    :class:`CPUMuon` for the storage layout and
+    :mod:`docs.mxfp8_3_bugs` for the three latent bugs that
+    were caught while shipping this.
   - ``scale``: required for ``int8`` / ``int4``; one of ``no``,
-    ``tensor``, ``per-channel``, ``block``. Ignored for floating
-    dtypes (always stored as ``None``).
+    ``tensor``, ``per-channel``, ``block``. For ``mxfp8`` the
+    value is implicitly ``'block'`` (set in
+    :meth:`TensorPrecision.__post_init__` when the dtype is
+    MXFP8); passing an explicit value is rejected because
+    per-tensor / per-channel scales are not part of the MX
+    spec. Ignored for floating dtypes (always stored as
+    ``None``).
   - ``block_size``: required when ``scale == 'block'``; ignored
     otherwise.
 
@@ -54,6 +64,12 @@ The six tensor classes (one :class:`TensorPrecision` each):
     quantization precision without a separate accumulator).
     bf16 / fp16 / fp32 are full-precision storage with no
     requant. int4 further halves but loses precision.
+    mxfp8 (E4M3 elements + E8M0 per-block scale; the
+    current default) is comparable to int8 + per-channel
+    on CPU RAM but gives finer within-row granularity at
+    the cost of more dequant/requant work per microbatch.
+    See :mod:`docs.mxfp8_3_bugs` for the implementation
+    notes.
   - ``adamw_m``        — AdamW's first moment AND the grad
     accumulator (merged). BF16 is the default (magnitude
     bounded, no precision concern).
@@ -88,6 +104,12 @@ class DType(str, Enum):
     BF16 = "bf16"
     INT8 = "int8"
     INT4 = "int4"
+    # Microscaling FP8 (OCP MX spec): per-element E4M3 + per-block
+    # E8M0 scale. Currently only used by CPUMuon for momentum
+    # storage (where the per-block scale gives finer within-row
+    # granularity than per-row int8 without a separate accumulator
+    # buffer). See :class:`CPUMuon` for the storage layout.
+    MXFP8 = "mxfp8"
 
     @property
     def is_integer(self) -> bool:
@@ -97,6 +119,17 @@ class DType(str, Enum):
     def is_floating(self) -> bool:
         return not self.is_integer
 
+    @property
+    def is_mxfp(self) -> bool:
+        """True for the MXFP family (E4M3 elements + E8M0 scales).
+
+        The ``is_integer`` flag is False (FP8 is floating-point),
+        but the storage layout is block-quantized like ``int8`` +
+        ``scale='block'``. Optimizer code branches on this flag
+        to pick the right (dequant, requant, accumulate) helpers.
+        """
+        return self == DType.MXFP8
+
     def to_torch(self) -> torch.dtype:
         """Return the corresponding :class:`torch.dtype`.
 
@@ -105,6 +138,10 @@ class DType(str, Enum):
         :class:`CPUMuon` is responsible for the packing scheme;
         we just hand back ``int8`` so the storage tensor
         construction is uniform.
+
+        ``MXFP8`` returns ``float8_e4m3fn`` (the element dtype);
+        the per-block scale uses ``float8_e8m0fnu`` which the
+        optimizer allocates separately.
         """
         return {
             DType.FP32: torch.float32,
@@ -112,6 +149,7 @@ class DType(str, Enum):
             DType.BF16: torch.bfloat16,
             DType.INT8: torch.int8,
             DType.INT4: torch.int8,
+            DType.MXFP8: torch.float8_e4m3fn,
         }[self]
 
 
@@ -142,6 +180,9 @@ class TensorPrecision:
 
     - ``int8`` / ``int4`` must specify a ``scale``.
     - ``scale == 'block'`` must specify a positive ``block_size``.
+    - ``mxfp8`` defaults ``scale='block'``, ``block_size=32``
+      (the OCP MX-spec "MXFP8 with 32-element blocks") when not
+      explicitly given.
     - Floating dtypes ignore ``scale`` and ``block_size``
       (silently cleared to ``None``).
     """
@@ -155,7 +196,30 @@ class TensorPrecision:
             self.dtype = DType(self.dtype)
         if isinstance(self.scale, str):
             self.scale = ScaleMode(self.scale)
-        if self.dtype.is_integer:
+        # MXFP8 requires block scaling (the E8M0 scale is per-block
+        # by definition). Default to scale='block', block_size=32 if
+        # the user didn't specify — this matches the OCP MX spec
+        # for "MXFP8 with 32-element blocks" (the most common
+        # training configuration). Other scale modes (tensor,
+        # per-channel) are rejected because the E8M0 hardware path
+        # is block-scaled.
+        if self.dtype.is_mxfp:
+            if self.scale is None:
+                self.scale = ScaleMode.BLOCK
+            elif self.scale != ScaleMode.BLOCK:
+                raise ValueError(
+                    f"precision: dtype={self.dtype.value} requires"
+                    f" scale='block' (E8M0 hardware path), got"
+                    f" scale={self.scale.value}."
+                )
+            if self.block_size is None:
+                self.block_size = 32
+            elif self.block_size <= 0:
+                raise ValueError(
+                    f"precision: block_size must be positive,"
+                    f" got {self.block_size}"
+                )
+        elif self.dtype.is_integer:
             if self.scale is None:
                 raise ValueError(
                     f"precision: dtype={self.dtype.value} requires a 'scale'"
@@ -173,9 +237,9 @@ class TensorPrecision:
                     )
         else:
             # fp* dtypes: silently drop scale / block_size to keep
-            # the config self-consistent. This means a user can
-            # write ``adamw_m: { dtype: bf16, scale: per-channel }``
-            # without us complaining — the scale is just ignored.
+            # the config self-consistent. (MXFP8 already had its
+            # scale/block_size set above; it's neither integer nor
+            # plain fp* so it falls outside this branch.)
             self.scale = None
             self.block_size = None
 

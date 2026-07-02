@@ -119,17 +119,24 @@ class _ParamState:
     exp_avg_sq: torch.Tensor | None = None
     # Muon-specific state (set when ``kind == 'muon'``). The
     # momentum matrix lives in ``mom_buf`` (any storage dtype:
-    # int8 with a BF16 per-row scale, or a raw fp16/bf16/fp32
-    # tensor with no scale). ``mom_buf`` also doubles as the
-    # grad accumulator (mu=1 accumulation). At ``step()`` time
-    # ``mom_buf`` is read (dequantized for int8), orthogonalized
-    # via Newton-Schulz, applied to the GPU param, then reset
-    # to zero for the next accumulation cycle. Field names are
+    # int8 with a BF16 per-row scale, mxfp8 with an E8M0
+    # per-block scale, or a raw fp16/bf16/fp32 tensor with no
+    # scale). ``mom_buf`` also doubles as the grad accumulator
+    # (mu=1 accumulation). At ``step()`` time ``mom_buf`` is
+    # read (dequantized for int8/mxfp8), orthogonalized via
+    # Newton-Schulz, applied to the GPU param, then reset to
+    # zero for the next accumulation cycle. Field names are
     # dtype-agnostic so the ``step()`` and ``loop.py``
     # byte-breakdown code works regardless of the configured
     # storage dtype.
     mom_buf: torch.Tensor | None = None
     mom_scale: torch.Tensor | None = None
+    # MXFP8-only: number of elements per E8M0 scale block. ``None``
+    # for int8 / fp* storage. The optimizer uses this to reshape
+    # ``mom_scale`` from ``[rows, ceil(cols / block_size)]`` to a
+    # per-element scale via ``repeat_interleave(block_size, dim=-1)``
+    # in the dequant path.
+    mxfp8_block_size: int | None = None
     # Cached for Muon: original param shape for reshape on GPU.
     shape: tuple = field(default_factory=tuple)
     # Step counter (per param; cheap).
@@ -172,9 +179,13 @@ class OptimizerState(Protocol):
     - ``mom_buf`` / ``mom_scale`` are Muon's momentum storage
       (which doubles as the grad accumulator). ``mom_buf`` is
       at the configured storage dtype (int8 with per-row
-      symmetric quantization + BF16 ``mom_scale``, OR a raw
-      fp16/bf16/fp32 tensor with ``mom_scale=None``). For
-      AdamW both are ``None``.
+      symmetric quantization + BF16 ``mom_scale``; OR mxfp8 with
+      per-block E8M0 ``mom_scale``; OR a raw fp16/bf16/fp32
+      tensor with ``mom_scale=None``). For AdamW both are
+      ``None``.
+    - ``mxfp8_block_size`` is the MXFP8-only block size (number
+      of elements per E8M0 scale). ``None`` for int8 / fp*
+      storage.
     - ``shape`` is cached for Muon (the original param shape
       before flatten) so diagnostics can report the failing
       param's full shape on NaN/Inf.
@@ -188,6 +199,7 @@ class OptimizerState(Protocol):
     exp_avg_sq: Optional[torch.Tensor]
     mom_buf: Optional[torch.Tensor]
     mom_scale: Optional[torch.Tensor]
+    mxfp8_block_size: Optional[int]
     shape: tuple
     step: int
 
@@ -515,6 +527,29 @@ class CPUMuon:
       exponent could underflow ``scale`` to 0 for very quiet
       rows, which would then divide-by-zero on dequant. BF16
       has the same 2-byte footprint as FP16.
+    * ``mxfp8`` + per-block E8M0 scale: 1 byte/elt E4M3 momentum
+      + 1 byte per ``block_size``-element block of E8M0 scale
+      (OCP MX spec; default ``block_size=32``). The 2-D momentum
+      matrix ``m`` is stored as a flat ``float8_e4m3fn`` buffer
+      reshaped to ``[rows, cols_padded]`` (``cols_padded`` rounds
+      up to a multiple of ``block_size`` — the tail block is all
+      zeros so it contributes nothing on dequant) plus a per-block
+      ``float8_e8m0fnu`` scale tensor of shape
+      ``[rows, cols_padded // block_size]``. The quantize recipe::
+
+          for each block of `block_size` contiguous elements along cols:
+              absmax = max(|m|) within the block
+              target_scale = absmax / E4M3_MAX
+              scale = round_to_nearest_power_of_2(target_scale)
+              q[i] = round_to_e4m3(m[i] / scale)
+
+      Same per-mb dequant → add → requant overhead as int8 (the
+      scale tensor tracks each block's growing max-abs across
+      accumulation); the storage savings vs int8 are negligible
+      (E8M0 is 1 byte vs BF16 2 bytes, but mxfp8 has ~cols/block_size
+      scale entries per row). The numerical advantage is the
+      per-block scale granularity — within-row scale variation
+      is captured without sacrificing global dynamic range.
     * ``bf16`` / ``fp16`` / ``fp32``: full-precision momentum, no
       quantization. ``mom_scale`` is ``None``. The Newton-Schulz
       output precision is unaffected by the storage dtype (NS
@@ -527,6 +562,8 @@ class CPUMuon:
 
     * ``int8``: dequant to FP32 on the GPU, SGD in FP32,
       requant to int8 + BF16 scale, D2H the new storage.
+    * ``mxfp8``: dequant to FP32 on the GPU, SGD in FP32,
+      requant to E4M3 + E8M0 scale, D2H the new storage.
     * ``fp16``/``bf16``/``fp32``: H2D the raw momentum, SGD in
       FP32, cast back to the storage dtype, D2H. No dequant /
       requant cycle.
@@ -554,19 +591,22 @@ class CPUMuon:
 
         - ``s.mom_buf``   (momentum + grad accumulator, merged)
           ← ``precision.muon_momentum`` (int8 with per-row
-          quantization, or raw fp16/bf16/fp32). ``mom_buf``
-          doubles as the accumulator (mu=1 accumulation).
-        - ``s.mom_scale`` (per-row scale)        ← only set for int8
-          storage (BF16 — the scale needs FP32-like dynamic range
-          to avoid underflow on quiet rows; BF16 is the cheapest
-          dtype that guarantees this). ``None`` for fp* storage.
+          quantization, mxfp8 with per-block E8M0 scale, or raw
+          fp16/bf16/fp32). ``mom_buf`` doubles as the accumulator
+          (mu=1 accumulation).
+        - ``s.mom_scale`` (scale tensor) ← set for int8 (BF16
+          per-row) or mxfp8 (E8M0 per-block). ``None`` for fp*
+          storage.
+        - ``s.mxfp8_block_size`` (block size for E8M0 scale) ←
+          set for mxfp8 (default 32), ``None`` for int8 / fp*.
 
         The ``gradients`` precision config is no longer used
         (there is no separate accumulator buffer).
 
-        Supported momentum dtypes: ``int8`` (default),
-        ``bf16`` / ``fp16`` / ``fp32`` (full-precision storage,
-        no quantization). ``int4`` raises :class:`NotImplementedError`
+        Supported momentum dtypes: ``int8`` (default, per-row
+        BF16 scale), ``mxfp8`` (per-block E8M0 scale, default
+        block_size=32), and full-precision ``bf16`` / ``fp16`` /
+        ``fp32``. ``int4`` raises :class:`NotImplementedError`
         (the packing scheme is on the roadmap but not landed).
         """
         self.lr = lr
@@ -576,8 +616,9 @@ class CPUMuon:
         self.weight_decay = weight_decay
         precision = precision or PrecisionConfig()
 
-        # Resolve momentum storage. int8 is the only fully-supported
-        # quantized storage; int4 is on the roadmap but not yet
+        # Resolve momentum storage. int8 / mxfp8 are the quantized
+        # storage paths (with their respective scale tensors);
+        # fp* is full-precision. int4 is on the roadmap but not yet
         # implemented (the mom_buf would need to pack 2 elements
         # per byte and the dequant path would need to unpack).
         # The ``gradients`` precision config is no longer used
@@ -587,18 +628,36 @@ class CPUMuon:
         if mom_dtype_cfg == DType.INT4:
             raise NotImplementedError(
                 "CPUMuon: muon_momentum dtype=int4 is not yet implemented."
-                " Use int8 (the current default) or a floating dtype"
-                " (bf16 / fp16 / fp32)."
+                " Use int8 (the current default), mxfp8, or a floating"
+                " dtype (bf16 / fp16 / fp32)."
             )
-        # int8 → 1 byte/elt momentum + a BF16 per-row scale.
+        # int8 → 1 byte/elt int8 + a BF16 per-row scale.
+        # mxfp8 → 1 byte/elt E4M3 + 1 byte per `block_size`-elt
+        #          E8M0 scale (default block_size=32; set in
+        #          TensorPrecision.__post_init__ when dtype=mxfp8).
         # fp*  → full-precision storage at the configured dtype;
         #         no scale, no dequant/requant in step().
         if mom_dtype_cfg.is_integer:
             mom_storage_dtype = mom_dtype_cfg.to_torch()  # int8
             scale_dtype = torch.bfloat16
+            scale_shape_fn = lambda shape: (shape[0],)
+            block_size = None
+        elif mom_dtype_cfg.is_mxfp:
+            mom_storage_dtype = mom_dtype_cfg.to_torch()  # float8_e4m3fn
+            scale_dtype = torch.float8_e8m0fnu
+            block_size = precision.muon_momentum.block_size
+            # Padded cols is rounded up to a multiple of block_size
+            # so the partial tail block is full of zeros (which
+            # quantize to zero with a zero scale — contributes
+            # nothing on dequant).
+            scale_shape_fn = lambda shape, bs=block_size: (
+                shape[0], (shape[1] + bs - 1) // bs,
+            )
         else:
             mom_storage_dtype = mom_dtype_cfg.to_torch()  # bf16/fp16/fp32
-            scale_dtype = None  # no scale for full-precision storage
+            scale_dtype = None
+            scale_shape_fn = None
+            block_size = None
 
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
@@ -615,18 +674,39 @@ class CPUMuon:
                 )
             n = p.numel()
             shape = tuple(p.shape)
+            if scale_shape_fn is None:
+                scale_shape: tuple[int, ...] = ()
+            else:
+                scale_shape = scale_shape_fn(shape)
             mom_scale = (
-                torch.zeros(shape[0], dtype=scale_dtype, device="cpu").pin_memory()
+                torch.zeros(scale_shape, dtype=scale_dtype, device="cpu").pin_memory()
                 if scale_dtype is not None else None
             )
+            # For MXFP8 storage, the per-block scale layout
+            # requires ``mom_buf`` to be sized ``rows * cols_p``
+            # (cols rounded up to a multiple of block_size), not
+            # the original ``rows * cols``. The trailing padded
+            # block is filled with zeros (no per-mb contribution)
+            # so it contributes nothing on dequant. Without this
+            # padding, the ``view(rows, n_blocks, bs)`` reshape
+            # in the dequant/requant helpers would raise on any
+            # param whose K dim is not a multiple of ``block_size``
+            # (e.g. KDA f_proj1/g_proj1 in tiny models).
+            storage_n = n
+            if block_size is not None and p.ndim == 2:
+                cols_dim = shape[1]
+                cols_p = cols_dim if cols_dim % block_size == 0 \
+                    else cols_dim + (block_size - cols_dim % block_size)
+                storage_n = shape[0] * cols_p
             # No separate accumulator buffer in the merged-
             # accumulator design. ``mom_buf`` doubles as the
             # grad accumulator (mu=1 accumulation) — see the
             # module docstring.
             st = _ParamState(
                 param=p,
-                mom_buf=torch.zeros(n, dtype=mom_storage_dtype, device="cpu").pin_memory(),
+                mom_buf=torch.zeros(storage_n, dtype=mom_storage_dtype, device="cpu").pin_memory(),
                 mom_scale=mom_scale,
+                mxfp8_block_size=block_size,
                 kind="muon",
                 shape=shape,
             )
@@ -682,12 +762,146 @@ class CPUMuon:
         s.mom_buf.copy_(q_int8.view(-1))
         s.mom_scale.copy_(new_scale_bf16)
 
+    # ------------------------------------------------------------------ #
+    # MXFP8 (E4M3 elements + per-block E8M0 scale) helpers.             #
+    # ------------------------------------------------------------------ #
+    # These mirror the int8 helpers above but use block-scaled
+    # E8M0 + E4M3 quantization (OCP MX spec). Same per-mb
+    # dequant-add-requant overhead as int8; finer within-row scale
+    # granularity.
+    #
+    # Storage layout (per-param ``s``):
+    #   mom_buf          : float8_e4m3fn,    shape [rows, cols_padded]
+    #                      (cols_padded rounds up to a multiple of
+    #                      ``block_size``; the tail block is all zeros
+    #                      so it contributes nothing on dequant)
+    #   mom_scale        : float8_e8m0fnu,   shape [rows, cols_padded // block_size]
+    #   mxfp8_block_size : int (default 32)
+    #
+    # The ``view`` to [rows, cols_padded] is a free reshape because
+    # mom_buf is contiguous 1-D.
+
+    _E4M3_MAX = 448.0
+
+    @staticmethod
+    def _round_to_e8m0(scale_fp32: torch.Tensor) -> torch.Tensor:
+        """Round FP32 scale values to the nearest E8M0-representable
+        power of 2 (banker's rounding on the exponent).
+
+        E8M0 has 8 exponent bits, no mantissa, no sign — values are
+        pure powers of 2 in [2^-126, 2^127]. We use byte 1 (smallest
+        representable, 2^-126) as the underflow floor so a
+        block of all-zero values doesn't produce a 0-byte scale
+        (E8M0 0-byte decodes to 0.0 → divide-by-zero on dequant;
+        for an all-zero block the quantized values are also zero,
+        so the scale value is moot, but we need a finite non-NaN
+        scale for the divide).
+
+        We bitcast via uint8 + ``.view(float8_e8m0fnu)`` (not
+        ``.to(float8_e8m0fnu)``, which does value conversion).
+        """
+        safe = scale_fp32.float().clamp(min=2 ** -127)
+        log2 = safe.log2()
+        e_unclamped = log2.round() + 127.0
+        e = e_unclamped.clamp(min=1.0, max=254.0)
+        return e.to(torch.uint8).view(torch.float8_e8m0fnu)
+
+    def _mxfp8_padded_cols(self, s: _ParamState) -> int:
+        """Number of cols after MXFP8 right-padding to a multiple
+        of ``s.mxfp8_block_size``. Used by both the dequant and
+        requant paths so they agree on the layout."""
+        bs = s.mxfp8_block_size
+        cols = s.shape[1]
+        return cols if cols % bs == 0 else cols + (bs - cols % bs)
+
+    def _dequantize_mxfp8(self, s: _ParamState) -> torch.Tensor:
+        """Dequantize MXFP8 ``s.mom_buf`` (E4M3) + ``s.mom_scale``
+        (E8M0) into a FP32 ``[rows, cols]`` tensor (the padded tail
+        block is cropped out — it's all zeros anyway).
+
+        Runs on the CPU. The per-block scale broadcast across the
+        block's elements via ``repeat_interleave(block_size, dim=-1)``
+        then we crop to the original cols.
+
+        Only valid when ``s.mxfp8_block_size is not None``.
+        """
+        rows, cols = s.shape[0], s.shape[1]
+        bs = s.mxfp8_block_size
+        cols_p = self._mxfp8_padded_cols(s)
+        n_blocks = cols_p // bs
+        # E4M3 → FP32 (lossless); reshape to [rows, n_blocks, bs].
+        q_blocks = s.mom_buf.view(rows, n_blocks, bs).float()
+        # E8M0 → FP32 via ``.float()`` (value conversion: byte b
+        # decodes to 2^(b-127)). NOT via ``.view(torch.uint8).float()``
+        # — that bitcasts to uint8 first and would give the byte value
+        # itself (e.g. byte 113 → 113.0), not the power-of-2 it encodes
+        # (2^-14 ≈ 6.1e-5). Easy bug to make and easy to miss because
+        # the values are still in a "plausible" range.
+        scale_fp32 = s.mom_scale.float().view(rows, n_blocks, 1)
+        # Per-element scale (broadcast across each block's bs elts).
+        out = q_blocks * scale_fp32
+        # Flatten and crop the padded tail (which is zero anyway).
+        return out.view(rows, cols_p)[:, :cols].reshape(rows, cols)
+
+    def _requantize_mxfp8(self, m_fp32: torch.Tensor, s: _ParamState) -> None:
+        """Per-block MXFP8 quantize ``m_fp32`` (FP32 ``[rows, cols]``)
+        into ``s.mom_buf`` (E4M3 ``[rows, cols_padded]``) +
+        ``s.mom_scale`` (E8M0 ``[rows, cols_padded // block_size]``).
+
+        The padded tail block is filled with zeros so it contributes
+        nothing on dequant.
+
+        Only valid when ``s.mxfp8_block_size is not None``.
+        """
+        rows, cols = s.shape[0], s.shape[1]
+        bs = s.mxfp8_block_size
+        cols_p = self._mxfp8_padded_cols(s)
+        n_blocks = cols_p // bs
+        # Reshape to blocks; pad cols to cols_p if needed.
+        if cols_p != cols:
+            m_padded = torch.nn.functional.pad(
+                m_fp32.view(rows, cols), (0, cols_p - cols),
+            )
+        else:
+            m_padded = m_fp32.view(rows, cols)
+        blocks = m_padded.view(rows, n_blocks, bs)
+        # Per-block absmax in FP32. E4M3 max is 448, so the per-block
+        # scale is absmax / 448, then round to nearest power of 2
+        # for E8M0.
+        absmax = blocks.abs().amax(dim=-1).float()           # [rows, n_blocks]
+        target_scale = (absmax / self._E4M3_MAX).clamp(min=2 ** -127)
+        scales = self._round_to_e8m0(target_scale)            # E8M0
+        # Per-element scale broadcast across each block's bs elts.
+        # ``scales.float()`` decodes the E8M0 byte to its value
+        # (2^(b-127)); the bitcast path would give the byte itself.
+        scale_fp32 = scales.float() \
+                        .view(rows, n_blocks, 1)
+        scaled = (blocks.float() / scale_fp32).clamp(-self._E4M3_MAX, self._E4M3_MAX)
+        # Cast FP32 → E4M3 (PyTorch does round-to-nearest-even).
+        q_e4m3 = scaled.to(torch.float8_e4m3fn)
+        # ``copy_`` requires shapes to match — flatten the src to
+        # the destination's 1-D shape (not just same numel).
+        s.mom_buf.copy_(q_e4m3.reshape(-1).view(s.mom_buf.shape))
+        s.mom_scale.copy_(scales.view(s.mom_scale.shape))
+
     def _newton_schulz(self, x: torch.Tensor) -> torch.Tensor:
         a, b, c = self._NS_COEFFS
         # Cast to FP16 for tensor-core matmul speed. The
         # orthogonalization is robust to FP16 noise for typical
         # gradient magnitudes.
         x = x.to(torch.float16)
+        # Normalize by Frobenius norm before NS. The polynomial
+        # coefficients (a, b, c) = (3.4445, -4.7750, 2.0315) have
+        # fixed points at singular values σ ≈ 0.868 and σ ≈ 1.265;
+        # the iteration only converges for σ in that band. Real
+        # gradient matrices can have singular values well outside
+        # the band (after accumulation, condition numbers of 100+
+        # are common); without this normalization NS diverges and
+        # every param becomes NaN on the second step.
+        # The standard Muon reference (Keller Jordan's muon.py)
+        # normalizes by ``X.norm() + eps`` for the same reason.
+        eps = 1e-7
+        x = x / (x.norm() + eps)
         if x.size(0) > x.size(1):
             g = x
             for _ in range(self.ns_steps):
@@ -728,16 +942,25 @@ class CPUMuon:
         configured storage dtype, D2H the new storage, then
         stream Newton-Schulz over rows to produce the update.
 
-        Two storage paths share the same scaffolding (H2D state,
-        SGD in FP32, D2H new state, then stream NS over rows):
+        Three storage paths share the same scaffolding (H2D
+        state, SGD in FP32, D2H new state, then stream NS over
+        rows):
 
-        * **Quantized** (``s.mom_scale is not None``, i.e.
-          ``int8`` + BF16 scale): dequant to FP32 on the GPU,
-          requant to int8 + BF16 scale, D2H the new storage.
-        * **Full-precision** (``s.mom_scale is None``, i.e.
-          ``fp16``/``bf16``/``fp32``): H2D the raw momentum,
-          cast back to the storage dtype, D2H. No dequant /
-          requant.
+        * **int8 + BF16 per-row scale** (canonical quantized
+          default): dequant to FP32 on the GPU, requant to
+          int8 + BF16 scale, D2H the new storage.
+        * **mxfp8 + E8M0 per-block scale** (experimental):
+          dequant to FP32 on the GPU (per-block scale broadcast
+          across the block), requant to E4M3 + E8M0 scale, D2H
+          the new storage.
+        * **Full-precision** (``fp16``/``bf16``/``fp32``, i.e.
+          ``s.mom_scale is None``): H2D the raw momentum, cast
+          back to the storage dtype, D2H. No dequant / requant.
+
+        Dispatch is via ``s.mxfp8_block_size is not None`` for
+        mxfp8 and ``s.mom_scale is not None`` (with the
+        mxfp8 check first) for int8; ``s.mom_scale is None``
+        implies fp*.
 
         No cross-step μ momentum smoothing is applied here —
         ``mom_buf`` resets to zero at the end of every step,
@@ -761,28 +984,58 @@ class CPUMuon:
         CHUNK_ROWS = self._STREAM_CHUNK_ROWS
         for s in self.state.values():
             g_buf = s.mom_buf
-            if g_buf.abs().sum().item() == 0:
+            # Early-exit on no accumulated grad. FP8 dtypes don't
+            # support CPU sum reductions (NotImplementedError), so
+            # we cast to bf16 first — same cost as the abs+sum
+            # reduction we're avoiding when the buffer IS empty
+            # (the cast is the only overhead on the early-exit path).
+            if g_buf.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
+                                torch.float8_e8m0fnu):
+                if g_buf.to(torch.bfloat16).abs().sum().item() == 0:
+                    continue
+            elif g_buf.abs().sum().item() == 0:
                 continue
             shape = s.shape
             rows, cols = shape[0], shape[1]
             device = s.param.device
-            quantized = s.mom_scale is not None
+            is_mxfp8 = s.mxfp8_block_size is not None
+            quantized = s.mom_scale is not None  # int8 OR mxfp8
 
             # ---- H2D state to GPU (async; pinned host memory →
             # real async DMA with non_blocking=True) ----
             mom_buf_gpu = g_buf.to(device, non_blocking=True)
 
             # ---- Get the SGD input as FP32 [rows, cols] on GPU.
-            # Quantized path: dequant int8 with the BF16 per-row
-            # scale. Full-precision path: just cast the storage
-            # dtype to FP32 (lossless for fp32; bf16/fp16 widen
-            # to FP32 in one instruction). ----
-            if quantized:
+            # Dispatch on storage variant. mxfp8 needs the block
+            # size to reshape mom_scale from [rows, n_blocks] back
+            # to per-element via repeat_interleave. ----
+            if is_mxfp8:
+                bs = s.mxfp8_block_size
+                cols_p = self._mxfp8_padded_cols(s)
+                scale_gpu = s.mom_scale.to(device, non_blocking=True)
+                # E4M3 → FP32, reshape to [rows, n_blocks, bs].
+                n_blocks = cols_p // bs
+                q_blocks = mom_buf_gpu.float().view(rows, n_blocks, bs)
+                # E8M0 → FP32 via ``.float()`` (value conversion:
+                # byte b → 2^(b-127)). The bitcast path through
+                # uint8 would give the byte itself, not the
+                # power-of-2 it encodes.
+                scale_fp32 = scale_gpu.float() \
+                                .view(rows, n_blocks, 1)
+                m_fp32_blocks = q_blocks * scale_fp32          # FP32 [rows, n_blocks, bs]
+                # Crop the padded tail block (which is zero anyway).
+                m_fp32_gpu = m_fp32_blocks.view(rows, cols_p)[:, :cols] \
+                                                    .reshape(rows, cols)
+            elif quantized:
+                # int8 + per-row BF16 scale.
                 scale_gpu = s.mom_scale.to(device, non_blocking=True)
                 q_2d = mom_buf_gpu.float().view(rows, cols)
                 scale_2d = scale_gpu.float().unsqueeze(1)     # [rows, 1]
                 m_fp32_gpu = q_2d * scale_2d                 # FP32 [rows, cols]
             else:
+                # Full-precision storage (fp16/bf16/fp32): just
+                # cast the storage dtype to FP32 (lossless for fp32;
+                # bf16/fp16 widen to FP32 in one instruction).
                 m_fp32_gpu = mom_buf_gpu.float().view(rows, cols)
 
             # ---- No SGD update here: mom_buf is already the
@@ -790,7 +1043,51 @@ class CPUMuon:
 
             # ---- Requant (quantized) or recast (full-precision)
             # + D2H the new momentum storage. ----
-            if quantized:
+            if is_mxfp8:
+                # Block-scaled requant. ``m_fp32_gpu`` is [rows, cols]
+                # (already cropped); pad right to cols_p, reshape to
+                # blocks, compute per-block absmax + E8M0 scale,
+                # divide + round to E4M3, D2H both.
+                bs = s.mxfp8_block_size
+                cols_p = self._mxfp8_padded_cols(s)
+                n_blocks = cols_p // bs
+                if cols_p != cols:
+                    m_padded = torch.nn.functional.pad(
+                        m_fp32_gpu, (0, cols_p - cols),
+                    )
+                else:
+                    m_padded = m_fp32_gpu
+                blocks = m_padded.view(rows, n_blocks, bs)
+                absmax = blocks.abs().amax(dim=-1).float()
+                target_scale = (absmax / self._E4M3_MAX).clamp(min=2 ** -127)
+                # Round-to-nearest power of 2 (E8M0); bitcast via uint8.
+                log2 = target_scale.log2()
+                e_unclamped = log2.round() + 127.0
+                e = e_unclamped.clamp(min=1.0, max=254.0)
+                new_scales = e.to(torch.uint8).view(torch.float8_e8m0fnu)
+                # ``.float()`` decodes E8M0 bytes to their value
+                # (2^(b-127)); do NOT use the bitcast path.
+                scale_fp32 = new_scales.float() \
+                                .view(rows, n_blocks, 1)
+                scaled = (blocks.float() / scale_fp32) \
+                            .clamp(-self._E4M3_MAX, self._E4M3_MAX)
+                q_e4m3 = scaled.to(torch.float8_e4m3fn)
+                # ``copy_`` requires shapes to match — view both
+                # src and dst in the same shape (not just same
+                # numel) to avoid the shape-mismatch error.
+                s.mom_buf.copy_(
+                    q_e4m3.reshape(-1).view(s.mom_buf.shape),
+                    non_blocking=True,
+                )
+                s.mom_scale.copy_(
+                    new_scales.view(s.mom_scale.shape),
+                    non_blocking=True,
+                )
+                # Orthogonalize from the dequantized FP32 (cleaner
+                # than re-reading the E4M3 storage).
+                orth_input = m_fp32_gpu
+            elif quantized:
+                # int8 per-row requant.
                 row_max = m_fp32_gpu.abs().amax(dim=1).clamp(min=1e-8)
                 new_scale_fp32 = row_max / 127.0
                 new_scale_bf16 = new_scale_fp32.to(torch.bfloat16)
@@ -872,6 +1169,7 @@ class CPUMuon:
                     "kind": s.kind,
                     "mom_buf": s.mom_buf,
                     "mom_scale": s.mom_scale,
+                    "mxfp8_block_size": s.mxfp8_block_size,
                 }
                 for s in self.state.values()
             ],
@@ -905,6 +1203,19 @@ class CPUMuon:
                 cur.mom_buf.copy_(sav["mom_buf"])
             if sav.get("mom_scale") is not None:
                 cur.mom_scale.copy_(sav["mom_scale"])
+            # mxfp8_block_size is metadata-only (no tensor); keep
+            # the current optimizer's value if not in the file
+            # (e.g. an older int8 checkpoint loaded into a freshly-
+            # constructed mxfp8 optimizer would mismatch — caught
+            # by the explicit check below).
+            file_bs = sav.get("mxfp8_block_size")
+            if file_bs is not None and cur.mxfp8_block_size is not None \
+                    and file_bs != cur.mxfp8_block_size:
+                raise ValueError(
+                    f"CPUMuon.load_state_dict: mxfp8 block_size"
+                    f" mismatch at param index {current.index(cur)}:"
+                    f" file={file_bs} current={cur.mxfp8_block_size}."
+                )
 
 
 # --------------------------------------------------------------------------- #
@@ -920,21 +1231,22 @@ def _accumulator_target(s: _ParamState) -> Tuple[torch.Tensor, torch.dtype]:
     ``cast_dtype`` is the dtype to cast the GPU grad to before
     the DMA. Normally this is the storage dtype of the
     accumulator (so the DMA carries the same bytes as storage).
-    The exception is int8 Muon, where we cast to BF16 instead:
-    the dequant-add-requant path on the flush side needs a
-    floating-point src tensor to add into the dequantized
-    FP32 momentum without losing the bf16 grad's mantissa.
+    The exception is int8 and mxfp8 Muon, where we cast to BF16
+    instead: the dequant-add-requant path on the flush side needs
+    a floating-point src tensor to add into the dequantized FP32
+    momentum without losing the bf16 grad's mantissa.
     """
     if s.kind == "adamw":
         return s.m, s.m.dtype
     # muon
     if s.mom_scale is not None:
-        # int8 storage: use bf16 as the cast target so the
-        # dequant-add-requant path can add the src to the
-        # dequantized FP32 momentum without further precision
-        # loss. (Casting to int8 directly would round the bf16
-        # grad to ±127/scale which is meaningless without the
-        # scale's full dynamic range.)
+        # Quantized storage (int8 OR mxfp8): use bf16 as the cast
+        # target so the dequant-add-requant path can add the src
+        # to the dequantized FP32 momentum without further
+        # precision loss. (Casting to int8 directly would round
+        # the bf16 grad to ±127/scale which is meaningless
+        # without the scale's full dynamic range. For mxfp8 the
+        # block-scaled divide would suffer the same truncation.)
         return s.mom_buf, torch.bfloat16
     return s.mom_buf, s.mom_buf.dtype
 
@@ -990,7 +1302,13 @@ def accumulate_grads_to_cpu(
                 .to("cpu", non_blocking=True)
             )
             if s.kind == "muon" and s.mom_scale is not None:
-                pending.append(("int8_muon", s, src_cpu))
+                # mxfp8 and int8 both need dequant-add-requant on
+                # the CPU flush side (the per-mb cost of preserving
+                # quantization precision without an extra buffer).
+                if s.mxfp8_block_size is not None:
+                    pending.append(("mxfp8_muon", s, src_cpu))
+                else:
+                    pending.append(("int8_muon", s, src_cpu))
             else:
                 pending.append(("add", target, src_cpu))
             # Free GPU grad immediately so the GPU memory is
@@ -1006,14 +1324,21 @@ def accumulate_grads_to_cpu(
         if entry[0] == "add":
             _, target, src = entry
             target.add_(src)
-        else:
-            # int8_muon: dequant-add-requant per microbatch so
-            # the per-row scale tracks the row's growing max-abs
+        elif entry[0] == "int8_muon":
+            # int8: dequant-add-requant per microbatch so the
+            # per-row scale tracks the row's growing max-abs
             # across accumulation (otherwise small grad updates
             # would round to zero and the scale would never
             # re-adjust).
             _, s, src = entry
             _int8_muon_accumulate(s, src)
+        elif entry[0] == "mxfp8_muon":
+            # mxfp8: per-block dequant-add-requant so each block's
+            # E8M0 scale tracks the block's growing max-abs.
+            _, s, src = entry
+            _mxfp8_muon_accumulate(s, src)
+        else:
+            raise RuntimeError(f"unknown pending entry kind: {entry[0]!r}")
 
 
 def _int8_muon_accumulate(s: _ParamState, src: torch.Tensor) -> None:
@@ -1054,6 +1379,69 @@ def _int8_muon_accumulate(s: _ParamState, src: torch.Tensor) -> None:
     q_int8 = (m_fp32 / scale_2d).round().clamp(-128, 127).to(torch.int8)
     s.mom_buf.copy_(q_int8.view(-1))
     s.mom_scale.copy_(new_scale_bf16)
+
+
+def _mxfp8_muon_accumulate(s: _ParamState, src: torch.Tensor) -> None:
+    """Dequant → add → requant for one microbatch's MXFP8-Muon grad.
+
+    Mirrors :func:`_int8_muon_accumulate` but uses block-scaled
+    E8M0 + E4M3 quantization (OCP MX spec). To add a new bf16 grad
+    ``src`` (cast to BF16 by the caller) without losing precision:
+
+      1. Dequant ``s.mom_buf`` (E4M3) + ``s.mom_scale`` (E8M0)
+         into FP32 ``[rows, cols_padded]`` blocks.
+      2. Crop to ``[rows, cols]`` (the padded tail is zero anyway).
+      3. Reshape ``src`` to ``[rows, cols]``, cast to FP32, add.
+      4. Requantize: pad right to ``cols_padded``, reshape to
+         ``[rows, n_blocks, bs]``, compute new per-block absmax,
+         new E8M0 scale (clamped to 2^-127 to avoid zero byte),
+         quantize to E4M3, copy back to ``s.mom_buf`` /
+         ``s.mom_scale``.
+
+    Same per-mb overhead as int8 (CPU dequant + add + requant);
+    finer per-block scale granularity.
+
+    Runs on the CPU. ``mom_buf`` is contiguous 1-D, so the
+    ``view(rows, cols_padded)`` reshape is free; the FP32 work
+    is the only allocation.
+    """
+    rows, cols = s.shape[0], s.shape[1]
+    bs = s.mxfp8_block_size
+    cols_p = s.shape[1] if cols % bs == 0 else cols + (bs - cols % bs)
+    n_blocks = cols_p // bs
+    # 1. Dequant: mom_buf (E4M3) * scale (E8M0) → FP32 [rows, n_blocks, bs].
+    q_blocks = s.mom_buf.view(rows, n_blocks, bs).float()
+    # ``.float()`` decodes E8M0 bytes to their value (2^(b-127));
+    # the bitcast path through uint8 would give the byte itself.
+    scale_fp32 = s.mom_scale.float().view(rows, n_blocks, 1)
+    m_blocks = q_blocks * scale_fp32                              # FP32
+    # 2. Crop the padded tail block (which is zero anyway).
+    m_2d = m_blocks.view(rows, cols_p)[:, :cols].reshape(rows, cols)
+    # 3. Add the src grad (cast to FP32 first for the in-place add).
+    m_2d.add_(src.view(rows, cols).float())
+    # 4. Requantize: pad, reshape to blocks, compute new E8M0 scales,
+    #    quantize to E4M3, copy back to s.mom_buf / s.mom_scale.
+    if cols_p != cols:
+        m_padded = torch.nn.functional.pad(m_2d, (0, cols_p - cols))
+    else:
+        m_padded = m_2d
+    blocks = m_padded.view(rows, n_blocks, bs)
+    absmax = blocks.abs().amax(dim=-1).float()
+    target_scale = (absmax / 448.0).clamp(min=2 ** -127)
+    log2 = target_scale.log2()
+    e_unclamped = log2.round() + 127.0
+    e = e_unclamped.clamp(min=1.0, max=254.0)
+    new_scales = e.to(torch.uint8).view(torch.float8_e8m0fnu)
+    # ``.float()`` decodes E8M0 bytes to their value; NOT the
+    # bitcast path through uint8.
+    new_scale_fp32 = new_scales.float().view(rows, n_blocks, 1)
+    scaled = (blocks.float() / new_scale_fp32).clamp(-448.0, 448.0)
+    q_e4m3 = scaled.to(torch.float8_e4m3fn)
+    # ``copy_`` requires shapes to match (not just element count) —
+    # flatten both sides and view as the destination shape to dodge
+    # the shape-mismatch error.
+    s.mom_buf.copy_(q_e4m3.reshape(-1).view(s.mom_buf.shape))
+    s.mom_scale.copy_(new_scales.view(s.mom_scale.shape))
 
 
 # --------------------------------------------------------------------------- #
@@ -1174,7 +1562,14 @@ def _make_offload_hook(s: _ParamState):
     """
     p = s.param
     target, target_dtype = _accumulator_target(s)
-    is_int8_muon = (s.kind == "muon" and s.mom_scale is not None)
+    is_mxfp8_muon = (
+        s.kind == "muon" and s.mxfp8_block_size is not None
+    )
+    is_int8_muon = (
+        s.kind == "muon"
+        and s.mom_scale is not None
+        and not is_mxfp8_muon
+    )
 
     def hook(g: torch.Tensor | None) -> None:
         # ``g`` is the leaf param per the PyTorch API contract.
@@ -1197,7 +1592,9 @@ def _make_offload_hook(s: _ParamState):
             .reshape(-1)
             .to("cpu", non_blocking=True)
         )
-        if is_int8_muon:
+        if is_mxfp8_muon:
+            _pending_grads.append(("mxfp8_muon", s, src))
+        elif is_int8_muon:
             _pending_grads.append(("int8_muon", s, src))
         else:
             _pending_grads.append(("add", target, src))
@@ -1256,7 +1653,10 @@ def flush_manual_flush_params(optimizers: List) -> None:
                 .to("cpu", non_blocking=True)
             )
             if s.kind == "muon" and s.mom_scale is not None:
-                pending.append(("int8_muon", s, src_cpu))
+                if s.mxfp8_block_size is not None:
+                    pending.append(("mxfp8_muon", s, src_cpu))
+                else:
+                    pending.append(("int8_muon", s, src_cpu))
             else:
                 pending.append(("add", target, src_cpu))
             p.grad = None
@@ -1267,9 +1667,14 @@ def flush_manual_flush_params(optimizers: List) -> None:
         if entry[0] == "add":
             _, target, src = entry
             target.add_(src)
-        else:
+        elif entry[0] == "int8_muon":
             _, s, src = entry
             _int8_muon_accumulate(s, src)
+        elif entry[0] == "mxfp8_muon":
+            _, s, src = entry
+            _mxfp8_muon_accumulate(s, src)
+        else:
+            raise RuntimeError(f"unknown pending entry kind: {entry[0]!r}")
 
 
 def flush_pending_grads(sync_device: int | None = None) -> None:
@@ -1308,13 +1713,68 @@ def flush_pending_grads(sync_device: int | None = None) -> None:
         if entry[0] == "add":
             _, target, src = entry
             target.add_(src)
-        else:
-            # int8_muon: dequant-add-requant per microbatch so
-            # the per-row scale tracks the row's growing max-abs
-            # across accumulation.
+        elif entry[0] == "int8_muon":
+            # int8: per-row dequant-add-requant so the per-row
+            # scale tracks the row's growing max-abs.
             _, s, src = entry
             _int8_muon_accumulate(s, src)
+        elif entry[0] == "mxfp8_muon":
+            # mxfp8: per-block dequant-add-requant so each block's
+            # E8M0 scale tracks the block's growing max-abs.
+            _, s, src = entry
+            _mxfp8_muon_accumulate(s, src)
+        else:
+            raise RuntimeError(f"unknown pending entry kind: {entry[0]!r}")
     _pending_grads.clear()
+
+
+def _scale_mxfp8_mom_buf(s: _ParamState, coef: float) -> None:
+    """In-place FP32-equivalent scale of an MXFP8 Muon accumulator.
+
+    ``coef * mom_buf`` is what
+    :func:`src.training.loop._compute_and_clip_grad_norm` wants
+    to apply when the grad norm exceeds the cap — but
+    ``.mul_`` is not implemented for FP8 dtypes on CPU, so we
+    round-trip through FP32: dequant → mul → requant. Same
+    per-param overhead as a per-mb dequant-add-requant (the
+    add path becomes a mul by ``coef``); reuses the same
+    ``.float()``-decode E8M0 path so the bitcast bug doesn't
+    come back.
+
+    No-op when ``coef == 1.0`` (cheap guard so the grad-norm
+    clip stays a no-op for well-behaved steps). Only valid
+    when ``s.mxfp8_block_size is not None``.
+    """
+    if coef == 1.0:
+        return
+    rows, cols = s.shape[0], s.shape[1]
+    bs = s.mxfp8_block_size
+    cols_p = cols if cols % bs == 0 else cols + (bs - cols % bs)
+    n_blocks = cols_p // bs
+    # 1. Dequant.
+    q_blocks = s.mom_buf.view(rows, n_blocks, bs).float()
+    scale_fp32 = s.mom_scale.float().view(rows, n_blocks, 1)
+    m_fp32_blocks = q_blocks * scale_fp32
+    m_2d = m_fp32_blocks.view(rows, cols_p)[:, :cols].reshape(rows, cols)
+    # 2. Scale (FP32 in place).
+    m_2d.mul_(coef)
+    # 3. Requantize (inlined; same logic as the per-mb accumulate path).
+    if cols_p != cols:
+        m_padded = torch.nn.functional.pad(m_2d, (0, cols_p - cols))
+    else:
+        m_padded = m_2d
+    blocks = m_padded.view(rows, n_blocks, bs)
+    absmax = blocks.abs().amax(dim=-1).float()
+    target_scale = (absmax / 448.0).clamp(min=2 ** -127)
+    log2 = target_scale.log2()
+    e_unclamped = log2.round() + 127.0
+    e = e_unclamped.clamp(min=1.0, max=254.0)
+    new_scales = e.to(torch.uint8).view(torch.float8_e8m0fnu)
+    new_scale_fp32 = new_scales.float().view(rows, n_blocks, 1)
+    scaled = (blocks.float() / new_scale_fp32).clamp(-448.0, 448.0)
+    q_e4m3 = scaled.to(torch.float8_e4m3fn)
+    s.mom_buf.copy_(q_e4m3.reshape(-1).view(s.mom_buf.shape))
+    s.mom_scale.copy_(new_scales.view(s.mom_scale.shape))
 
 
 def zero_cpu_grad_accum(optimizers: List) -> None:

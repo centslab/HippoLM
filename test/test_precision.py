@@ -459,6 +459,97 @@ def test_muon_step_runs_for_int8_and_floating_storage_paths():
     assert not torch.equal(p2.data, initial2)
 
 
+def test_muon_mxfp8_storage_step_runs_and_produces_finite_params():
+    """MXFP8 (E4M3 + per-block E8M0) momentum storage round-trips
+    correctly through step().
+
+    Verifies:
+      - The E8M0 ``.float()`` decode path gives the power-of-2
+        value (2^(b-127)), not the byte itself — the bitcast
+        bug produced all-zero quantized values and silent
+        momentum collapse.
+      - The Frobenius-norm NS normalization prevents singular
+        value blow-up on the second step (NS coeffs (3.4445,
+        -4.7750, 2.0315) only converge for σ in
+        [0.868, 1.265]; random Gaussian grads easily exceed
+        that band).
+      - The padded storage (``mom_buf.numel() == rows * cols_p``)
+        handles K dims that aren't a multiple of ``block_size``.
+    """
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda", 0)
+
+    # Two params: one with cols % block_size == 0 (cols=32) and
+    # one with cols < block_size (cols=16) — the latter exercises
+    # the padded-storage branch.
+    for rows, cols in [(8, 32), (8, 16), (16, 32)]:
+        torch.manual_seed(0)
+        p = nn.Parameter(torch.randn(rows, cols, device=device) * 0.02)
+        opt = CPUMuon([p], precision=PrecisionConfig(
+            muon_momentum=TensorPrecision(dtype=DType.MXFP8, block_size=32),
+        ))
+        s = opt.state[id(p)]
+        # Storage dtype checks.
+        assert s.mom_buf.dtype == torch.float8_e4m3fn, (
+            f"mxfp8 mom_buf should be E4M3, got {s.mom_buf.dtype}"
+        )
+        assert s.mom_scale.dtype == torch.float8_e8m0fnu, (
+            f"mxfp8 mom_scale should be E8M0, got {s.mom_scale.dtype}"
+        )
+        # Padded storage size: rows * ceil(cols / block_size) * block_size.
+        cols_p = cols if cols % 32 == 0 else cols + (32 - cols % 32)
+        expected_numel = rows * cols_p
+        assert s.mom_buf.numel() == expected_numel, (
+            f"padded mom_buf wrong size for shape ({rows},{cols}):"
+            f" got {s.mom_buf.numel()}, expected {expected_numel}"
+        )
+
+        # Accumulate a few microbatches so the per-mb
+        # dequant-add-requant path is exercised. Without the
+        # ``.float()`` E8M0 decode fix, the dequantized
+        # momentum would be all-zero (the byte 113 would
+        # decode to 113.0 instead of 2^-14 ≈ 6.1e-5, dividing
+        # every quantized value into a rounding hole).
+        for _ in range(3):
+            p.grad = torch.randn_like(p) * 0.01
+            accumulate_grads_to_cpu([opt])
+        initial = p.data.clone()
+        opt.step()
+        # The param must have moved (no silent zero-update from
+        # the E8M0 bitcast bug) and stayed finite (no NaN from
+        # the NS divergence).
+        assert not torch.equal(p.data, initial), (
+            f"mxfp8 param shape ({rows},{cols}) did not move —"
+            f" momentum storage likely collapsed to zero"
+        )
+        assert torch.isfinite(p.data).all(), (
+            f"mxfp8 param shape ({rows},{cols}) became NaN/Inf"
+            f" after step — NS divergence?"
+        )
+
+
+def test_precision_config_mxfp8_defaults_to_block_size_32():
+    """MXFP8 dtype without an explicit block_size defaults to 32
+    (the OCP MX spec "MXFP8 with 32-element blocks").
+    """
+    tp = TensorPrecision(dtype=DType.MXFP8)
+    assert tp.scale == ScaleMode.BLOCK
+    assert tp.block_size == 32
+
+
+def test_precision_config_mxfp8_rejects_per_channel_scale():
+    """MXFP8 is block-scaled (E8M0 hardware path); per-channel
+    and tensor scales are rejected at config-parse time.
+    """
+    with pytest.raises(ValueError, match="requires.*block"):
+        TensorPrecision(
+            dtype=DType.MXFP8, scale=ScaleMode.PER_CHANNEL,
+        )
+    with pytest.raises(ValueError, match="requires.*block"):
+        TensorPrecision(dtype=DType.MXFP8, scale=ScaleMode.TENSOR)
+
+
 # --------------------------------------------------------------------------- #
 # accumulate_grads_to_cpu honors the accumulator's storage dtype.              #
 # --------------------------------------------------------------------------- #
