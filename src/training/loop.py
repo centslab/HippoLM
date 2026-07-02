@@ -809,9 +809,55 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # After chunk i's bwd completes, the freed memory is
                 # reusable for chunk i+1's fwd — the autograd graph is
                 # severed.
+                # Token-weighted per-chunk loss normalization.
+                # ------------------------------------------------
+                # The model returns each chunk's MEAN cross-entropy
+                # over that chunk's valid (non-ignored) tokens. Real
+                # FFD-packed data fills docs from position 0 and pads
+                # the tail, so the trailing chunks are pure padding
+                # (labels all -100) and the model returns 0 for them.
+                # Dividing every chunk's mean by ``n_chunks`` (the old
+                # code) assumed each chunk held an equal 1/n_chunks
+                # share of the valid tokens — true only for the fully
+                # packed dummy-data smoke test. On real data the empty
+                # trailing chunks then diluted the step loss toward
+                # zero (e.g. 5 real chunks of ~12.7 out of 16 reported
+                # ~3.98 instead of ~12.7) and under-scaled the real
+                # chunks' gradients.
+                #
+                # Fix: weight each chunk by its share of the step's
+                # valid tokens, so ``step_loss`` equals the token-
+                # weighted mean CE over the whole packed sequence and
+                # the accumulated gradient matches a single full-
+                # sequence backward. This reduces to the old
+                # ``/n_chunks`` exactly when every chunk is equally
+                # full. The model shifts labels by one (predict t+1
+                # from t), so the per-chunk valid count is measured on
+                # ``labels[:, s+1:e]`` — identical to the count the
+                # FusedLinearCE kernel divides its mean by.
+                chunk_valid = [
+                    int(
+                        (labels[:, ci * micro_batch_size + 1:
+                                (ci + 1) * micro_batch_size] != -100)
+                        .sum().item()
+                    )
+                    for ci in range(n_chunks)
+                ]
+                total_valid = max(sum(chunk_valid), 1)
+                # Stop after the last chunk that has any valid token:
+                # trailing all-pad chunks carry no state into any real
+                # chunk, so running their (32-layer) forward would be
+                # pure waste. Interior empty chunks (should not occur
+                # with the trailing-pad FFD packer) still run forward
+                # for state carry but contribute no loss/gradient.
+                last_real = max(
+                    (ci for ci, nv in enumerate(chunk_valid) if nv > 0),
+                    default=-1,
+                )
+
                 kda_states: list[torch.Tensor | None] | None = None
                 step_loss_chunk_sum = 0.0
-                for ci in range(n_chunks):
+                for ci in range(last_real + 1):
                     s = ci * micro_batch_size
                     e = s + micro_batch_size
                     chunk_ids = input_ids[:, s:e]
@@ -820,6 +866,7 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         _slice_cu_seqlens(cu_seqlens, s, e)
                         if cu_seqlens is not None else None
                     )
+                    n_valid_ci = chunk_valid[ci]
 
                     with torch.amp.autocast(
                         device_type="cuda",
@@ -831,20 +878,15 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                             cu_seqlens=chunk_cu,
                             kda_states=kda_states,
                         )
-                        # Divide by n_chunks so the sum of per-chunk
-                        # losses equals the full-sequence mean cross-
-                        # entropy (each chunk covers 1/n_chunks of the
-                        # tokens). The /n_chunks rescales the gradient
-                        # consistently — the optimizer's CPU grad
-                        # accumulator adds per-chunk grads, and the
-                        # /n_chunks makes the effective LR-per-step
-                        # equal to LR/n_chunks (matching the legacy
-                        # grad-accumulation semantics).
-                        chunk_loss = outputs["loss"] / n_chunks
-                    # Accumulate the *detached* loss for logging.
-                    # ``step_loss_chunk_sum`` is a plain float; safe to
-                    # hold without retaining the graph.
-                    step_loss_chunk_sum += chunk_loss.item()
+                        # ``outputs["loss"]`` is the mean over this
+                        # chunk's ``n_valid_ci`` tokens, so
+                        # ``loss * n_valid_ci`` is the chunk's summed
+                        # CE and dividing by ``total_valid`` gives the
+                        # chunk's contribution to the step's global
+                        # token-weighted mean.
+                        chunk_loss = (
+                            outputs["loss"] * (n_valid_ci / total_valid)
+                        )
                     # Carry forward, then detach. Detach preserves the
                     # numerical state (chunk i+1 sees the same h-vector
                     # values) but breaks the autograd graph chain so
@@ -855,6 +897,17 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         for st in outputs["kda_states"]
                     ]
                     del outputs
+                    if n_valid_ci == 0:
+                        # All-pad interior chunk: the forward already
+                        # carried the KDA state; there is no loss to
+                        # backward.
+                        if getattr(args, "empty_cache_between_mb", True):
+                            torch.cuda.empty_cache()
+                        continue
+                    # Accumulate the *detached* loss for logging.
+                    # ``step_loss_chunk_sum`` is a plain float; safe to
+                    # hold without retaining the graph.
+                    step_loss_chunk_sum += chunk_loss.item()
                     # Per-chunk immediate backward. Per-param
                     # accumulate-grad hooks fire as the autograd graph
                     # walks; flush_pending_grads syncs the D2H
