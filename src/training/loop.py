@@ -129,6 +129,65 @@ def wsd_lr(
     return peak_lr
 
 
+def _slice_cu_seqlens(
+    global_cu_seqlens: torch.Tensor,
+    chunk_start: int,
+    chunk_end: int,
+) -> torch.Tensor:
+    """Slice a global ``cu_seqlens`` tensor to a chunk-local one.
+
+    The chunked-training invariant: each chunk covers tokens at
+    global offsets ``[chunk_start, chunk_end)`` within the
+    super-long packed sequence. Doc boundaries (encoded in
+    ``global_cu_seqlens`` as cumulative end-offsets) that fall
+    inside this range become boundaries in the chunk-local
+    ``cu_seqlens``; boundaries outside are dropped.
+
+    The returned tensor:
+
+      - starts at ``0`` (chunk-local origin),
+      - lists each global doc-end that lies in
+        ``(chunk_start, chunk_end]`` shifted by ``-chunk_start``,
+      - ends at ``chunk_end - chunk_start`` (chunk-local right edge).
+
+    Edge cases:
+
+      - A global boundary exactly at ``chunk_start`` becomes the
+        chunk's local ``0`` (the chunk opens a new "doc" — same
+        convention as :func:`pack_chunk_aligned` where the
+        ``pack_end`` entry resets the KDA + ShortConv state).
+      - A global boundary exactly at ``chunk_end`` becomes the
+        chunk's local ``chunk_size`` (the chunk closes its last
+        doc at the chunk's right edge).
+      - Empty chunk (``chunk_start == chunk_end``) returns
+        ``[0]`` (a degenerate single-entry sequence).
+
+    This is what the model receives as ``cu_seqlens`` for the
+    ShortConvolution call (depthwise conv kernel resets at doc
+    boundaries). The KDA sub-layer itself does NOT receive
+    ``cu_seqlens`` — see ``TPKDA.forward``.
+    """
+    if chunk_start == chunk_end:
+        # Empty chunk: degenerate but well-defined.
+        return global_cu_seqlens.new_zeros(1)
+
+    in_range = (global_cu_seqlens >= chunk_start) & (
+        global_cu_seqlens <= chunk_end
+    )
+    local = global_cu_seqlens[in_range] - chunk_start
+    # Defensive: ensure 0 at the start and chunk_size at the end.
+    chunk_size = chunk_end - chunk_start
+    if local.numel() == 0 or local[0].item() != 0:
+        local = torch.cat([
+            local.new_zeros(1, dtype=local.dtype), local,
+        ])
+    if local[-1].item() != chunk_size:
+        local = torch.cat([
+            local, local.new_full((1,), chunk_size, dtype=local.dtype),
+        ])
+    return local
+
+
 def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     """Compute the L2 norm across all per-param accumulators in
     the given optimizers, all-reduce across the TP world, and
@@ -661,9 +720,33 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
     autocast_enabled = precision.autocast_enabled
     autocast_dtype = precision.autocast_dtype
 
+    # Chunked-training configuration. ``seq_len`` is now the TOTAL
+    # tokens per step (super-long FFD-packed sequence); the
+    # forward is split into ``n_chunks`` chunks of
+    # ``micro_batch_size`` tokens each, with the KDA recurrent
+    # state carried between chunks (full BPTT through the
+    # carried state). ``n_chunks`` is derived as
+    # ``seq_len // micro_batch_size`` and replaces the legacy
+    # ``gradient_accumulation_steps`` knob — same number, but
+    # now it controls the number of chunks per step rather than
+    # the number of independent microbatches per step.
+    micro_batch_size = getattr(args, "micro_batch_size", 0) or 0
+    if micro_batch_size <= 0 or micro_batch_size > args.seq_len:
+        # Default / test-config fallback: one chunk per step
+        # (legacy single-chunk behavior). This makes quick.yml
+        # and other small configs Just Work without forcing every
+        # test to set ``micro_batch_size`` explicitly.
+        micro_batch_size = args.seq_len
+    n_chunks = args.seq_len // micro_batch_size
+    if n_chunks * micro_batch_size != args.seq_len:
+        raise ValueError(
+            f"seq_len ({args.seq_len}) must be a multiple of"
+            f" micro_batch_size ({micro_batch_size}); got"
+            f" seq_len / micro_batch_size = {args.seq_len / micro_batch_size}"
+        )
+
     global_step = 0
     accumulated_loss = 0.0
-    microbatch_in_cycle = 0
 
     try:
         for epoch in range(args.epochs):
@@ -687,134 +770,114 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         f"starting training"
                     )
 
+                # One batch == one super-long packed sequence.
+                # Shape: [batch_size=1, seq_len=T_total]. It holds
+                # the FFD-packed contents of one step (many docs
+                # back-to-back); we slice it into ``n_chunks``
+                # chunks of ``micro_batch_size`` tokens each for
+                # the per-chunk forward.
                 input_ids = batch["input_ids"].to(gpus[rank], non_blocking=True)
                 labels = batch["labels"].to(gpus[rank], non_blocking=True)
-                # ``cu_seqlens`` is produced on the owner rank by
-                # :class:`PrefetchBatcher` from the chunk-aware
-                # FFD packer and broadcast to every rank through
-                # the per-rank queues. Skip when the loader is the
-                # right-pad dummy path (no packing).
                 cu_seqlens = batch.get("cu_seqlens")
                 if cu_seqlens is not None:
                     cu_seqlens = cu_seqlens.to(gpus[rank], non_blocking=True)
-                # End of "data wait + H2D" phase. The time from
-                # ``_mb_t_loop_start`` to here is dominated by the
-                # queue wait when the prefetcher is slower than the
-                # consumer (data-path-bound) and by the small
-                # ``.to(non_blocking=True)`` H2D copy otherwise.
+                # End of "data wait + H2D" phase.
                 _mb_t_data_end = time.perf_counter()
 
-                # Autocast is driven by ``precision.activations``:
-                # fp16 / bf16 enable autocast with that dtype; fp32
-                # disables it (a no-op ``enabled=False`` context is
-                # still entered so the surrounding code is uniform).
-                with torch.amp.autocast(
-                    device_type="cuda",
-                    dtype=autocast_dtype,
-                    enabled=autocast_enabled,
-                ):
-                    outputs = model(input_ids, labels=labels, cu_seqlens=cu_seqlens)
-                    loss = outputs["loss"]
+                # Per-chunk forward, KDA state flows between chunks
+                # (carried as a list of per-layer final-state tensors
+                # from the previous chunk's forward). For chunk 0
+                # the state is ``None`` — each layer starts from
+                # zeros. We accumulate all chunk losses and call
+                # backward ONCE at the end of the step so the
+                # autograd graph connects across chunks via the
+                # carried state (full BPTT — gradient of later
+                # chunks flows back to earlier chunks' params).
+                kda_states: list[torch.Tensor | None] | None = None
+                chunk_losses: list[torch.Tensor] = []
+                for ci in range(n_chunks):
+                    s = ci * micro_batch_size
+                    e = s + micro_batch_size
+                    chunk_ids = input_ids[:, s:e]
+                    chunk_labels = labels[:, s:e]
+                    chunk_cu = (
+                        _slice_cu_seqlens(cu_seqlens, s, e)
+                        if cu_seqlens is not None else None
+                    )
+
+                    with torch.amp.autocast(
+                        device_type="cuda",
+                        dtype=autocast_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        outputs = model(
+                            chunk_ids, labels=chunk_labels,
+                            cu_seqlens=chunk_cu,
+                            kda_states=kda_states,
+                        )
+                        chunk_loss = outputs["loss"]
+                    chunk_losses.append(chunk_loss)
+                    # Carry forward: the new per-layer KDA states
+                    # become the next chunk's initial states. The
+                    # state tensors are part of the autograd graph
+                    # (they depend on the chunk's input + the prior
+                    # state), so we must NOT detach — the chain rule
+                    # must flow back through them during backward.
+                    kda_states = outputs["kda_states"]
+                    del outputs
+
+                # Total loss = mean of chunk losses (equivalent to
+                # the per-step mean cross-entropy because each
+                # chunk has the same number of tokens).
+                loss = torch.stack(chunk_losses).mean()
                 torch.cuda.synchronize(gpus[rank])
                 _mb_t_fwd_end = time.perf_counter()
-                mb_loss = loss.detach().float().item()
+                # Per-step loss for logging (detach to avoid
+                # retaining the graph after this line).
+                step_loss = loss.detach().float().item()
+                accumulated_loss += step_loss
                 if rank == 0 and (
-                    global_step < _DIAG_STEPS or not math.isfinite(mb_loss)
+                    global_step < _DIAG_STEPS or not math.isfinite(step_loss)
                 ):
                     logger.info(
-                        f"  [diag] mb={batch_idx} loss={mb_loss:.6e}"
+                        f"  [diag] step={global_step} loss={step_loss:.6e}"
                     )
-                (loss / args.gradient_accumulation_steps).backward()
+
+                # Single backward at end of step: chain rule flows
+                # through the carried KDA states from chunk
+                # n_chunks-1 back to chunk 0 (full BPTT).
+                loss.backward()
                 torch.cuda.synchronize(gpus[rank])
                 _mb_t_bwd_end = time.perf_counter()
-                accumulated_loss += mb_loss
 
-                # Per-microbatch flush. The per-param post-accumulate-grad
-                # hooks (see :func:`register_grad_offload_hooks`) issue
-                # D2H transfers; we sync the current device's stream and
-                # fold the CPU src tensors into the per-param accumulator
-                # (``s.m`` for AdamW, ``s.mom_buf`` for Muon — the
-                # merged accumulator) so the pending list does NOT grow
-                # across microbatches.
-                #
-                # Why not defer the sync to the end of the cycle?
-                # The DMAs each carry a pinned CPU source buffer. With
-                # ``gradient_accumulation_steps=64`` and ~1 GB of grads
-                # per microbatch, deferring would pin ~64 GB of CPU
-                # memory before any flush — well over the system
-                # pinned-memory budget. The per-microbatch sync waits
-                # for the current stream's DMAs to complete (~100-200 µs
-                # on a 5060Ti; negligible vs the 100+ ms forward/backward
-                # of the next microbatch, which itself is the real
-                # bottleneck). The end-of-cycle flush below is now a
-                # no-op (the queue is already empty) but is kept as
-                # belt-and-suspenders for correctness.
+                # Per-step flush. The per-param post-accumulate-grad
+                # hooks (see :func:`register_grad_offload_hooks`)
+                # issued D2H transfers during ``backward()``; we
+                # sync the current device's stream and fold the CPU
+                # src tensors into the per-param accumulator. Same
+                # semantics as the per-microbatch flush in the
+                # legacy path; just consolidated to once-per-step
+                # because we now do a single backward.
                 flush_pending_grads(sync_device=gpus[rank])
-                # Manual flush for the tied-embed params (see
-                # :data:`src.training.param_offload._manual_flush_param_ids`):
-                # their grad arrives via a custom autograd Function
-                # that fires after the natural-path accumulate_grad_,
-                # so we read ``p.grad`` once at the end of each
-                # microbatch (post the full ``backward()``) to get
-                # the *complete* grad. No-op for any model without
-                # tied / custom-autograd params.
                 flush_manual_flush_params([muon_opt, adamw_opt])
 
-                # Release the caching-allocator slack pool back to the
-                # driver. The PyTorch caching allocator does not shrink
-                # the pool between microbatches (avoids cudaFree/
-                # cudaMalloc thrash), but on the 16 GB 5060 Ti this
-                # leaves ~4 GB of pool locked at the high-water mark.
-                # Production measurements: empty_cache here drops
-                # reserved from 8.05 GB to 4.09 GB (+4.16 GB free
-                # driver memory) at a cost of ~24 ms/mb (+0.7%
-                # wall-clock). The next fwd re-allocates from the
-                # shrunken pool; the realloc cost is hidden by the
-                # matmul/concat work in the fwd itself.
                 if getattr(args, "empty_cache_between_mb", True):
                     torch.cuda.empty_cache()
 
                 _mb_t_sync_end = time.perf_counter()
 
-                # Per-microbatch timing log, opt-in via
-                # ``--mb_timing N``. Logs the first N microbatches of
-                # every step (not just the first step) so you can see
-                # whether the breakdown changes mid-training. Read
-                # the column with the largest value to localize the
-                # slow phase:
-                #   data_ms  = queue wait + .to()  (data path slow?)
-                #   fwd_ms   = forward  (model/KDA slow?)
-                #   bwd_ms   = backward (model/KDA slow?)
-                #   sync_ms  = D2H wait + CPU add (DMA/CPU add slow?)
-                #
-                # Must run BEFORE the ``del input_ids/labels`` below
-                # — those ``del``s remove the local binding, and the
-                # log line reads ``input_ids.shape`` / ``cu_seqlens``.
+                # Per-step timing log (chunked path: one row per
+                # step, not per chunk). The breakdown is the same
+                # data_ms / fwd_ms / bwd_ms / sync_ms columns.
                 mb_timing = getattr(args, "mb_timing", 0)
-                if (
-                    rank == 0
-                    and mb_timing > 0
-                    and microbatch_in_cycle <= mb_timing
-                ):
-                    # FFD packing telemetry: ``n_packs`` is always
-                    # ``batch_size`` by contract (see
-                    # :func:`pack_chunk_aligned`); ``real_docs`` is
-                    # the number of actual docs that landed in the
-                    # packs (``cu_seqlens.numel() - batch_size``, the
-                    # ``batch_size`` term being the per-pack
-                    # boundaries). When ``real_docs == batch_size``
-                    # every pack is exactly one doc (over-split);
-                    # when ``real_docs`` is much smaller than the
-                    # capacity the FFD candidate pool was too small
-                    # — raise ``pack_buffer_size``.
+                if rank == 0 and mb_timing > 0 and batch_idx < mb_timing:
                     n_real_docs = (
                         cu_seqlens.numel() - args.batch_size
-                        if cu_seqlens is not None
-                        else -1
+                        if cu_seqlens is not None else -1
                     )
                     logger.info(
                         f"  [mb-time] step={global_step}"
-                        f" mb={microbatch_in_cycle}/{args.gradient_accumulation_steps}"
+                        f" n_chunks={n_chunks}/{n_chunks}"
                         f" data_ms={(_mb_t_data_end - _mb_t_loop_start) * 1000:6.1f}"
                         f" fwd_ms={(_mb_t_fwd_end - _mb_t_data_end) * 1000:6.1f}"
                         f" bwd_ms={(_mb_t_bwd_end - _mb_t_fwd_end) * 1000:6.1f}"
@@ -824,179 +887,147 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                         f" real_docs={n_real_docs}"
                     )
 
-                del loss, outputs, input_ids, labels
-                microbatch_in_cycle += 1
+                del loss, chunk_losses, input_ids, labels
+                # Free the chunk-local cu_seqlens tensors and the
+                # final KDA state list; they go out of scope when
+                # we move past the next loop iteration, but
+                # releasing the references here makes the
+                # allocator's job easier on the next step.
+                del kda_states
 
-                if microbatch_in_cycle >= args.gradient_accumulation_steps:
-                    # End-of-cycle sync. Already a no-op given the
-                    # per-microbatch flush above, but kept so the
-                    # accumulator reads below (inf/nan check, grad-norm,
-                    # optimizer step) see a fully synced queue even
-                    # if the per-microbatch flush is later changed
-                    # (e.g. amortized over K microbatches).
-                    flush_pending_grads(sync_device=gpus[rank])
-                    # Inf/nan check on the accumulated CPU grads.
-                    # The merged accumulator is s.m for AdamW and
-                    # s.mom_buf for Muon.
-                    found_inf = False
-                    nan_opt_name = None
-                    nan_s_id = None
-                    n_nan_accum_total = 0
-                    for opt_name, opt in (("muon", muon_opt), ("adamw", adamw_opt)):
-                        for sid, s in opt.state.items():
-                            # Quantized muon (int8/mxfp8) has a
-                            # separate bf16 ``accum`` buffer; fp*
-                            # muon and AdamW use ``mom_buf`` /
-                            # ``m`` as the merged accumulator.
-                            accum = (
-                                s.m if s.kind == "adamw"
-                                else (s.accum if s.accum is not None else s.mom_buf)
-                            )
-                            # Cast to BF16 before ``isfinite`` — FP8
-                            # storage (mxfp8 muon: E4M3 / E8M0) has no
-                            # direct ``isfinite`` implementation in
-                            # PyTorch 2.9.1 and raises
-                            # ``NotImplementedError``. The bf16
-                            # round-trip is lossless for the
-                            # non-NaN/Inf values we're trying to
-                            # detect; NaN in FP8 is a deliberate
-                            # 0x7F / 0xFF byte pattern that decodes
-                            # to NaN in BF16 too. (With the new
-                            # separate-accumulator design, ``accum``
-                            # for quantized muon is already BF16, so
-                            # the cast is a no-op there.)
-                            n_nan = (~torch.isfinite(accum.to(torch.bfloat16))).sum().item()
-                            n_nan_accum_total += n_nan
-                            if n_nan > 0 and not found_inf:
-                                found_inf = True
-                                nan_opt_name = opt_name
-                                nan_s_id = sid
-                        if found_inf:
+                # Per-step end-of-step: optimizer step + diagnostics
+                # + checkpoint. The old "if microbatch_in_cycle >=
+                # gradient_accumulation_steps" gate collapses to
+                # "every step is a step" — the chunked forward IS
+                # the gradient accumulation (n_chunks = gas).
+                flush_pending_grads(sync_device=gpus[rank])
+                # Inf/nan check on the accumulated CPU grads.
+                found_inf = False
+                n_nan_accum_total = 0
+                for opt_name, opt in (("muon", muon_opt), ("adamw", adamw_opt)):
+                    for sid, s in opt.state.items():
+                        accum = (
+                            s.m if s.kind == "adamw"
+                            else (s.accum if s.accum is not None else s.mom_buf)
+                        )
+                        # Cast to BF16 before ``isfinite`` — FP8
+                        # storage (mxfp8 muon) has no direct
+                        # ``isfinite`` in PyTorch 2.9.1. The bf16
+                        # round-trip is lossless for the non-NaN/Inf
+                        # values we're trying to detect.
+                        n_nan = (~torch.isfinite(accum.to(torch.bfloat16))).sum().item()
+                        n_nan_accum_total += n_nan
+                        if n_nan > 0:
+                            found_inf = True
                             break
-                    if rank == 0 and global_step < 5:
-                        print(f"  [CHECK-DEBUG] step={global_step} n_nan_accum_total={n_nan_accum_total} found_inf={found_inf}")
-                    if not found_inf:
-                        total_norm = _compute_and_clip_grad_norm(
-                            [muon_opt, adamw_opt], args.max_grad_norm,
+                    if found_inf:
+                        break
+                if rank == 0 and global_step < 5:
+                    print(f"  [CHECK-DEBUG] step={global_step} n_nan_accum_total={n_nan_accum_total} found_inf={found_inf}")
+                if not found_inf:
+                    total_norm = _compute_and_clip_grad_norm(
+                        [muon_opt, adamw_opt], args.max_grad_norm,
+                    )
+                    if global_step < _DIAG_STEPS and rank == 0:
+                        log_pre_step_diag(
+                            logger,
+                            step=global_step,
+                            total_norm=total_norm,
+                            muon_state=muon_opt.state,
+                            adamw_state=adamw_opt.state,
                         )
+                    cur_muon_lr = wsd_lr(
+                        global_step, peak_muon_lr,
+                        warmup_steps, decay_steps,
+                        args.max_steps,
+                    )
+                    cur_adamw_lr = wsd_lr(
+                        global_step, peak_adamw_lr,
+                        warmup_steps, decay_steps,
+                        args.max_steps,
+                    )
+                    muon_opt.lr = cur_muon_lr
+                    adamw_opt.lr = cur_adamw_lr
+                    muon_opt.step()
+                    if global_step < _DIAG_STEPS and rank == 0:
+                        log_post_opt_diag(
+                            logger,
+                            step=global_step,
+                            opt_label="muon",
+                            state=muon_opt.state,
+                        )
+                    adamw_opt.step()
+                    if global_step < _DIAG_STEPS and rank == 0:
+                        log_post_opt_diag(
+                            logger,
+                            step=global_step,
+                            opt_label="adamw",
+                            state=adamw_opt.state,
+                        )
+                    zero_cpu_grad_accum([muon_opt, adamw_opt])
+                    if getattr(args, "ffn_nvfp4", False):
+                        from src.models.ops.nvfp4_linear import repack_nvfp4_weights
+                        n_repacked = repack_nvfp4_weights(model)
                         if global_step < _DIAG_STEPS and rank == 0:
-                            log_pre_step_diag(
-                                logger,
-                                step=global_step,
-                                total_norm=total_norm,
-                                muon_state=muon_opt.state,
-                                adamw_state=adamw_opt.state,
-                            )
-                        # Apply the WSD schedule: scale both peak LRs by
-                        # the same multiplier so Muon and AdamW track
-                        # each other through warmup / stable / decay.
-                        # ``wsd_lr`` reads the supplied peak; we then
-                        # push it onto ``opt.lr`` because both
-                        # ``CPUAdamW.step`` and ``CPUMuon.step`` read
-                        # ``self.lr`` at the top of each call.
-                        cur_muon_lr = wsd_lr(
-                            global_step, peak_muon_lr,
-                            warmup_steps, decay_steps,
-                            args.max_steps,
-                        )
-                        cur_adamw_lr = wsd_lr(
-                            global_step, peak_adamw_lr,
-                            warmup_steps, decay_steps,
-                            args.max_steps,
-                        )
-                        muon_opt.lr = cur_muon_lr
-                        adamw_opt.lr = cur_adamw_lr
-                        muon_opt.step()
-                        if global_step < _DIAG_STEPS and rank == 0:
-                            log_post_opt_diag(
-                                logger,
-                                step=global_step,
-                                opt_label="muon",
-                                state=muon_opt.state,
-                            )
-                        adamw_opt.step()
-                        if global_step < _DIAG_STEPS and rank == 0:
-                            log_post_opt_diag(
-                                logger,
-                                step=global_step,
-                                opt_label="adamw",
-                                state=adamw_opt.state,
-                            )
-                        zero_cpu_grad_accum([muon_opt, adamw_opt])
-                        # W4A16 NVFP4 hook: re-quantize the BF16
-                        # master weights (now updated by the optimizer)
-                        # into the NVFP4 packed buffers, so the next
-                        # forward's dequantize-on-fwd sees the latest
-                        # values. No-op when NVFP4 is disabled (the
-                        # walker finds 0 NVFP4 modules and returns 0).
-                        if getattr(args, "ffn_nvfp4", False):
-                            from src.models.ops.nvfp4_linear import repack_nvfp4_weights
-                            n_repacked = repack_nvfp4_weights(model)
-                            if global_step < _DIAG_STEPS and rank == 0:
-                                logger.info(
-                                    "[nvfp4] step=%d repacked %d NVFP4 weight(s)",
-                                    global_step, n_repacked,
-                                )
-                    else:
-                        total_norm = float("nan")
-                    scaler.update()
-                    torch.cuda.synchronize(gpus[rank])
-
-                    global_step += 1
-                    avg_loss = accumulated_loss / args.gradient_accumulation_steps
-                    accumulated_loss = 0.0
-                    microbatch_in_cycle = 0
-
-                    if rank == 0 and global_step % args.log_interval == 0:
-                        grad_norm_str = (
-                            f"{total_norm:.2f}" if total_norm == total_norm
-                            else "nan"
-                        )
-                        # Show the LRs that just ran so users can see
-                        # the WSD curve in the log (Muon + AdamW).
-                        lr_str = (
-                            f"lr_muon={muon_opt.lr:.2e}"
-                            f" lr_adamw={adamw_opt.lr:.2e}"
-                        )
-                        logger.info(
-                            f"Step {global_step}/{args.max_steps} | "
-                            f"Loss: {avg_loss:.4f} | "
-                            f"grad_norm: {grad_norm_str} | "
-                            f"{lr_str}"
-                        )
-                        for d in gpus:
-                            free, total = torch.cuda.mem_get_info(d)
-                            used = total - free
                             logger.info(
-                                f"  device {d} VRAM: {used / 1024**3:.2f} /"
-                                f" {total / 1024**3:.2f} GB"
+                                "[nvfp4] step=%d repacked %d NVFP4 weight(s)",
+                                global_step, n_repacked,
                             )
+                else:
+                    total_norm = float("nan")
+                scaler.update()
+                torch.cuda.synchronize(gpus[rank])
 
-                    # Periodic checkpoint. Rank 0 only; the other
-                    # ranks' sharded state is not gathered here.
-                    # Best-effort: log and continue on failure.
-                    if (
-                        rank == 0
-                        and args.checkpoint_interval > 0
-                        and global_step % args.checkpoint_interval == 0
-                    ):
-                        try:
-                            ckpt_path = save_checkpoint(
-                                model,
-                                optimizers={"muon": muon_opt, "adamw": adamw_opt},
-                                scaler=scaler,
-                                step=global_step,
-                                loss=avg_loss,
-                                checkpoint_dir=run_dir / "checkpoints",
-                                keep_last_n=args.checkpoint_keep_last_n,
-                            )
-                            logger.info(f"  checkpoint saved: {ckpt_path}")
-                        except Exception as ckpt_err:
-                            logger.warning(
-                                f"  checkpoint save failed at step"
-                                f" {global_step}: {ckpt_err!r};"
-                                f" continuing training"
-                            )
+                global_step += 1
+                avg_loss = accumulated_loss  # one loss value per step now
+                accumulated_loss = 0.0
+
+                if rank == 0 and global_step % args.log_interval == 0:
+                    grad_norm_str = (
+                        f"{total_norm:.2f}" if total_norm == total_norm
+                        else "nan"
+                    )
+                    lr_str = (
+                        f"lr_muon={muon_opt.lr:.2e}"
+                        f" lr_adamw={adamw_opt.lr:.2e}"
+                    )
+                    logger.info(
+                        f"Step {global_step}/{args.max_steps} | "
+                        f"Loss: {avg_loss:.4f} | "
+                        f"grad_norm: {grad_norm_str} | "
+                        f"{lr_str}"
+                    )
+                    for d in gpus:
+                        free, total = torch.cuda.mem_get_info(d)
+                        used = total - free
+                        logger.info(
+                            f"  device {d} VRAM: {used / 1024**3:.2f} /"
+                            f" {total / 1024**3:.2f} GB"
+                        )
+
+                # Periodic checkpoint.
+                if (
+                    rank == 0
+                    and args.checkpoint_interval > 0
+                    and global_step % args.checkpoint_interval == 0
+                ):
+                    try:
+                        ckpt_path = save_checkpoint(
+                            model,
+                            optimizers={"muon": muon_opt, "adamw": adamw_opt},
+                            scaler=scaler,
+                            step=global_step,
+                            loss=avg_loss,
+                            checkpoint_dir=run_dir / "checkpoints",
+                            keep_last_n=args.checkpoint_keep_last_n,
+                        )
+                        logger.info(f"  checkpoint saved: {ckpt_path}")
+                    except Exception as ckpt_err:
+                        logger.warning(
+                            f"  checkpoint save failed at step"
+                            f" {global_step}: {ckpt_err!r};"
+                            f" continuing training"
+                        )
 
             if global_step >= args.max_steps:
                 break

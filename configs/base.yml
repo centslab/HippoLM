@@ -36,11 +36,26 @@ rms_norm_eps: 0.000001
 epochs: 1
 max_steps: 1000
 batch_size: 1
-seq_len: 16384
+# Total tokens per step (one super-long FFD-packed sequence).
+# 262144 = 16 × 16384 = same total tokens/step as the legacy
+# ``seq_len=16384, gradient_accumulation_steps=16`` config.
+seq_len: 262144
+# Chunk size: the super-long sequence is split into
+# ``seq_len // micro_batch_size = 16`` chunks of this many
+# tokens each, with the KDA recurrent state carried between
+# chunks (full BPTT). Default 16384 matches the legacy per-
+# microbatch length so backward-compat configs continue to
+# train one chunk per "old" microbatch.
+micro_batch_size: 16384
 learning_rate: 0.01
 weight_decay: 0.01
 lr_warmup_steps: 0
 lr_decay_steps: 100
+# Derived: n_chunks = seq_len / micro_batch_size = 16. Kept as
+# a config knob for documentation; the training loop ignores
+# this value and computes ``n_chunks`` from seq_len and
+# micro_batch_size directly. Set to any value — the new loop
+# only reads seq_len and micro_batch_size.
 gradient_accumulation_steps: 16
 # Chunk-aware FFD packing (see src/training/data/collate.py).
 # ``pack_chunk_size``: alignment granularity for doc boundaries inside

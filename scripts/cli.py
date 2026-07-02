@@ -81,6 +81,24 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- Training ----
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--seq_len", type=int, default=512)
+    # ---- Chunked-training: tokens per micro-batch (chunk) ----
+    # ``seq_len`` is now the TOTAL tokens per step (one super-long
+    # FFD-packed sequence). The forward is split into
+    # ``seq_len // micro_batch_size`` chunks of this many tokens
+    # each, with the KDA recurrent state carried between chunks.
+    # Default = previous seq_len default (16384) — same total
+    # tokens per step as before when combined with
+    # gradient_accumulation_steps=16 → seq_len=262144.
+    p.add_argument(
+        "--micro_batch_size", type=int, default=16384,
+        help="Tokens per micro-batch chunk. The super-long sequence"
+             " produced per step (length ``seq_len``) is split into"
+             " ``seq_len // micro_batch_size`` chunks, and the"
+             " KDA recurrent state is carried between chunks (full"
+             " BPTT through the carried state). Default 16384."
+             " Set to ``seq_len`` to disable chunking (legacy"
+             " single-chunk behavior).",
+    )
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=1)

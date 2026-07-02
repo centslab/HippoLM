@@ -208,30 +208,42 @@ class TPKDA(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        initial_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass. ``x`` is the full hidden (replicated
-        across the TP group). Returns full hidden (after the
-        ``o_proj`` all-reduce).
+        across the TP group). Returns ``(output, final_state)``
+        where ``output`` is the residual stream contribution
+        (after the ``o_proj`` all-reduce) and ``final_state``
+        is the KDA recurrent state at the last token (shape
+        ``[1, hpp, head_k_dim, head_v_dim]`` in float32).
 
-        When ``cu_seqlens`` is supplied the batch dim is folded
-        into the sequence dim so the KDA chunkwise kernel sees
-        ``batch_size=1`` (its hard requirement when varlen state
-        reset is in use). All projections run on the flattened
-        ``[1, B*T, hidden]`` tensor and the output is reshaped
-        back to ``[B, T, hidden]`` before ``o_proj``.
+        ``cu_seqlens`` (when set) is forwarded only to
+        ``ShortConvolution`` so the depthwise conv kernel's
+        causal state resets at each doc boundary. The KDA
+        recurrence itself sees the whole chunk as one stream
+        (no per-doc reset) — this is the chunked-training
+        invariant: state flows across chunks within a step.
+
+        ``initial_state`` is the KDA recurrent state at the
+        start of this chunk. ``None`` means "start from zeros"
+        (the legacy / first-chunk-of-step behavior). For
+        subsequent chunks in a step, pass the ``final_state``
+        returned by the previous chunk's forward. State dtype
+        must be float32 (the FLA kernel's contract).
         """
         from einops import rearrange
 
         # Packed path: fold batch dim into seq dim. The QKV /
         # FG / gate projections are just matmuls and don't care
-        # about the leading-dim interpretation; only the chunkwise
-        # recurrence cares, and it requires ``B=1`` when
-        # ``cu_seqlens`` is set.
+        # about the leading-dim interpretation; only the
+        # chunkwise KDA recurrence cares, and we now always
+        # feed it the ``[B, T, ...]`` shape (no cu_seqlens on
+        # the KDA call, so it processes the whole chunk as one
+        # stream). ``cu_seqlens`` is still threaded into the
+        # ShortConvolution call to keep the depthwise conv's
+        # causal state from blurring across unrelated docs.
         B, T, hidden = x.shape
-        if cu_seqlens is not None:
-            x_in = x.reshape(1, B * T, hidden)
-        else:
-            x_in = x
+        x_in = x  # KDA sees [B, T, hidden] without cu_seqlens-driven flatten
 
         # Fused QKV: one matmul produces [B, T, 2*key+v] which
         # we split into Q / K / V per rank. Saves 2 kernel
@@ -287,29 +299,39 @@ class TPKDA(nn.Module):
             beta = beta * 2.0
 
         # chunk_kda: rank-local. No TP comm inside the kernel.
-        o, _ = self._chunk_kda(
+        # The chunked-training invariant: NO ``cu_seqlens`` here,
+        # so the KDA recurrence sees the whole chunk as one stream
+        # and the recurrent state can be carried across chunks
+        # via ``initial_state`` / ``output_final_state=True``. Doc
+        # boundaries inside the chunk are NOT resets — that signal
+        # is only used by ShortConvolution above (depthwise conv
+        # state) and the label-mask in the loss head.
+        o, final_state = self._chunk_kda(
             q=q, k=k, v=v, g=g, beta=beta,
             A_log=self.A_log, dt_bias=self.dt_bias,
-            initial_state=None, output_final_state=False,
+            initial_state=initial_state,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             safe_gate=self.safe_gate,
             lower_bound=self.lower_bound,
-            cu_seqlens=cu_seqlens,
             skip_aqk_akk_saved=self.skip_aqk_akk_saved,
         )
 
-        # o has shape ``x_in.shape[:-1] + (hpp, head_v_dim)``.
-        # Reshape back to ``[B, T, hpp, head_v_dim]`` when the
-        # packed path flattened the leading dims.
-        if cu_seqlens is not None:
-            o = o.reshape(B, T, self.hpp, self.head_v_dim)
-            g_for_norm = g_for_norm.reshape(B, T, self.hpp, self.head_v_dim)
+        # o has shape ``[B, T, hpp, head_v_dim]`` (no flatten
+        # happened — KDA sees the natural ``[B, T, ...]`` shape
+        # because we no longer thread ``cu_seqlens`` to it).
+        # g_for_norm is already ``[B, T, hpp, head_v_dim]`` from
+        # the ``g_proj1`` rearrange above.
 
         # o_norm: per-head RMSNorm on the last dim.
-        g_for_norm = rearrange(g_for_norm, "... (h d) -> ... h d", d=self.head_v_dim)
         o = self.o_norm(o, g_for_norm)
         o = rearrange(o, "b t h d -> b t (h d)")
         # o_proj: row-parallel, all-reduces to [B, T, hidden_size].
         o = self.o_proj(o)
-        return o
+        # Return the residual contribution AND the final KDA
+        # recurrent state so the caller can carry it into the next
+        # chunk. ``final_state`` is shape
+        # ``[1, hpp, head_k_dim, head_v_dim]`` in float32
+        # (matches ``initial_state`` contract).
+        return o, final_state

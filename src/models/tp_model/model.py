@@ -306,7 +306,9 @@ class TPHippoModel(nn.Module):
         block_layers,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        layer_kda_states: list[torch.Tensor | None] | None = None,
+        return_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Run a contiguous group of ``len(block_layers)`` layers
         (one block) on the local device and return the block's
         output. Used as the body of
@@ -323,9 +325,26 @@ class TPHippoModel(nn.Module):
         layer (FFN / RMSNorm ignore it). When this body runs
         inside ``checkpoint.checkpoint`` the cu_seqlens tensor
         is saved with the recomputation inputs automatically.
+
+        ``layer_kda_states`` (length ``len(block_layers)``)
+        holds the KDA recurrent state to seed each layer; pass
+        ``None`` for "start from zeros" for every layer in the
+        block. When ``return_states=True`` the block returns
+        ``(output, collected_states)`` where ``collected_states``
+        is the per-layer final state list; otherwise just the
+        output (the legacy path).
         """
-        for layer in block_layers:
-            x = layer(x, cu_seqlens=cu_seqlens)
+        collected: list[torch.Tensor] = []
+        for i, layer in enumerate(block_layers):
+            init = (
+                layer_kda_states[i] if layer_kda_states is not None
+                else None
+            )
+            x, s = layer(x, cu_seqlens=cu_seqlens, initial_state=init)
+            if return_states:
+                collected.append(s)
+        if return_states:
+            return x, collected
         return x
 
     def forward(
@@ -333,23 +352,49 @@ class TPHippoModel(nn.Module):
         input_ids: torch.Tensor,  # [B, T], lives on this rank's device
         labels: torch.Tensor | None = None,  # [B, T], same device
         cu_seqlens: torch.Tensor | None = None,  # [total_docs+1]
+        kda_states: list[torch.Tensor | None] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run the full TP model forward.
 
-        ``cu_seqlens`` is the global offset tensor produced by
-        :func:`pack_chunk_aligned` — see that function's docstring
-        for the contract. When set the KDA sub-layer inside every
-        block resets the recurrent state at each ``cu_seqlens``
-        boundary; the rest of the model (FFN, RMSNorm, embed,
-        BlockAttnRes, lm_head) ignores it. The hidden state shape
-        is unchanged (``[B, T, hidden]`` on every rank) — only
-        the KDA sub-layer flattens / unflattens internally.
+        ``cu_seqlens`` is the chunk-local offset tensor produced
+        by :func:`src.training.loop._slice_cu_seqlens` (or the
+        full-sequence tensor for non-chunked callers). When set
+        it is forwarded only to ``ShortConvolution`` so the
+        depthwise conv resets its causal state at each doc
+        boundary. The KDA sub-layer does NOT receive cu_seqlens
+        — its recurrence sees the whole chunk as one stream, so
+        the carried ``initial_state`` (= the previous chunk's
+        ``final_state``) flows without per-doc resets.
+
+        ``kda_states`` (optional) is a list of length
+        ``num_layers`` carrying the KDA recurrent state at the
+        start of this chunk, one entry per layer. Each entry is
+        either ``None`` (use zeros — the legacy / first-chunk-
+        of-step behavior) or a ``[1, hpp, head_k_dim,
+        head_v_dim]`` float32 tensor. Pass ``None`` (or a list
+        of ``None``) for the first chunk of each step.
+
+        Returns ``{"loss" or "logits", "kda_states": [Tensor]×L}``.
+        ``out["kda_states"][li]`` is the KDA state at the last
+        token of this chunk for layer ``li``, ready to seed the
+        same layer's call in the next chunk. When ``labels`` is
+        ``None`` (inference), only ``out["kda_states"]`` and
+        ``out["logits"]`` are populated.
         """
         device = input_ids.device.index if input_ids.device.type == "cuda" else input_ids.device
         embeds = self.replicated_per_device[str(device)]["embed_tokens"](input_ids)
         attn_res = self.replicated_per_device[str(device)]["attn_res"]
         blocks: list[torch.Tensor] = [embeds]  # b_0 = embedding
         x = embeds  # Block 0's input is the embedding.
+
+        # Per-layer KDA final-state collection for the chunked
+        # training invariant: each layer's ``final_state`` is
+        # captured at the end of the forward so the caller can
+        # pass it as the next chunk's ``initial_state``.
+        final_kda_states: list[torch.Tensor] = []
+        # Track which absolute layer indices we're collecting for
+        # (the per-sub-block loop below returns local indices).
+        layer_offset = 0
 
         # Block-level checkpointing + KDA cache in the last block
         # --------------------------------------------------------
@@ -410,10 +455,23 @@ class TPHippoModel(nn.Module):
             for sub_start in range(start, end, sub_block_size):
                 sub_end = min(sub_start + sub_block_size, end)
                 sub_layers = layers[sub_start:sub_end]
-                x = torch.utils.checkpoint.checkpoint(
+                # Slice the per-layer kda_states for this sub-block.
+                # ``None`` means "all zeros" — the sub-block helper
+                # handles ``None`` uniformly by passing ``None`` to
+                # every layer.
+                if kda_states is None:
+                    sub_states = None
+                else:
+                    sub_states = kda_states[sub_start:sub_end]
+                x, sub_final = torch.utils.checkpoint.checkpoint(
                     self._block_forward, sub_layers, x, cu_seqlens,
+                    sub_states, True,  # return_states=True
                     use_reentrant=True, preserve_rng_state=False,
                 )
+                # ``sub_final`` is local to this sub-block (length
+                # ``len(sub_layers)``). Remap to absolute layer indices.
+                final_kda_states.extend(sub_final)
+                layer_offset += len(sub_layers)
             blocks.append(x)
         # Last block: per-layer checkpointing for every layer
         # except the very last one. The first n-1 blocks are
@@ -438,18 +496,32 @@ class TPHippoModel(nn.Module):
             x = attn_res(blocks)
         last_start = last_block * block_size
         last_block_layers = layers[last_start:]
-        for layer in last_block_layers[:-1]:
-            x = torch.utils.checkpoint.checkpoint(
-                layer, x, cu_seqlens,
+        for li, layer in enumerate(last_block_layers[:-1]):
+            init = (
+                kda_states[last_start + li] if kda_states is not None
+                else None
+            )
+            x, final_state = torch.utils.checkpoint.checkpoint(
+                layer, x, cu_seqlens, init,
                 use_reentrant=True, preserve_rng_state=False,
             )
+            final_kda_states.append(final_state)
+            layer_offset += 1
         # Final layer of the last block: NO checkpoint wrapper.
         # Its KDA internals (q, k, v, beta, g, Aqk, Akk, w_wy,
         # u_wy, qg, kg, v_new, h) are held for backward.
-        x = last_block_layers[-1](x, cu_seqlens=cu_seqlens)
+        final_init = (
+            kda_states[last_start + len(last_block_layers) - 1]
+            if kda_states is not None else None
+        )
+        x, final_state = last_block_layers[-1](
+            x, cu_seqlens=cu_seqlens, initial_state=final_init,
+        )
+        final_kda_states.append(final_state)
+        layer_offset += 1
 
         hidden_states = self.replicated_per_device[str(device)]["norm"](x)
-        out: dict[str, torch.Tensor] = {}
+        out: dict[str, torch.Tensor] = {"kda_states": final_kda_states}
         if labels is not None:
             # Fused lm_head + CE. The kernel:
             #   1. Slices hidden to drop the last time position

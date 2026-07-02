@@ -51,21 +51,34 @@ class TPHippoLayer(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        initial_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Standard residual transformer layer on the local device.
 
         Args:
             x: ``[B, T, hidden_size]`` replicated hidden state.
-            cu_seqlens: optional ``[total_docs + 1]`` long tensor
-                with global offsets across the flattened
-                ``batch_size * seq_len`` sequence. Forwarded
-                to the KDA sub-layer only; FFN / RMSNorm do not
-                depend on the doc layout.
+            cu_seqlens: optional ``[chunk_local_total_docs + 1]``
+                long tensor with offsets across the chunk's
+                flattened sequence. Forwarded to the KDA
+                sub-layer's ShortConvolution only (so the
+                depthwise conv resets at doc boundaries).
+            initial_state: optional ``[1, hpp, head_k_dim,
+                head_v_dim]`` float32 — the KDA recurrent state
+                at the start of this chunk. ``None`` (or a list
+                entry of ``None`` at the model level) means
+                "start from zeros".
 
         Returns:
+            ``(output, final_state)``: ``output`` is
             ``[B, T, hidden_size]`` after KDA and FFN with
-            standard residual connections.
+            standard residual connections; ``final_state`` is
+            the KDA state at the last token, to be passed as
+            ``initial_state`` to the next chunk's layer call.
         """
-        x = x + self.kda(self.attn_norm(x), cu_seqlens=cu_seqlens)
+        kda_out, final_state = self.kda(
+            self.attn_norm(x), cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+        )
+        x = x + kda_out
         x = x + self.ffn(self.mlp_norm(x))
-        return x
+        return x, final_state
