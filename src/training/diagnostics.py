@@ -81,21 +81,42 @@ def log_pre_step_diag(
 ) -> None:
     """Emit the pre-optimizer-step diagnostic.
 
-    For each optimizer we report the max abs of the merged
-    accumulator/state tensor (``mom_buf`` for Muon, ``m`` for
-    AdamW — in the merged-accumulator design these are the
-    same tensor), the max abs of the remaining optimizer-internal
-    state (only ``v`` for AdamW; Muon has no separate internal
-    state once ``mom_buf`` doubles as the accumulator), and the
-    max abs of the param. Combined with ``total_norm`` this is
-    enough to localize the source of an explosion to a specific
-    optimizer (muon vs adamw) and stage (grad vs state vs
-    param).
+    For each optimizer we report the max abs of the cycle's
+    grad accumulator (``m`` for AdamW; ``accum`` when set for
+    quantized muon — int8/mxfp8 — and ``mom_buf`` for fp*
+    muon in the merged-accumulator design), the max abs of the
+    remaining optimizer-internal state (only ``exp_avg_sq`` for
+    AdamW; Muon has no separate internal state at this point
+    — ``mom_buf`` / ``mom_scale`` are populated at step end,
+    not read here), and the max abs of the param. Combined
+    with ``total_norm`` this is enough to localize the source
+    of an explosion to a specific optimizer (muon vs adamw)
+    and stage (grad vs state vs param).
+
+    For quantized muon the diagnostic reads ``s.accum`` (the
+    bf16 cycle sum) rather than ``s.mom_buf`` (which is the
+    int8/mxfp8 representation that hasn't been populated yet
+    for this cycle — it was reset to zero at the end of the
+    previous cycle's step). Reading ``mom_buf`` here would
+    report the stale prior cycle's quantized momentum and
+    miss any current-cycle divergence.
     """
+    # Resolve which tensor to read for each muon param: the
+    # separate ``accum`` (quantized) when set, else ``mom_buf``
+    # (fp* muon merged design).
+    def muon_accum_max(state: Dict[int, OptimizerState]) -> float:
+        if not state:
+            return 0.0
+        vals = []
+        for s in state.values():
+            t = s.accum if s.accum is not None else s.mom_buf
+            vals.append(amax_cpu(t))
+        return max(vals)
+
     logger.info(
         f"  [diag-step {step} pre]"
         f" total_norm={total_norm:.3e}"
-        f" muon: mom_max={_max_over_states(muon_state, 'mom_buf'):.3e}"
+        f" muon: mom_max={muon_accum_max(muon_state):.3e}"
         f" pmax={_max_over_states(muon_state, 'param'):.3e}"
         f" | adamw: m_max={_max_over_states(adamw_state, 'm'):.3e}"
         f" v_max={_max_over_states(adamw_state, 'exp_avg_sq'):.3e}"

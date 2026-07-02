@@ -102,3 +102,121 @@ debug, now promoted). It covers:
 - Embed weight (when 2-D) → Muon
 - A mixed-model fixture that exercises the ndim-2 / ndim-1 /
   ndim-3 cases together
+
+## Muon accumulator layout: bf16 merged vs separate `accum` for quantized storage
+
+Muon's per-cycle grad accumulator layout depends on the
+configured `precision.muon_momentum` storage dtype. The split
+was introduced in 2026-07-02 to fix a per-microbatch CPU sync
+bottleneck in the merged-accumulator design when the storage
+dtype was quantized (int8 / mxfp8).
+
+### The bottleneck (pre-fix)
+
+The pre-fix design had `s.mom_buf` doubling as the per-mb
+grad accumulator (`mu=1` accumulation — `mom_buf` resets to
+zero at the end of every `step()`). For fp* storage this was
+fine: each microbatch's bf16 grad was just added to
+`s.mom_buf` (CPU bf16 add, ~30 ms at 8-layer smoke).
+
+For quantized storage (int8 + BF16 per-row scale, mxfp8 +
+E8M0 per-block scale) this merged design forced a full
+dequant-add-requant cycle on the CPU pinned momentum buffer
+for **every** microbatch: dequant `mom_buf`/`mom_scale` →
+FP32, add the new bf16 grad, requantize back to int8/E4M3 +
+scale, copy back. At 8-layer smoke this was ~7-8 seconds per
+microbatch; at the production 32-layer scale ~32 seconds per
+microbatch — the dominant cost in `flush_pending_grads`. With
+`gradient_accumulation_steps=16` a single optimizer step
+spent ~8 minutes on CPU sync alone, blocking every forward.
+
+### The fix (2026-07-02)
+
+A separate `s.accum` field was added to `_ParamState` —
+BF16, pinned, `numel=n` — for Muon params with quantized
+storage. The per-mb hot path becomes `s.accum.add_(grad_bf16)`
+— a single CPU bf16 add at ~30 ms (independent of scale).
+The expensive dequant-add-requant now runs **once per
+optimizer step** (amortized over all microbatches in the
+cycle) inside `CPUMuon.step`, which reads `s.accum` as the
+cycle's grad sum, does Newton-Schulz, and requantizes the
+result back into `s.mom_buf` / `s.mom_scale` for state_dict
+observability and cycle continuity.
+
+fp* muon keeps the merged-accumulator design: `s.mom_buf`
+**is** the accumulator (no separate `s.accum`). Only the
+quantized path pays the extra 2 bytes/elt for the separate
+`accum` buffer.
+
+### Per-storage-dtype layout
+
+| `muon_momentum` dtype | accumulator | momentum storage | per-mb work |
+| --- | --- | --- | --- |
+| `bf16` / `fp16` / `fp32` | `s.mom_buf` (merged) | `s.mom_buf` (same tensor) | CPU fp add (cheap) |
+| `int8` (per-row BF16 scale) | `s.accum` (bf16) | `s.mom_buf` (int8) + `s.mom_scale` (bf16) | CPU bf16 add to `accum` (cheap); dequant-add-requant happens once at `step()` |
+| `mxfp8` (E4M3 + per-block E8M0 scale) | `s.accum` (bf16) | `s.mom_buf` (E4M3) + `s.mom_scale` (E8M0) | CPU bf16 add to `accum` (cheap); dequant-add-requant happens once at `step()` |
+
+### API surface
+
+- `_accumulator_target(s)` returns `(target, cast_dtype)`:
+  - AdamW: `(s.m, s.m.dtype)`
+  - Muon, quantized: `(s.accum, torch.bfloat16)`
+  - Muon, fp*: `(s.mom_buf, s.mom_buf.dtype)`
+- `register_grad_offload_hooks` always emits
+  `("add", target, src)` for muon (no more `mxfp8_muon` /
+  `int8_muon` pending entry kinds).
+- `flush_pending_grads`, `flush_manual_flush_params`, and
+  `accumulate_grads_to_cpu` only handle the plain `("add", ...)`
+  triple. The dequant-add-requant cycle has moved to
+  `_quantize_accum_to_mom_buf`, called from
+  `CPUMuon.step` at cycle end (one requantize per param per
+  step).
+- `_scale_accum(s, coef)` (renamed from `_scale_mxfp8_mom_buf`)
+  scales the right accumulator per param kind: `s.m` for
+  AdamW, `s.accum` for quantized muon, `s.mom_buf` for fp*
+  muon. The previous FP8 dequant-mul-requant round-trip is
+  gone — the accumulator is always a floating-point dtype.
+- `state_dict` / `load_state_dict` save and restore `s.accum`
+  for mid-cycle resume.
+
+### Memory cost
+
+The separate `s.accum` is 2 bytes/elt (BF16) for every
+quantized-muon param. Cost vs the merged design:
+- int8 muon: 1 byte/elt (int8 mom_buf) + 2 bytes/elt (bf16
+  per-row scale) + 2 bytes/elt (bf16 accum) = 5 bytes/elt
+  vs 3 bytes/elt before. About 67% more CPU memory.
+- mxfp8 muon: 1 byte/elt (E4M3 mom_buf) + 0.03 bytes/elt
+  (E8M0 per-block scale, 1 byte per 32) + 2 bytes/elt (bf16
+  accum) = ~3.03 bytes/elt vs ~1.03 bytes/elt before.
+  About 3x more CPU memory.
+- fp* muon: unchanged. No separate `s.accum`.
+
+The memory cost is paid back by ~10x faster per-mb sync:
+~30 ms per mb for the separate-accumulator path vs ~7000 ms
+for the merged-accumulator + per-mb dequant-add-requant
+cycle. The cost also includes one requantize per param per
+optimizer step (amortized over `gradient_accumulation_steps`
+microbatches), so the net per-step CPU sync cost drops
+~3-4x at production scale.
+
+### Regression test
+
+`test/_tmp/test_muon_separate_accum.py` pins the design:
+
+1. `test_mxfp8_per_mb_flush_is_fast` — at 8-layer smoke
+   scale, the per-mb flush for mxfp8 muon must be <2 s
+   (pre-fix: ~7 s).
+2. `test_int8_per_mb_flush_is_fast` — same budget for int8.
+3. `test_mxfp8_final_param_close_to_bf16` — the mxfp8 path's
+   post-step param must match the bf16-muon post-step param
+   to within quantization noise (<5% rel diff). Pins that the
+   redesign changed only the per-mb path, not the algorithm.
+4. `test_bf16_momentum_unchanged` — bf16 muon must still use
+   the merged-accumulator design (no separate `s.accum`).
+   `_accumulator_target` returns `(s.mom_buf, bfloat16)` for
+   bf16 muon.
+
+If any of these regress, the redesign has been broken or
+reverted — the next time a quantized storage config is
+shipped, the per-mb CPU sync cliff will return.

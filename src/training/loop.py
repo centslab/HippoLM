@@ -134,29 +134,29 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     the given optimizers, all-reduce across the TP world, and
     clip in place.
 
-    In the merged-accumulator design, the "accumulator" is
-    ``s.m`` for AdamW and ``s.mom_buf`` for Muon — there is no
-    separate ``s.accum``. We clip in place on whichever tensor
-    holds the sum-of-microbatch-grads for that param. Scales
-    the accumulator by ``clip_coef = max_norm / (total_norm +
-    1e-6)`` only when the norm exceeds the cap, so well-behaved
-    steps are no-ops.
+    For each param the accumulator is whichever tensor holds
+    the sum-of-microbatch-grads for that param at this point:
+    ``s.m`` (AdamW), ``s.accum`` (quantized muon: int8 /
+    mxfp8), or ``s.mom_buf`` (fp* muon, merged design).
+    Scales the accumulator by ``clip_coef = max_norm /
+    (total_norm + 1e-6)`` only when the norm exceeds the cap,
+    so well-behaved steps are no-ops.
 
-    FP8 storage path (mxfp8 Muon: E4M3 ``mom_buf`` + E8M0
-    ``mom_scale``): ``.mul_`` is not implemented for FP8 dtypes
-    on CPU, so the in-place scale has to round-trip through
-    FP32: dequant → mul → requant. We do that via
-    :func:`_scale_mxfp8_mom_buf` so the per-mb / per-step
-    requantize paths share the same dequant/requant logic.
+    The clip is always a plain ``.mul_(coef)`` because all
+    three accumulators are floating-point (BF16 / FP16 / FP32);
+    the previous FP8 ``mom_buf`` round-trip via
+    ``_scale_mxfp8_mom_buf`` is gone — the separate-accumulator
+    redesign moved the FP8 storage away from the clip path.
     """
     import torch.distributed as dist
-    from src.training.param_offload import _scale_mxfp8_mom_buf
 
     local_sq = torch.zeros(1)
     for opt in opts:
         for s in opt.state.values():
-            # The merged-accumulator: m for AdamW, mom_buf for Muon.
-            accum = s.m if s.kind == "adamw" else s.mom_buf
+            accum = (
+                s.m if s.kind == "adamw"
+                else (s.accum if s.accum is not None else s.mom_buf)
+            )
             local_sq += accum.detach().float().pow(2).sum()
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
@@ -170,13 +170,10 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     #       (quadratic clip instead of linear).
     if max_norm > 0.0 and total_norm > max_norm:
         clip_coef = max_norm / (total_norm + 1e-6)
+        from src.training.param_offload import _scale_accum
         for opt in opts:
             for s in opt.state.values():
-                if s.kind == "muon" and s.mxfp8_block_size is not None:
-                    _scale_mxfp8_mom_buf(s, clip_coef)
-                else:
-                    accum = s.m if s.kind == "adamw" else s.mom_buf
-                    accum.mul_(clip_coef)
+                _scale_accum(s, clip_coef)
     return total_norm
 
 
@@ -507,12 +504,18 @@ def _setup_worker(
     # line below (and any future debugger) can see the components
     # separately.
     #
-    # In the merged-accumulator design there is no separate
-    # ``accum`` buffer: ``s.m`` (AdamW) and ``s.mom_buf`` (Muon)
-    # double as the grad accumulator AND the optimizer's
-    # first-moment / momentum feed. The byte savings vs the
-    # prior design is exactly 2 bytes/elt (one BF16 buffer's
-    # worth) on every trainable param.
+    # Accumulator layout: AdamW uses ``s.m`` (BF16) as both the
+    # grad accumulator and the first moment — no separate
+    # ``accum`` buffer. Muon uses the same merged design for fp*
+    # storage (``s.mom_buf`` doubles as the accumulator). For
+    # quantized muon (int8 / mxfp8) there is a SEPARATE bf16
+    # ``s.accum`` buffer that holds the per-mb grad sum cheaply
+    # (the old dequant-add-requant per-mb cycle was the CPU
+    # bottleneck at 8+ seconds per microbatch — see
+    # ``docs/optimizer_layout.md`` for the design). The byte
+    # cost of the separate ``accum`` is 2 bytes/elt for the
+    # quantized-muon params, paid back by ~10x faster per-mb
+    # sync.
     #
     # Muon's momentum storage dtype is configurable
     # (``precision.muon_momentum``): int8 with a BF16 per-row
@@ -530,11 +533,20 @@ def _setup_worker(
         # mxfp8: per-block E8M0 scale; total scale bytes is
         # ``ceil(cols / block_size)`` per row, 1 byte per entry.
         mxfp8_block_size = muon_states[0].mxfp8_block_size
+        # Separate ``accum`` buffer exists only for quantized
+        # muon (int8 / mxfp8) — fp* muon keeps the merged-
+        # accumulator design. Checked per-state (not just the
+        # first) so a heterogeneous model still computes
+        # correctly.
+        quantized_muon_params = sum(
+            s.param.numel() for s in muon_states if s.accum is not None
+        )
     else:
         muon_mom_dtype = torch.int8
         muon_mom_bytes_per_elt = 1
         muon_has_scale = False
         mxfp8_block_size = None
+        quantized_muon_params = 0
     muon_mom = n_muon * muon_mom_bytes_per_elt
     if muon_has_scale:
         if mxfp8_block_size is not None:
@@ -553,9 +565,14 @@ def _setup_worker(
             muon_scale = n_muon_rows * 2
     else:
         muon_scale = 0
+    # Separate ``accum`` cost: 2 bytes/elt (BF16) for every
+    # quantized-muon param. Zero for fp* muon (no separate
+    # buffer) and for AdamW (its ``s.m`` is the merged
+    # accumulator).
+    muon_accum = quantized_muon_params * 2
     adamw_m = n_adamw * 2
     adamw_v = n_adamw * 2
-    muon_bytes = muon_mom + muon_scale
+    muon_bytes = muon_mom + muon_scale + muon_accum
     adamw_bytes = adamw_m + adamw_v
     muon_mom_label = (
         f"{str(muon_mom_dtype).replace('torch.', '')}_mom"
@@ -571,16 +588,20 @@ def _setup_worker(
         )
     else:
         muon_scale_str = ""
+    muon_accum_str = (
+        f" + bf16_accum={muon_accum / 1024**3:.3f} GB"
+        if muon_accum > 0 else ""
+    )
     logger.info(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
         f" ({muon_bytes / 1024**3:.2f} GB total:"
         f" {muon_mom_label}={muon_mom / 1024**3:.3f} GB"
-        f"{muon_scale_str}),"
+        f"{muon_scale_str}{muon_accum_str}),"
         f" AdamW params={n_adamw:,}"
         f" ({adamw_bytes / 1024**3:.2f} GB total:"
         f" bf16_m={adamw_m / 1024**3:.3f} GB"
         f" + bf16_v={adamw_v / 1024**3:.3f} GB)"
-        f" [merged-accumulator: no separate grad buffer]."
+        f" [separate-accum for quantized muon: cheap CPU bf16 add per mb]."
     )
 
     return {
@@ -823,7 +844,14 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     n_nan_accum_total = 0
                     for opt_name, opt in (("muon", muon_opt), ("adamw", adamw_opt)):
                         for sid, s in opt.state.items():
-                            accum = s.m if s.kind == "adamw" else s.mom_buf
+                            # Quantized muon (int8/mxfp8) has a
+                            # separate bf16 ``accum`` buffer; fp*
+                            # muon and AdamW use ``mom_buf`` /
+                            # ``m`` as the merged accumulator.
+                            accum = (
+                                s.m if s.kind == "adamw"
+                                else (s.accum if s.accum is not None else s.mom_buf)
+                            )
                             # Cast to BF16 before ``isfinite`` — FP8
                             # storage (mxfp8 muon: E4M3 / E8M0) has no
                             # direct ``isfinite`` implementation in
@@ -833,7 +861,10 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                             # non-NaN/Inf values we're trying to
                             # detect; NaN in FP8 is a deliberate
                             # 0x7F / 0xFF byte pattern that decodes
-                            # to NaN in BF16 too.
+                            # to NaN in BF16 too. (With the new
+                            # separate-accumulator design, ``accum``
+                            # for quantized muon is already BF16, so
+                            # the cast is a no-op there.)
                             n_nan = (~torch.isfinite(accum.to(torch.bfloat16))).sum().item()
                             n_nan_accum_total += n_nan
                             if n_nan > 0 and not found_inf:

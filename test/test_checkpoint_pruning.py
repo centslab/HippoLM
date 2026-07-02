@@ -27,7 +27,6 @@ from src.training.checkpoint import prune_old_checkpoints, save_checkpoint
 from src.training.param_offload import (
     CPUAdamW,
     CPUMuon,
-    _int8_muon_accumulate,
 )
 
 
@@ -59,13 +58,17 @@ def _populate(model, adamw, muon, seed: int) -> None:
     for s in adamw.state.values():
         s.m.add_(s.param.grad.detach().to("cpu").reshape(-1))
     for s in muon.state.values():
-        if s.mom_scale is not None:
-            _int8_muon_accumulate(
-                s,
+        if s.accum is not None:
+            # Quantized muon: per-mb hot path adds bf16 grad
+            # into the separate ``s.accum`` buffer.
+            s.accum.add_(
                 s.param.grad.detach().to(torch.bfloat16).reshape(-1).to("cpu"),
             )
         else:
-            s.mom_buf.add_(s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1))
+            # fp* muon: merged accumulator.
+            s.mom_buf.add_(
+                s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1)
+            )
 
 
 def _make_saves(model, adamw, muon, d: Path, n: int, keep_last_n):

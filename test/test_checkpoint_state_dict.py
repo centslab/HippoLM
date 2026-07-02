@@ -31,7 +31,6 @@ from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.param_offload import (
     CPUAdamW,
     CPUMuon,
-    _int8_muon_accumulate,
 )
 
 
@@ -86,18 +85,26 @@ def _populate_state(model, adamw, muon, seed: int = 1) -> None:
         s.m.add_(s.param.grad.detach().to("cpu").reshape(-1))
         s.step = 3
     for s in muon.state.values():
-        if s.mom_scale is not None:
-            # int8 storage: dequant/add/requant path (mirrors the
-            # per-microbatch accumulate hook's int8_muon branch).
-            _int8_muon_accumulate(
-                s,
+        if s.accum is not None:
+            # Quantized muon (int8 / mxfp8): the per-mb hot
+            # path now adds the bf16 grad into the separate
+            # ``s.accum`` buffer (cheap CPU bf16 add). The
+            # old dequant-add-requant cycle moved to step()
+            # time and is exercised by the optimizer step
+            # itself; populating state directly here mirrors
+            # what the per-mb hook would do.
+            s.accum.add_(
                 s.param.grad.detach()
                 .to(torch.bfloat16)
                 .reshape(-1)
                 .to("cpu"),
             )
         else:
-            s.mom_buf.add_(s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1))
+            # fp* muon: merged-accumulator design, ``mom_buf``
+            # is the accumulator.
+            s.mom_buf.add_(
+                s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1)
+            )
         s.step = 7
 
 
