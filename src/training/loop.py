@@ -571,14 +571,21 @@ def _setup_worker(
     # grad accumulator and the first moment — no separate
     # ``accum`` buffer. Muon uses the same merged design for fp*
     # storage (``s.mom_buf`` doubles as the accumulator). For
-    # quantized muon (int8 / mxfp8) there is a SEPARATE bf16
-    # ``s.accum`` buffer that holds the per-mb grad sum cheaply
-    # (the old dequant-add-requant per-mb cycle was the CPU
-    # bottleneck at 8+ seconds per microbatch — see
-    # ``docs/optimizer_layout.md`` for the design). The byte
-    # cost of the separate ``accum`` is 2 bytes/elt for the
-    # quantized-muon params, paid back by ~10x faster per-mb
-    # sync.
+    # int8 muon, there is a separate bf16 ``s.accum`` buffer that
+    # holds the per-mb grad sum cheaply (the int8
+    # dequant-add-requant per-mb cycle was the CPU bottleneck at
+    # 8+ seconds per microbatch — see ``docs/optimizer_layout.md``
+    # for the design). For mxfp8 muon, there is NO separate
+    # ``accum`` buffer: the per-mb accumulation flows through a
+    # fused C++ kernel (:func:`fused_mxfp8_dequant_add_requant`)
+    # that does dequant + add + requant in one pass directly into
+    # ``s.mom_buf``. This is the mxfp8 design's whole point — to
+    # save the 2 bytes/elt that a separate accumulator would have
+    # cost (see test/test_mxfp8_no_accum.py for the regression).
+    # Per-mb CPU sync is slower for mxfp8 (~1s/mb at the smoke
+    # scale) than for int8 with bf16 accum (~50ms), but it's still
+    # inside the per-mb sync budget because the D2H DMA dominates
+    # the wall-clock anyway.
     #
     # Muon's momentum storage dtype is configurable
     # (``precision.muon_momentum``): int8 with a BF16 per-row
@@ -655,6 +662,18 @@ def _setup_worker(
         f" + bf16_accum={muon_accum / 1024**3:.3f} GB"
         if muon_accum > 0 else ""
     )
+    # Per-param log line describes the per-mb CPU sync cost:
+    # int8 uses a separate bf16 accum (~50ms/mb); mxfp8 uses
+    # the fused C++ kernel on mom_buf directly (~1s/mb at smoke
+    # scale). Branches on mom_buf.dtype so the message reflects
+    # the actual configured storage, not just "any quantized
+    # muon".
+    if muon_states and muon_mom_dtype == torch.float8_e4m3fn:
+        accum_note = "mxfp8: fused C++ kernel per-mb (~1s/mb at smoke scale)"
+    elif muon_accum > 0:
+        accum_note = "int8: cheap CPU bf16 add per mb (~50ms)"
+    else:
+        accum_note = "merged-accumulator (mom_buf doubles as accumulator)"
     logger.info(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
         f" ({muon_bytes / 1024**3:.2f} GB total:"
@@ -664,7 +683,7 @@ def _setup_worker(
         f" ({adamw_bytes / 1024**3:.2f} GB total:"
         f" bf16_m={adamw_m / 1024**3:.3f} GB"
         f" + bf16_v={adamw_v / 1024**3:.3f} GB)"
-        f" [separate-accum for quantized muon: cheap CPU bf16 add per mb]."
+        f" [{accum_note}]."
     )
 
     return {

@@ -72,9 +72,15 @@ Conventions
     AdamW: m (BF16, numel) + v (BF16, numel)
     Muon:  mom_buf (cfg.dtype, numel)
            + mom_scale (BF16, rows)  [int8 only; None for fp*]
-  No separate accumulator buffer. ``m`` / ``mom_buf`` are the
-  accumulator AND the optimizer's first-moment / momentum feed
-  (mu=1 accumulation).
+           + mom_scale (E8M0, rows × ceil(cols / bs))  [mxfp8 only]
+    For mxfp8 muon: no ``accum`` BF16 buffer. The per-mb
+    accumulation flows through the fused mxfp8 kernel
+    directly into ``mom_buf`` (a per-mb dequant + add +
+    requant in one C++ pass). This is the raison d'être of
+    the mxfp8 storage format — paying the per-mb requant
+    cost on the existing ``mom_buf`` and saving 2 bytes/elt
+    of CPU pinned memory that a separate ``accum`` would
+    have used.
 - For ~624 M params: AdamW ≈ 4 × 624 M = 2.5 GB CPU RAM
   (m BF16 + v BF16, both 2 bytes/elt).
   Muon: 0.3 GB (int8, mom_buf only) / 0.6 GB (fp16/bf16) /
@@ -138,8 +144,13 @@ class _ParamState:
     # in the dequant path.
     mxfp8_block_size: int | None = None
     # Muon-only: per-microbatch grad accumulator (BF16, pinned).
-    # Set ONLY for muon params with quantized storage (int8 /
-    # mxfp8). For fp* muon, ``mom_buf`` doubles as the
+    # Set ONLY for int8 muon (a separate bf16 ``accum`` lets the
+    # per-mb CPU add stay cheap and pushes the int8 requantize to
+    # step time). For mxfp8 muon, ``accum`` is ``None`` — the
+    # per-mb accumulation flows directly into ``mom_buf`` via the
+    # fused C++ kernel (:func:`_mxfp8_apply_grad`), which is the
+    # whole point of the mxfp8 design (save the 2 bytes/elt of an
+    # extra bf16 accum). For fp* muon, ``mom_buf`` doubles as the
     # accumulator (no separate buffer) — keeps the previously-
     # stable bf16 muon path untouched.
     #
@@ -716,6 +727,16 @@ class CPUMuon:
                 torch.zeros(scale_shape, dtype=scale_dtype, device="cpu").pin_memory()
                 if scale_dtype is not None else None
             )
+            # E8M0 byte 0 decodes to 0.0 → divide-by-zero on dequant.
+            # Initialize all mxfp8 scale bytes to 1 (=2^-126, the safe
+            # floor) so a freshly-loaded param doesn't NaN out on the
+            # first dequant (the kernel overwrites these every cycle
+            # anyway, so this is purely a pre-first-step floor).
+            if scale_dtype is torch.float8_e8m0fnu:
+                mom_scale = torch.full(
+                    scale_shape, 1, dtype=torch.uint8,
+                    device="cpu",
+                ).view(torch.float8_e8m0fnu).pin_memory()
             # For MXFP8 storage, the per-block scale layout
             # requires ``mom_buf`` to be sized ``rows * cols_p``
             # (cols rounded up to a multiple of block_size), not
@@ -732,14 +753,18 @@ class CPUMuon:
                 cols_p = cols_dim if cols_dim % block_size == 0 \
                     else cols_dim + (block_size - cols_dim % block_size)
                 storage_n = shape[0] * cols_p
-            # Separate bf16 accumulator for quantized muon (int8 /
-            # mxfp8). See :attr:`_ParamState.accum` for the why.
-            # For fp* muon the merged-accumulator design still
-            # applies (``mom_buf`` doubles as the accumulator),
-            # so ``accum`` stays ``None``.
+            # Separate bf16 accumulator for int8 muon only. For
+            # mxfp8 we now do per-mb in-place accumulation on the
+            # mxfp8 ``mom_buf`` itself via the fused C++ kernel
+            # (:func:`_mxfp8_apply_grad`), which is what the
+            # mxfp8 design was for: save the 2 bytes/elt of an
+            # extra bf16 accum. For fp* muon the merged-accumulator
+            # design still applies (``mom_buf`` doubles as the
+            # accumulator), so ``accum`` stays ``None``.
+            is_mxfp8_param = (block_size is not None and p.ndim == 2)
             accum = (
                 torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory()
-                if quantized else None
+                if quantized and not is_mxfp8_param else None
             )
             st = _ParamState(
                 param=p,
@@ -853,6 +878,51 @@ class CPUMuon:
         bs = s.mxfp8_block_size
         cols = s.shape[1]
         return cols if cols % bs == 0 else cols + (bs - cols % bs)
+
+    def _mxfp8_apply_grad(self, s: _ParamState, src_bf16: torch.Tensor) -> None:
+        """Per-mb in-place accumulate ``src_bf16`` (BF16, numel)
+        into ``s.mom_buf`` via the fused mxfp8 dequant+add+requant
+        kernel.
+
+        This is the per-mb hot path that replaces the prior
+        "separate bf16 accum + step-end requantize" design. The
+        mxfp8 storage format exists precisely to skip the
+        per-mb dequant+add+requant cost on a separate accum
+        buffer; we now pay the dequant+add+requant per mb
+        (in the kernel) directly on the mxfp8 storage and
+        save the 2 bytes/elt of CPU pinned memory for ``accum``.
+
+        For dims where ``cols % block_size == 0`` (the production
+        case for hidden_dim 1024+, intermediate 3072), the
+        ``src_bf16`` length equals ``mom_buf.numel()`` exactly
+        and the kernel is called directly. For dims where
+        ``cols % block_size != 0``, ``mom_buf`` is sized to
+        ``rows * cols_padded`` (one padded tail block) and we
+        zero-pad the trailing ``rows * (cols_padded - cols)``
+        elements of ``src_bf16`` before the kernel call.
+        """
+        from .ops.mxfp8_accum import fused_mxfp8_dequant_add_requant
+        rows, cols = s.shape[0], s.shape[1]
+        bs = s.mxfp8_block_size
+        cols_p = self._mxfp8_padded_cols(s)
+        if cols_p != cols:
+            # Pad the trailing block with zeros. The kernel sees
+            # the same len = rows * cols_p as ``mom_buf``.
+            tail = rows * (cols_p - cols)
+            pad = torch.zeros(tail, dtype=torch.bfloat16,
+                              device="cpu").pin_memory()
+            src_padded = torch.cat(
+                [src_bf16.view(rows, cols)[:, :cols].reshape(-1), pad],
+            ).pin_memory()
+            fused_mxfp8_dequant_add_requant(
+                s.mom_buf, s.mom_scale, src_padded, rows, cols,
+                block_size=bs,
+            )
+        else:
+            fused_mxfp8_dequant_add_requant(
+                s.mom_buf, s.mom_scale, src_bf16, rows, cols,
+                block_size=bs,
+            )
 
     def _dequantize_mxfp8(self, s: _ParamState) -> torch.Tensor:
         """Dequantize MXFP8 ``s.mom_buf`` (E4M3) + ``s.mom_scale``
@@ -1056,9 +1126,13 @@ class CPUMuon:
             device = s.param.device
             is_mxfp8 = s.mxfp8_block_size is not None
             quantized = s.mom_scale is not None  # int8 OR mxfp8
-
-            # ---- H2D the cycle's grad sum to GPU.
-            # For quantized muon this is ``s.accum`` (bf16).
+            # mxfp8 muon no longer has a separate ``accum`` —
+            # the per-mb fused kernel accumulates directly into
+            # ``mom_buf``. So this branch behaves like the old
+            # fp* muon merged-accumulator design (read ``mom_buf``
+            # directly, no requantize back at step end).
+            if is_mxfp8:
+                use_separate_accum = False
             # For fp* muon this is ``s.mom_buf`` (the merged
             # accumulator). ----
             if use_separate_accum:
@@ -1093,6 +1167,11 @@ class CPUMuon:
             # ---- Requantize (quantized only) + D2H. For the
             # separate-accumulator path the requantize happens
             # on the CPU at step end (see _quantize_accum_to_mom_buf).
+            # For mxfp8 muon (no separate accum) the cycle-sum IS
+            # ``mom_buf`` already — there is no step-end requantize
+            # back to ``mom_buf`` because we just consumed it for
+            # NS. The cycle reset below zeros ``mom_buf`` so the
+            # next cycle's per-mb fused accumulate starts fresh.
             # For fp* muon the recast happens on the GPU here
             # (same as before). ----
             if use_separate_accum:
@@ -1101,39 +1180,10 @@ class CPUMuon:
                 # FP32 buffer on GPU IS the NS input.
                 orth_input = m_fp32_gpu
             elif is_mxfp8:
-                # Block-scaled requant. ``m_fp32_gpu`` is [rows, cols]
-                # (already cropped); pad right to cols_p, reshape to
-                # blocks, compute per-block absmax + E8M0 scale,
-                # divide + round to E4M3, D2H both.
-                bs = s.mxfp8_block_size
-                cols_p = self._mxfp8_padded_cols(s)
-                n_blocks = cols_p // bs
-                if cols_p != cols:
-                    m_padded = torch.nn.functional.pad(
-                        m_fp32_gpu, (0, cols_p - cols),
-                    )
-                else:
-                    m_padded = m_fp32_gpu
-                blocks = m_padded.view(rows, n_blocks, bs)
-                absmax = blocks.abs().amax(dim=-1).float()
-                target_scale = (absmax / self._E4M3_MAX).clamp(min=2 ** -127)
-                log2 = target_scale.log2()
-                e_unclamped = log2.round() + 127.0
-                e = e_unclamped.clamp(min=1.0, max=254.0)
-                new_scales = e.to(torch.uint8).view(torch.float8_e8m0fnu)
-                scale_fp32 = new_scales.float() \
-                                .view(rows, n_blocks, 1)
-                scaled = (blocks.float() / scale_fp32) \
-                            .clamp(-self._E4M3_MAX, self._E4M3_MAX)
-                q_e4m3 = scaled.to(torch.float8_e4m3fn)
-                s.mom_buf.copy_(
-                    q_e4m3.reshape(-1).view(s.mom_buf.shape),
-                    non_blocking=True,
-                )
-                s.mom_scale.copy_(
-                    new_scales.view(s.mom_scale.shape),
-                    non_blocking=True,
-                )
+                # mxfp8 muon (no ``accum``): just take the
+                # dequantized fp32 from H2D as the NS input. The
+                # post-NS update is applied directly to the GPU
+                # param; ``mom_buf`` is reset to zero below.
                 orth_input = m_fp32_gpu
             elif quantized:
                 # int8 per-row requant.
@@ -1280,31 +1330,47 @@ class CPUMuon:
 # --------------------------------------------------------------------------- #
 # Public API: stream grads to CPU and reset                                   #
 # --------------------------------------------------------------------------- #
-def _accumulator_target(s: _ParamState) -> Tuple[torch.Tensor, torch.dtype]:
-    """Return ``(target_tensor, cast_dtype)`` for the offload path.
+def _accumulator_target(s: _ParamState) -> Tuple[torch.Tensor, torch.dtype, bool]:
+    """Return ``(target_tensor, cast_dtype, is_mxfp8)`` for the
+    offload path.
 
     ``target_tensor`` is the CPU-side tensor that the per-microbatch
-    grad should be folded into (mu=1 accumulation). For AdamW it's
-    ``s.m``; for Muon it's ``s.accum`` when set (quantized muon:
-    int8 / mxfp8) or ``s.mom_buf`` (fp* muon, merged design).
+    grad is folded into (mu=1 accumulation). For AdamW it's
+    ``s.m``; for fp* Muon it's ``s.mom_buf`` directly; for int8
+    Muon it's ``s.accum`` (the BF16 mirror that gets requantized
+    into ``s.mom_buf`` at step time).
+
+    For mxfp8 Muon, ``s.accum`` is ``None`` and the per-mb
+    accumulation flows directly into ``s.mom_buf`` via the
+    fused C++ kernel (:func:`CPUMuon._mxfp8_apply_grad`).
+    ``target_tensor`` is set to ``s.mom_buf`` (so the hook's
+    bookkeeping is uniform), but the flush dispatches based on
+    ``is_mxfp8`` and calls the kernel instead of ``.add_()``.
 
     ``cast_dtype`` is the dtype to cast the GPU grad to before
     the DMA. Always BF16 for the accumulator side — both
-    ``s.m`` (AdamW) and the new ``s.accum`` (quantized muon)
-    are BF16. For fp* muon (no separate accum), the cast
-    matches the storage dtype of ``s.mom_buf``.
+    ``s.m`` (AdamW) and ``s.accum`` (int8 muon) are BF16. For
+    fp* muon (no separate accum), the cast matches the storage
+    dtype of ``s.mom_buf``. For mxfp8, the kernel reads BF16.
     """
     if s.kind == "adamw":
-        return s.m, s.m.dtype
+        return s.m, s.m.dtype, False
     # muon
+    if s.mxfp8_block_size is not None:
+        # mxfp8 muon: the fused kernel does in-place
+        # dequant+add+requant. ``mom_buf`` is the cycle-sum.
+        # The cast is BF16 (kernel reads bf16 grads); the
+        # flush dispatches through ``_mxfp8_apply_grad``
+        # instead of ``.add_()``.
+        return s.mom_buf, torch.bfloat16, True
     if s.accum is not None:
-        # Quantized muon: ``accum`` (BF16) is the per-mb
+        # int8 muon: ``accum`` (BF16) is the per-mb
         # accumulator. The cast target is BF16 — a cheap CPU
         # bf16 add, not the old dequant-add-requant cycle.
-        return s.accum, torch.bfloat16
+        return s.accum, torch.bfloat16, False
     # fp* muon: merged-accumulator design, ``mom_buf`` IS the
     # accumulator. Cast matches the storage dtype.
-    return s.mom_buf, s.mom_buf.dtype
+    return s.mom_buf, s.mom_buf.dtype, False
 
 
 def accumulate_grads_to_cpu(
@@ -1345,7 +1411,7 @@ def accumulate_grads_to_cpu(
             g = s.param.grad
             if g is None:
                 continue
-            target, cast_dtype = _accumulator_target(s)
+            target, cast_dtype, is_mxfp8 = _accumulator_target(s)
             # Cast on the GPU first (so DMA carries the cast
             # dtype), flatten to match the 1-D accumulator, then
             # issue the async D2H.
@@ -1355,7 +1421,11 @@ def accumulate_grads_to_cpu(
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
             )
-            pending.append((target, src_cpu))
+            # Mark the queue entry with the op kind so the flush
+            # can dispatch mxfp8 entries through the fused kernel
+            # instead of a plain ``.add_()``.
+            op = "mxfp8_accum" if is_mxfp8 else "add"
+            pending.append((op, target, src_cpu))
             # Free GPU grad immediately so the GPU memory is
             # available for the next micro-batch's forward.
             s.param.grad = None
@@ -1365,8 +1435,28 @@ def accumulate_grads_to_cpu(
     else:
         torch.cuda.synchronize()
 
-    for target, src in pending:
+    if not pending:
+        return
+    # Group entries by op kind; needs the optimizer to dispatch
+    # mxfp8 through ``CPUMuon._mxfp8_apply_grad``.
+    mxfp8_pending = []
+    add_pending = []
+    for entry in pending:
+        op = entry[0]
+        if op == "mxfp8_accum":
+            mxfp8_pending.append(entry)
+        else:
+            add_pending.append((entry[1], entry[2]))
+    for target, src in add_pending:
         target.add_(src)
+    if mxfp8_pending:
+        for opt in optimizers:
+            for s in opt.state.values():
+                s._optimizer = opt  # belt-and-suspenders for the manual path
+                for entry in mxfp8_pending:
+                    if entry[1] is s.mom_buf:
+                        opt._mxfp8_apply_grad(s, entry[2])
+                        break
 
 
 def _quantize_accum_to_mom_buf(s: _ParamState) -> None:
@@ -1541,6 +1631,10 @@ def register_grad_offload_hooks(
                 # Skip the per-param hook; flush_pending_grads
                 # handles this param via the manual path.
                 continue
+            # Attach the optimizer to the state object so the
+            # mxfp8 flush dispatch can reach the helper without
+            # a separate id→state map.
+            s._optimizer = opt
             p.register_post_accumulate_grad_hook(_make_offload_hook(s))
     # Defensive: clear any stale entries (e.g. from a previous
     # run sharing the module-level queue).
@@ -1562,14 +1656,19 @@ def _make_offload_hook(s: _ParamState):
     microbatch — the root cause of a multi-day "loss not
     decreasing" incident. Always read ``p.grad`` here.
 
-    For quantized muon (int8 / mxfp8) the target is the bf16
-    ``s.accum`` buffer; the per-mb work is a cheap CPU bf16
-    add (no dequant-add-requant cycle). The expensive
-    quantization happens once per optimizer step inside
-    :meth:`CPUMuon.step`.
+    For int8 muon the target is the bf16 ``s.accum`` buffer; the
+    per-mb work is a cheap CPU bf16 add (no dequant-add-requant
+    cycle). The expensive quantization happens once per optimizer
+    step inside :meth:`CPUMuon.step`.
+
+    For mxfp8 muon the target is ``s.mom_buf`` (the cycle-sum is
+    the mxfp8 storage itself), but the flush calls the fused C++
+    :func:`_mxfp8_apply_grad` instead of a plain ``.add_()`` —
+    that op is what saves the 2 bytes/elt of an extra accum
+    buffer and is the entire point of the mxfp8 storage format.
     """
     p = s.param
-    target, target_dtype = _accumulator_target(s)
+    target, target_dtype, is_mxfp8 = _accumulator_target(s)
 
     def hook(g: torch.Tensor | None) -> None:
         # ``g`` is the leaf param per the PyTorch API contract.
@@ -1592,7 +1691,8 @@ def _make_offload_hook(s: _ParamState):
             .reshape(-1)
             .to("cpu", non_blocking=True)
         )
-        _pending_grads.append(("add", target, src))
+        op = "mxfp8_accum" if is_mxfp8 else "add"
+        _pending_grads.append((op, target, src, s))
         # Free the GPU grad right now so the memory is available
         # for the next param's backward. The hook return value
         # replaces .grad per PyTorch's contract; returning None
@@ -1640,20 +1740,40 @@ def flush_manual_flush_params(optimizers: List) -> None:
             g = p.grad
             if g is None:
                 continue
-            target, cast_dtype = _accumulator_target(s)
+            target, cast_dtype, is_mxfp8 = _accumulator_target(s)
             src_cpu = (
                 g.detach()
                 .to(cast_dtype)
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
             )
-            pending.append((target, src_cpu))
+            op = "mxfp8_accum" if is_mxfp8 else "add"
+            pending.append((op, target, src_cpu, s))
             p.grad = None
     if not pending:
         return
     torch.cuda.synchronize()
-    for target, src in pending:
+    # Dispatch by op tag. mxfp8 entries go through the fused
+    # kernel via ``CPUMuon._mxfp8_apply_grad`` (saves the 2
+    # bytes/elt of a separate bf16 ``accum``). int8 / fp* /
+    # AdamW are plain ``.add_()``.
+    mxfp8_pending = []
+    plain_adds = []
+    for entry in pending:
+        if entry[0] == "mxfp8_accum":
+            mxfp8_pending.append(entry)
+        else:
+            plain_adds.append((entry[1], entry[2]))
+    for target, src in plain_adds:
         target.add_(src)
+    if mxfp8_pending:
+        for opt in optimizers:
+            for s in opt.state.values():
+                s._optimizer = opt
+                for entry in mxfp8_pending:
+                    if entry[1] is s.mom_buf:
+                        opt._mxfp8_apply_grad(s, entry[2])
+                        break
 
 
 def flush_pending_grads(sync_device: int | None = None) -> None:
@@ -1688,13 +1808,44 @@ def flush_pending_grads(sync_device: int | None = None) -> None:
         torch.cuda.synchronize(sync_device)
     else:
         torch.cuda.synchronize()
-    # All entries are now plain ``("add", target, src)`` triples;
-    # the dequant-add-requant cycle moved to :meth:`CPUMuon.step`
-    # (one requantize per param per step, amortized over the
-    # whole accumulation cycle).
+    # Entries come in two flavors:
+    #   - ``("add", target, src, s)`` for AdamW / fp* Muon /
+    #     int8 Muon (the cheap ``.add_()``).
+    #   - ``("mxfp8_accum", mom_buf, src_bf16, s)`` for mxfp8
+    #     Muon (dispatched through the fused C++ kernel via
+    #     ``CPUMuon._mxfp8_apply_grad``; this op is the raison
+    #     d'être of the mxfp8 storage format — saves the 2
+    #     bytes/elt of a separate bf16 ``accum`` buffer).
+    # Dispatch by the op tag; fall through to ``.add_()`` for
+    # the plain add case.
+    plain_adds = []
+    mxfp8_apps = []
     for entry in _pending_grads:
-        _, target, src = entry
+        op = entry[0]
+        if op == "mxfp8_accum":
+            mxfp8_apps.append(entry)
+        else:
+            _, target, src, _ = entry
+            plain_adds.append((target, src))
+    for target, src in plain_adds:
         target.add_(src)
+    if mxfp8_apps:
+        for entry in mxfp8_apps:
+            _, _, src, s = entry
+            opt = getattr(s, "_optimizer", None)
+            if opt is None:
+                # Defensive: no optimizer attached (e.g. test
+                # path that bypassed register_grad_offload_hooks).
+                # Fall back to plain bf16 add; the next step
+                # will dequant+requant the (wrong) bf16 storage
+                # as int8 instead of mxfp8. Logged once via the
+                # assertion.
+                raise RuntimeError(
+                    "mxfp8 flush: param's _ParamState has no "
+                    "_optimizer attached; was register_grad_offload_hooks "
+                    "called?"
+                )
+            opt._mxfp8_apply_grad(s, src)
     _pending_grads.clear()
 
 
@@ -1707,13 +1858,14 @@ def _scale_accum(s: _ParamState, coef: float) -> None:
     Resolves the right accumulator for the param:
       - AdamW: ``s.m`` (BF16, the merged accumulator + first
         moment).
-      - Muon, quantized (int8 / mxfp8): ``s.accum`` (BF16,
-        pinned) — ``.mul_`` is supported in one instruction,
-        no FP8 round-trip needed. The cheap bf16 mul replaces
-        the old dequant-mul-requant cycle on ``s.mom_buf``
-        (~7000 ms / param at 8-layer smoke); the new path is
-        ~30 ms.
-      - Muon, fp* (merged design): ``s.mom_buf``.
+      - Muon int8 / fp* / AdamW: ``s.accum`` (BF16) when set,
+        else ``s.mom_buf`` (merged design).
+      - Muon mxfp8: ``s.mom_buf`` (E4M3+E8M0). The clip does a
+        dequant-mul-requant via :func:`_requantize_mxfp8` —
+        expensive (~one fused-kernel-pass per clipped param),
+        but only fires when the norm exceeds the cap (a rare
+        event after warm-up). This is the price of the
+        no-separate-accum mxfp8 design.
 
     No-op when ``coef == 1.0`` (cheap guard so the grad-norm
     clip stays a no-op for well-behaved steps).
@@ -1721,12 +1873,51 @@ def _scale_accum(s: _ParamState, coef: float) -> None:
     if coef == 1.0:
         return
     if s.kind == "adamw":
-        target = s.m
+        s.m.mul_(coef)
     elif s.accum is not None:
-        target = s.accum
+        s.accum.mul_(coef)
+    elif s.mxfp8_block_size is not None:
+        # mxfp8: dequant, scale, requant via the PyTorch
+        # helpers. Equivalent numerically to scaling the
+        # underlying fp32 accumulator — the dequant/requant
+        # carries the bf16 precision loss through.
+        opt = getattr(s, "_optimizer", None)
+        if opt is None:
+            # No optimizer attached (test path) — fall back to
+            # a plain dequant-mul-requant via PyTorch ops.
+            bs = s.mxfp8_block_size
+            rows, cols = s.shape[0], s.shape[1]
+            cols_p = (cols if cols % bs == 0
+                       else cols + (bs - cols % bs))
+            n_blocks = cols_p // bs
+            q_blocks = s.mom_buf.view(rows, n_blocks, bs).float()
+            scale_fp32 = s.mom_scale.float().view(rows, n_blocks, 1)
+            m_fp32 = (q_blocks * scale_fp32).view(rows, cols_p)
+            m_fp32[:, :cols] *= coef
+            E4M3_MAX = 448.0
+            absmax = (m_fp32.view(rows, n_blocks, bs)
+                      .abs().amax(dim=-1).float())
+            target_scale = (absmax / E4M3_MAX) \
+                              .clamp(min=2 ** -127)
+            log2 = target_scale.log2()
+            e_unclamped = log2.round() + 127.0
+            e = e_unclamped.clamp(min=1.0, max=254.0)
+            new_scales = e.to(torch.uint8).view(torch.float8_e8m0fnu)
+            scale_fp32_new = new_scales.float() \
+                                .view(rows, n_blocks, 1)
+            scaled = (m_fp32.view(rows, n_blocks, bs) / scale_fp32_new) \
+                        .clamp(-E4M3_MAX, E4M3_MAX)
+            q_e4m3 = scaled.to(torch.float8_e4m3fn)
+            s.mom_buf.copy_(q_e4m3.reshape(-1).view(s.mom_buf.shape))
+            s.mom_scale.copy_(new_scales.view(s.mom_scale.shape))
+        else:
+            # Optimizer-attached path: use the existing helpers.
+            m_fp32 = opt._dequantize_mxfp8(s)
+            m_fp32 *= coef
+            opt._requantize_mxfp8(m_fp32, s)
     else:
-        target = s.mom_buf
-    target.mul_(coef)
+        # fp* muon (merged design).
+        s.mom_buf.mul_(coef)
 
 
 def zero_cpu_grad_accum(optimizers: List) -> None:
@@ -1734,32 +1925,37 @@ def zero_cpu_grad_accum(optimizers: List) -> None:
     next accumulation cycle).
 
     For AdamW, zero ``s.m`` (the merged accumulator + first
-    moment). For Muon, zero ``s.accum`` when set (quantized
-    muon: int8 / mxfp8) or ``s.mom_buf`` (fp* muon, merged
-    design). The optimizer's own ``step()`` already zeros the
-    accumulator it consumes; this function is a defensive zero
-    for the case where ``found_inf`` is detected and the
-    optimizers are NOT stepped — we still want to clear the
-    accumulated grads before the next cycle.
+    moment). For Muon, zero ``s.accum`` when set (int8 muon
+    only; mxfp8 muon no longer has a separate accum), or zero
+    ``s.mom_buf`` for the merged-accumulator design (fp* muon
+    AND mxfp8 muon). The optimizer's own ``step()`` already
+    zeros the accumulator it consumes; this function is a
+    defensive zero for the case where ``found_inf`` is detected
+    and the optimizers are NOT stepped — we still want to clear
+    the accumulated grads before the next cycle.
     """
     for opt in optimizers:
         for s in opt.state.values():
             if s.kind == "adamw":
                 s.m.zero_()
             elif s.accum is not None:
-                # Quantized muon: zero the separate bf16
-                # accumulator. ``mom_buf`` is irrelevant for
-                # next-cycle accumulation (it gets requantized
-                # from ``accum`` at step end of the next
-                # cycle), so we leave it alone.
+                # int8 muon: zero the separate bf16 accumulator.
+                # ``mom_buf`` is irrelevant for next-cycle
+                # accumulation (it gets requantized from
+                # ``accum`` at step end of the next cycle), so
+                # we leave it alone.
                 s.accum.zero_()
             else:
-                # fp* muon: zero ``mom_buf`` (merged
-                # accumulator). int8 zeros the int8 storage
-                # without touching the scale; the scale was
-                # last set by the requant on the most recent
-                # cycle's step, which is the right starting
-                # point for the next cycle's accumulation.
+                # fp* muon AND mxfp8 muon: zero ``mom_buf``
+                # (merged accumulator). For mxfp8, the kernel
+                # writes both mom_buf and mom_scale every mb,
+                # so leaving mom_scale from the prior cycle is
+                # harmless (the kernel overwrites it).
+                # int8 zeros the int8 storage without touching
+                # the scale; the scale was last set by the
+                # requant on the most recent cycle's step,
+                # which is the right starting point for the
+                # next cycle's accumulation.
                 s.mom_buf.zero_()
 
 

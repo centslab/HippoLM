@@ -235,10 +235,13 @@ def test_bf16_momentum_unchanged():
     opt = CPUMuon([p], lr=0.01, weight_decay=0.0, precision=prec)
     s = next(iter(opt.state.values()))
 
-    # Per-mb: target = s.mom_buf (no separate accum), bf16 cast
-    target, dtype = _accumulator_target(s)
+    # Per-mb: target = s.mom_buf (no separate accum), bf16 cast.
+    # Returns 3-tuple (target, cast_dtype, is_mxfp8) — the
+    # is_mxfp8 flag drives flush dispatch (see param_offload.py).
+    target, dtype, is_mxfp8 = _accumulator_target(s)
     assert target is s.mom_buf
     assert dtype == torch.bfloat16
+    assert is_mxfp8 is False
     print(f"  [PASS] bf16 momentum uses merged accum (target=mom_buf)")
 
 

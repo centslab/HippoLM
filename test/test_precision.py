@@ -92,8 +92,12 @@ def test_precision_config_base_yml_overrides_dataclass_defaults():
       - ``model_weights`` : BF16 (not the dataclass default FP16 —
         moved when W4A16 NVFP4 FFN shipped, since BF16 master weights
         are required for NVFP4 packing).
-      - ``muon_momentum``  : MXFP8 (not INT8 — moved when MXFP8
-        muon shipped, with the per-32 E8M0 block scale).
+      - ``muon_momentum``  : BF16 (not INT8, not MXFP8 — moved
+        to BF16 on 2026-07-03 after mxfp8 was found to diverge
+        over many gradient-accumulation steps; see
+        :mod:`docs.mxfp8_3_bugs` Bug 4. mxfp8 remains selectable
+        via ``configs/test/muon_mxfp8.yml`` for memory-constrained
+        experiments).
       - ``activations``    : BF16 (not FP16 — autocast over BF16
         activations is what the W4A16 + MXFP8 stack expects).
 
@@ -118,9 +122,10 @@ def test_precision_config_base_yml_overrides_dataclass_defaults():
         f"base.yml precision.model_weights is {p.model_weights.dtype}, "
         f"expected BF16 (NVFP4 FFN packing requires BF16 master weights)"
     )
-    assert p.muon_momentum.dtype == DType.MXFP8, (
+    assert p.muon_momentum.dtype == DType.BF16, (
         f"base.yml precision.muon_momentum is {p.muon_momentum.dtype}, "
-        f"expected MXFP8 (per-32 E8M0 block scale path)"
+        f"expected BF16 (2026-07-03: mxfp8 in prod diverges — see "
+        f"docs/mxfp8_3_bugs Bug 4)"
     )
     assert p.activations.dtype == DType.BF16, (
         f"base.yml precision.activations is {p.activations.dtype}, "

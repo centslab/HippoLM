@@ -137,7 +137,17 @@ precision:
   model_weights: { dtype: bf16 }
   gradients:     { dtype: bf16 }
   activations:   { dtype: bf16 }
-  muon_momentum: { dtype: mxfp8 }   # E4M3 elements + E8M0 per-32 scale
+  # muon_momentum storage. Default is bf16. The mxfp8 (E4M3 +
+  # per-32 E8M0) and int8 (BF16 per-row scale) code paths
+  # exist and are exercised by ``configs/test/muon_mxfp8.yml``
+  # and ``configs/test/muon_int8.yml`` — they're selectable
+  # for memory-constrained experiments, but they are NOT
+  # production: the per-mb quant error compounds over many
+  # gradient-accumulation steps and training diverges (see
+  # :mod:`docs.mxfp8_3_bugs` for the analysis). For prod,
+  # bf16 momentum gives the full-precision grad-sum feed
+  # to Newton-Schulz orthogonalization.
+  muon_momentum: { dtype: bf16 }
   adamw_m:       { dtype: bf16 }
   adamw_v:       { dtype: bf16 }
 

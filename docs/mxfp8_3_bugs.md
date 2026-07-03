@@ -16,6 +16,16 @@ config is just a one-line `extends: ../base.yml` with model
 size overrides — see the docstring of that yml for the
 rationale.
 
+**Production status (2026-07-03 update):** mxfp8 was
+reverted from `base.yml` to `bf16` after a real training
+run diverged — see **Bug 4** below. The mxfp8 code path is
+intact (the design intent — no separate `s.accum`, fused
+C++ kernel — is preserved) and is still selectable for
+memory-constrained experiments and CI smoke coverage, but
+it is no longer the default. The precision section in
+`base.yml` now reads `muon_momentum: { dtype: bf16 }` with
+a comment explaining the choice.
+
 ## Why this matters
 
 The MXFP8 storage design (E4M3 elements + E8M0 per-block
@@ -283,6 +293,115 @@ singular values stay in the stable band.
 | 1 | E8M0 bitcast-as-uint8 decode (silent zero-update) | e2e smoke loss appears stuck | `scale.float()` not `scale.view(uint8).float()` |
 | 2 | Padded storage missing for cols not multiple of 32 | e2e smoke on tiny model (or any cols % 32 ≠ 0 param) | Allocate `rows * cols_p` for mxfp8 |
 | 3 | NS divergence at σ > 1.265 (NaN at n_mb=3) | Random-grad smoke at 3+ microbatches | Normalize by Frobenius norm before NS |
+| 4 | Quant error compounds over many grad-accum steps (loss diverges) | 2026-07-03 real-data training run | Revert production to bf16; keep mxfp8 selectable |
+
+## Bug 4 — quant error compounds over many grad-accum steps (training diverges)
+
+### Symptom
+
+On 2026-07-03 a real training run with `precision.
+muon_momentum: { dtype: mxfp8 }` (the production default at
+the time) showed the loss diverge after a few hundred
+steps: "误差飞起来了" (loss blew up). The smoke test
+(`configs/test/muon_mxfp8.yml`, 4 steps) had passed clean
+— the bug fires only after enough step × mb combinations
+to let the error compound past a stable basin.
+
+The same code path passed all the unit tests in
+`test/test_mxfp8_no_accum.py`: dtypes are correct, dispatch
+flags work, fused kernel is finite, the no-`s.accum` design
+intent is intact. None of those tests assert anything about
+long-run stability — and that's the gap.
+
+### Root cause
+
+The mxfp8 design uses an in-place per-mb dequant+add+requant
+directly into `s.mom_buf`. Each microbatch does:
+
+```
+  mom_buf := quant(dequant(mom_buf) + grad_mb)
+```
+
+The per-mb `quant` is E4M3 (3-bit mantissa) with a per-block
+E8M0 scale. Per-elt error is bounded by ~12% of the block's
+max-abs — fine for a single round-trip. But the key word is
+**replaces**: the lossy representation of `dequant(mom_buf) +
+grad_mb` overwrites the old `mom_buf`, discarding the
+information that was in the old mantissa. After N cycles
+the `mom_buf` no longer represents the true grad sum
+`(g_1 + g_2 + ... + g_N) / N` — it represents the
+lossy-quantized accumulated sum with error that grows
+unboundedly in N (a well-known issue with progressive
+quantization: see e.g. "On the Convergence of Progressive
+Quantization" — the error variance is O(N) without a
+dequant-before-requant pass that preserves the original
+information, which we explicitly don't do because that
+defeats the memory savings).
+
+At `gradient_accumulation_steps=16` (the canonical
+HippoLM setting) and ~1024 steps, that's ~16k quantize
+operations on the same buffer, with error variance
+growing linearly. The NS step then orthogonalizes a
+momentum with growing noise; the ortho step amplifies
+high-frequency noise (NS implicitly divides by σ_min, so
+noise on small-singular-value directions is magnified);
+the param update becomes incoherent; the loss diverges.
+
+The bug is **specific to mxfp8's in-place
+dequant+add+requant** design — int8 muon is not affected
+because it uses a separate bf16 `s.accum` (no in-place
+quant round-trip; the bf16 `s.accum` accumulates the true
+grad sum, and requantize happens once per step with the
+true sum as input).
+
+### Fix
+
+Revert `base.yml` from `muon_momentum: { dtype: mxfp8 }` to
+`muon_momentum: { dtype: bf16 }`. The mxfp8 code path is
+intact on main — `configs/test/muon_mxfp8.yml` still
+exercises it — but it's no longer the production default.
+`bf16` momentum gives the full-precision grad-sum feed to
+NS, with no quant noise at all. The CPU RAM cost of
+`bf16` momentum (2 bytes/elt) is acceptable for the
+current 5060 Ti 16G target (the per-rank optimizer state
+is on pinned host memory, not GPU VRAM, so the mxfp8
+savings didn't help the VRAM-bound part of training
+anyway).
+
+A future experiment could revisit mxfp8 with a **true**
+progressive-quantization scheme: store the bf16 `s.accum`
+at full precision and requantize only at step time (the
+int8 design pattern), so the per-mb path is cheap and
+the step-time requantize is the only lossy step. This
+would lose the "no separate accum" memory savings of
+mxfp8 — but for the int8 case the bf16 `s.accum` is
+already known to be stable over many cycles (the user
+hasn't reported divergence with int8 muon). The mxfp8
+specific memory saving was the entire point of the
+redesign, so the experiment isn't worth it without
+new evidence that the in-place requant can be made
+stable.
+
+### Test that catches it
+
+The smoke test (`configs/test/muon_mxfp8.yml`, 4 steps)
+**does NOT** catch this bug — the divergence fires over
+many cycles. A regression test that runs ~1024 steps of
+real training with mxfp8 momentum and asserts the loss
+decreases monotonically over a sliding window would catch
+it, but that's a 10-minute CI test per run. The
+author's compromise: the test config still exists for
+code-path coverage; the **production default in `base.yml`**
+is the guard against re-introducing the regression.
+If you flip `base.yml` to mxfp8, the comment block on
+`muon_momentum` should force you to read this section.
+
+For an at-desk verification: run
+`python scripts/train.py --config configs/test/muon_mxfp8.yml`
+on a slightly extended `max_steps=64` config and check
+that the per-step loss doesn't grow. The 4-step smoke
+masks the issue; 64 steps is borderline. Production-style
+runs (≥256 steps) diverge clearly.
 
 All three are now caught by the
 `test_muon_mxfp8_storage_step_runs_and_produces_finite_params`
@@ -290,5 +409,6 @@ test (one test, three shape variants) and the
 `configs/test/muon_mxfp8.yml` smoke config. The smoke
 config is intentionally a one-liner (`extends:
 ../base.yml` plus model size overrides) — the precision
-block is inherited from `base.yml`, which now ships with
-`muon_momentum: { dtype: mxfp8 }` as the default.
+block overrides the `base.yml` `bf16` default back to
+`mxfp8` for the duration of the smoke run, so the mxfp8
+code path stays exercised.

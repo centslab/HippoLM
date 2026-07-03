@@ -194,14 +194,22 @@ def test_real_base_yml_loads():
 def test_real_test_yml_inherits_base():
     """The actual ``configs/test/quick.yml`` extends base.yml and
     pulls in the precision block. This is the contract the test
-    configs rely on."""
+    configs rely on.
+
+    Note: ``muon_momentum.dtype`` was reverted from mxfp8 → bf16
+    on 2026-07-03 after mxfp8 in production was found to diverge
+    over many gradient-accumulation steps (see
+    :mod:`docs.mxfp8_3_bugs` Bug 4). The mxfp8 path is still
+    exercised by ``configs/test/muon_mxfp8.yml`` which overrides
+    the dtype back to mxfp8.
+    """
     quick = _REPO / "configs" / "test" / "quick.yml"
     if not quick.exists():
         pytest.skip("configs/test/quick.yml not present")
     merged = _load_yaml_with_extends(str(quick))
     # Inherited from base:
     assert "precision" in merged
-    assert merged["precision"]["muon_momentum"]["dtype"] == "mxfp8"
+    assert merged["precision"]["muon_momentum"]["dtype"] == "bf16"
     # Overridden by the child:
     assert merged["num_layers"] == 2
     # The extends key itself is consumed.
