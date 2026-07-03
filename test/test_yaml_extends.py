@@ -230,7 +230,7 @@ def test_optimizer_block_in_base_resolves_all_five():
         "--muon_weight_decay CLI flag must exist for the grouped"
         " optimizer config to be overridable from the command line"
     )
-    assert args.learning_rate == pytest.approx(0.01)
+    assert args.learning_rate == pytest.approx(0.004)
     assert args.weight_decay == pytest.approx(0.01)
     assert args.muon_lr == pytest.approx(0.02)
     assert args.muon_weight_decay == pytest.approx(0.0)

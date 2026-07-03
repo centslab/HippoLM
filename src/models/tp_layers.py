@@ -62,7 +62,15 @@ def init_tp(world_size: int, devices: list[int], backend: str = "nccl") -> None:
     import torch.distributed as dist
 
     global _TP_GROUP, _TP_WORLD_SIZE, _TP_RANK
-    assert _TP_GROUP is None, "init_tp called twice"
+    # Idempotent: tear down any prior TP state first so callers from
+    # different test modules (or any other re-init path) don't crash
+    # on "init_tp called twice". Without this, the assertion used to
+    # sit here turned into a test-isolation nightmare once more than
+    # one test file started initializing TP — adding a new TP test
+    # alphabetically before an existing one would silently break
+    # the older one. Now they all just re-init cleanly.
+    if _TP_GROUP is not None:
+        shutdown_tp()
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     # Pick a port that's unlikely to clash. Use the same convention
