@@ -101,6 +101,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
+    # AdamW beta1 / beta2 (first / second moment decay). Default
+    # values match the legacy hardcoded (0.9, 0.95) on the CPUAdamW
+    # merged-accumulator path so existing checkpoints stay numerically
+    # identical. Override via ``optimizer.adamw.beta1`` /
+    # ``optimizer.adamw.beta2`` in the yml, or these flat CLI flags.
+    p.add_argument("--adamw_beta1", type=float, default=0.9,
+                   help="AdamW first-moment decay. Default 0.9 "
+                        "(matches the legacy hardcoded value).")
+    p.add_argument("--adamw_beta2", type=float, default=0.95,
+                   help="AdamW second-moment decay. Default 0.95 "
+                        "(matches the legacy hardcoded value).")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=1000)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -337,6 +348,8 @@ def _flatten_optimizer_overrides(yml_dict: Dict[str, Any]) -> None:
     mappings = (
         ("adamw", "lr",            "learning_rate"),
         ("adamw", "weight_decay",  "weight_decay"),
+        ("adamw", "beta1",         "adamw_beta1"),
+        ("adamw", "beta2",         "adamw_beta2"),
         ("muon",  "lr",            "muon_lr"),
         ("muon",  "weight_decay",  "muon_weight_decay"),
         ("muon",  "momentum",      "muon_momentum"),

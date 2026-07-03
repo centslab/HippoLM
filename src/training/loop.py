@@ -523,6 +523,8 @@ def _setup_worker(
         lr_muon=args.muon_lr,
         lr_adamw=args.learning_rate,
         weight_decay=args.weight_decay,
+        adamw_beta1=args.adamw_beta1,
+        adamw_beta2=args.adamw_beta2,
         muon_momentum=args.muon_momentum,
         muon_weight_decay=args.muon_weight_decay,
         precision=precision,

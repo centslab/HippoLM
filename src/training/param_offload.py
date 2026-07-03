@@ -1769,6 +1769,8 @@ def build_param_groups(
     lr_muon: float = 1e-3,
     lr_adamw: float = 1e-4,
     weight_decay: float = 0.01,
+    adamw_beta1: float = 0.9,
+    adamw_beta2: float = 0.95,
     muon_momentum: float = 0.95,
     muon_weight_decay: float = 0.0,
     precision: Optional[PrecisionConfig] = None,
@@ -1789,6 +1791,16 @@ def build_param_groups(
     ``optimizer:`` block in the yml (via ``scripts.cli._flatten_
     optimizer_overrides``) or the corresponding ``--weight_decay`` /
     ``--muon_weight_decay`` CLI flags.
+
+    ``adamw_beta1`` / ``adamw_beta2`` (defaults 0.9 / 0.95) are the
+    first / second moment decay for :class:`CPUAdamW`. They come from
+    ``optimizer.adamw.beta1`` / ``optimizer.adamw.beta2`` in the yml
+    or the ``--adamw_beta1`` / ``--adamw_beta2`` CLI flags. With the
+    merged-accumulator design, ``beta1`` is stored / serialized /
+    logged but not consumed by ``step()`` — the algorithm only uses
+    ``beta2`` for ``v = β2*v + (1-β2)*m² + bc2`` (see
+    :meth:`CPUAdamW.step`). The defaults match the pre-refactor
+    hardcoded values so existing checkpoints are numerically identical.
 
     ``precision`` (optional :class:`PrecisionConfig`) is forwarded
     to both optimizers; the model weights themselves are
@@ -1838,7 +1850,7 @@ def build_param_groups(
     adamw_opt = CPUAdamW(
         adamw_params,
         lr=lr_adamw,
-        betas=(0.9, 0.95),
+        betas=(adamw_beta1, adamw_beta2),
         eps=1e-8,
         weight_decay=weight_decay,
         precision=precision,
