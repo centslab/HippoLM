@@ -47,8 +47,11 @@ seq_len: 262144
 # microbatch length so backward-compat configs continue to
 # train one chunk per "old" microbatch.
 micro_batch_size: 16384
-learning_rate: 0.01
-weight_decay: 0.01
+# ``learning_rate`` and ``weight_decay`` are no longer top-level
+# keys — they live inside the ``optimizer:`` block below (under
+# ``optimizer.adamw:`` for the AdamW side). Override either via
+# the nested block in a child yml or the corresponding flat CLI
+# flag (``--learning_rate``, ``--weight_decay``).
 lr_warmup_steps: 0
 lr_decay_steps: 100
 # Derived: n_chunks = seq_len / micro_batch_size = 16. Kept as
@@ -77,9 +80,24 @@ pack_chunk_size: 64
 # to 32-64 if you see sparse packs in the First-batch heartbeat.
 pack_buffer_size: 2048
 
-# Optimizer
-muon_lr: 0.02            # Muon (2D matrices) learning rate
-muon_momentum: 0.95      # SGD momentum for the Muon path
+# Optimizer hparams (grouped by optimizer; both ``weight_decay`` and
+# ``lr`` are now per-optimizer rather than shared).
+#
+#   adamw: 1-D params (RMSNorm / KDA A_log / dt_bias / BlockAttnRes
+#          query / embed_tokens / lm_head / KDA short-conv 3-D
+#          weights).
+#   muon:  2-D Linear weights (the dominant bulk of params on this
+#          stack).
+#
+# Each sub-block accepts ``lr`` + ``weight_decay`` (``muon`` also
+# takes ``momentum``). Override either the flat CLI flag
+# (``--muon_lr``, ``--muon_weight_decay``, …) or any single nested
+# sub-key in a child yml; flat keys win over the nested block.
+# To disable Muon-side weight decay entirely, set
+# ``optimizer.muon.weight_decay: 0.0`` (the default).
+optimizer:
+  adamw: { lr: 0.004, weight_decay: 0.01 }
+  muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95 }
 max_grad_norm: 1.0       # Pre-clip L2 norm (TP-reduced). <=0 disables clipping.
 seed: 42                 # RNG seed for replicated-param init on each device.
 

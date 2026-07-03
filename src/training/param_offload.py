@@ -1770,6 +1770,7 @@ def build_param_groups(
     lr_adamw: float = 1e-4,
     weight_decay: float = 0.01,
     muon_momentum: float = 0.95,
+    muon_weight_decay: float = 0.0,
     precision: Optional[PrecisionConfig] = None,
 ) -> Tuple[List, List]:
     """Build a (muon_optimizer, adamw_optimizer) pair for a single
@@ -1780,6 +1781,14 @@ def build_param_groups(
           KDA A_log/dt_bias with ``_no_weight_decay``): AdamW
         - 2D Linear weights: Muon
         - Embedding + lm_head: AdamW (per user spec)
+
+    ``weight_decay`` is the AdamW-side decay (1D / embed / lm_head /
+    the routed 3D short-conv weights). ``muon_weight_decay`` is the
+    Muon-side decay (2D Linear weights) and defaults to ``0.0`` to
+    match the pre-refactor hardcoded behavior. Both come from the
+    ``optimizer:`` block in the yml (via ``scripts.cli._flatten_
+    optimizer_overrides``) or the corresponding ``--weight_decay`` /
+    ``--muon_weight_decay`` CLI flags.
 
     ``precision`` (optional :class:`PrecisionConfig`) is forwarded
     to both optimizers; the model weights themselves are
@@ -1823,7 +1832,7 @@ def build_param_groups(
         momentum=muon_momentum,
         nesterov=True,
         ns_steps=5,
-        weight_decay=0.0,   # decoupled wd applied elsewhere if needed
+        weight_decay=muon_weight_decay,   # resolved per-config (default 0.0; was hardcoded)
         precision=precision,
     )
     adamw_opt = CPUAdamW(

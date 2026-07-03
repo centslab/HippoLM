@@ -236,6 +236,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min_gpu_memory_mb", type=int, default=10240)
     p.add_argument("--muon_lr", type=float, default=0.02,
                    help="Learning rate for Muon (2D weight matrices).")
+    p.add_argument("--muon_weight_decay", type=float, default=0.0,
+                   help="Weight decay for Muon (2D weight matrices)."
+                        " Default 0.0 (matches the legacy hardcoded"
+                        " behavior). Set via the nested optimizer"
+                        " block in the yml, or override per-run on the"
+                        " CLI.")
     p.add_argument("--muon_momentum", type=float, default=0.95,
                    help="SGD momentum for the Muon path.")
     p.add_argument("--seed", type=int, default=42,
@@ -295,6 +301,53 @@ def _load_yaml(path: str) -> Dict[str, Any]:
     import yaml
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
+
+def _flatten_optimizer_overrides(yml_dict: Dict[str, Any]) -> None:
+    """Walk a yml dict's nested ``optimizer:`` block and populate the
+    flat argparse-default keys used by the training loop.
+
+    The canonical yml shape (see ``configs/base.yml``) is::
+
+        optimizer:
+          adamw: { lr: 0.01, weight_decay: 0.01 }
+          muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95 }
+
+    argparse has no native nested-dict type, so the CLI surface
+    stays flat (``--learning_rate``, ``--weight_decay``,
+    ``--muon_lr``, ``--muon_weight_decay``, ``--muon_momentum``).
+    This helper unpacks the yml nested block into the same flat
+    keys so the loop.py / param_offload.py reading code is
+    untouched.
+
+    Precedence: when a yml mixes the nested block with legacy
+    flat keys (``learning_rate: 0.007`` AND ``optimizer.adamw.lr:
+    0.01``), the FLAT key wins — explicit beats implicit. Users
+    who list the old flat key meant it. The helper only writes a
+    destination key when it is not already present.
+
+    The ``optimizer:`` key itself is consumed in-place (``pop``)
+    so it never reaches ``set_defaults`` as an unknown argparse
+    target.
+    """
+    opt = yml_dict.pop("optimizer", None)
+    if not isinstance(opt, dict):
+        return
+    # (group, nested-key, flat-argparse-name) triples.
+    mappings = (
+        ("adamw", "lr",            "learning_rate"),
+        ("adamw", "weight_decay",  "weight_decay"),
+        ("muon",  "lr",            "muon_lr"),
+        ("muon",  "weight_decay",  "muon_weight_decay"),
+        ("muon",  "momentum",      "muon_momentum"),
+    )
+    for group, key, dest in mappings:
+        if dest in yml_dict:
+            # Legacy flat key already set in the yml — keep it.
+            continue
+        sub = opt.get(group)
+        if isinstance(sub, dict) and key in sub:
+            yml_dict[dest] = sub[key]
 
 
 def _load_yaml_with_extends(
@@ -380,5 +433,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if yml_path.exists():
         yml_dict = _load_yaml_with_extends(str(yml_path))
         if yml_dict:
+            # Unpack the nested ``optimizer:`` block (if any) into
+            # the flat argparse-default keys the training loop reads
+            # (learning_rate / weight_decay / muon_lr / muon_weight_
+            # decay / muon_momentum). Flat keys in the yml that
+            # conflict with the nested block win (explicit beats
+            # implicit). Must run before set_defaults below.
+            _flatten_optimizer_overrides(yml_dict)
             parser.set_defaults(**yml_dict)
     return parser.parse_args(argv)

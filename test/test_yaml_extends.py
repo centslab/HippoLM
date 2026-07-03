@@ -206,3 +206,32 @@ def test_real_test_yml_inherits_base():
     assert merged["num_layers"] == 2
     # The extends key itself is consumed.
     assert "extends" not in merged
+
+
+# --------------------------------------------------------------------------- #
+# Optimizer block flatten helper (consumed by ``scripts.cli.parse_args``).    #
+# --------------------------------------------------------------------------- #
+def test_optimizer_block_in_base_resolves_all_five():
+    """``configs/base.yml`` uses the grouped ``optimizer:`` block;
+    after ``parse_args`` every CLI-default flat key the training
+    loop reads must be populated (learning_rate, weight_decay,
+    muon_lr, muon_weight_decay, muon_momentum).
+
+    Locks in the contract that the nested yml shape correctly
+    feeds the loop / ``build_param_groups`` reads.
+    """
+    from scripts.cli import parse_args as _parse_args
+
+    base = _REPO / "configs" / "base.yml"
+    if not base.exists():
+        pytest.skip("configs/base.yml not present")
+    args = _parse_args(["--config", str(base)])
+    assert hasattr(args, "muon_weight_decay"), (
+        "--muon_weight_decay CLI flag must exist for the grouped"
+        " optimizer config to be overridable from the command line"
+    )
+    assert args.learning_rate == pytest.approx(0.01)
+    assert args.weight_decay == pytest.approx(0.01)
+    assert args.muon_lr == pytest.approx(0.02)
+    assert args.muon_weight_decay == pytest.approx(0.0)
+    assert args.muon_momentum == pytest.approx(0.95)
