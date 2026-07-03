@@ -211,11 +211,12 @@ def test_real_test_yml_inherits_base():
 # --------------------------------------------------------------------------- #
 # Optimizer block flatten helper (consumed by ``scripts.cli.parse_args``).    #
 # --------------------------------------------------------------------------- #
-def test_optimizer_block_in_base_resolves_all_five():
+def test_optimizer_block_in_base_resolves_all_keys():
     """``configs/base.yml`` uses the grouped ``optimizer:`` block;
     after ``parse_args`` every CLI-default flat key the training
     loop reads must be populated (learning_rate, weight_decay,
-    muon_lr, muon_weight_decay, muon_momentum).
+    adamw_beta1, adamw_beta2, adamw_eps, muon_lr, muon_weight_decay,
+    muon_momentum).
 
     Locks in the contract that the nested yml shape correctly
     feeds the loop / ``build_param_groups`` reads.
@@ -232,6 +233,9 @@ def test_optimizer_block_in_base_resolves_all_five():
     )
     assert args.learning_rate == pytest.approx(0.004)
     assert args.weight_decay == pytest.approx(0.01)
+    assert args.adamw_beta1 == pytest.approx(0.9)
+    assert args.adamw_beta2 == pytest.approx(0.95)
+    assert args.adamw_eps == pytest.approx(1e-8)
     assert args.muon_lr == pytest.approx(0.02)
     assert args.muon_weight_decay == pytest.approx(0.0)
     assert args.muon_momentum == pytest.approx(0.95)

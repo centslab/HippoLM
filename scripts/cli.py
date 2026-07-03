@@ -112,6 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--adamw_beta2", type=float, default=0.95,
                    help="AdamW second-moment decay. Default 0.95 "
                         "(matches the legacy hardcoded value).")
+    p.add_argument("--adamw_eps", type=float, default=1e-8,
+                   help="AdamW epsilon inside ``sqrt(v/bc2) + eps``."
+                        " Default 1e-8 (matches the legacy hardcoded value).")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max_steps", type=int, default=1000)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -209,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(after flush_manual_flush_params) to release the "
                         "caching-allocator slack pool back to the driver. "
                         "Frees ~4 GB of pool on 16 GB production config at "
-                        "the cost of ~24 ms/mb (+0.7% wall-clock). Disable "
+                        "the cost of ~24 ms/mb (+0.7%% wall-clock). Disable "
                         "only if benchmarking the raw allocator behavior.")
     p.add_argument(
         "--shuffle", type=bool, default=True,
@@ -350,6 +353,7 @@ def _flatten_optimizer_overrides(yml_dict: Dict[str, Any]) -> None:
         ("adamw", "weight_decay",  "weight_decay"),
         ("adamw", "beta1",         "adamw_beta1"),
         ("adamw", "beta2",         "adamw_beta2"),
+        ("adamw", "eps",           "adamw_eps"),
         ("muon",  "lr",            "muon_lr"),
         ("muon",  "weight_decay",  "muon_weight_decay"),
         ("muon",  "momentum",      "muon_momentum"),

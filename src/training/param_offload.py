@@ -1771,6 +1771,7 @@ def build_param_groups(
     weight_decay: float = 0.01,
     adamw_beta1: float = 0.9,
     adamw_beta2: float = 0.95,
+    adamw_eps: float = 1e-8,
     muon_momentum: float = 0.95,
     muon_weight_decay: float = 0.0,
     precision: Optional[PrecisionConfig] = None,
@@ -1801,6 +1802,10 @@ def build_param_groups(
     ``beta2`` for ``v = β2*v + (1-β2)*m² + bc2`` (see
     :meth:`CPUAdamW.step`). The defaults match the pre-refactor
     hardcoded values so existing checkpoints are numerically identical.
+
+    ``adamw_eps`` (default 1e-8) is the AdamW epsilon inside
+    ``sqrt(v/bc2) + eps`` (see :meth:`CPUAdamW.step`). Comes from
+    ``optimizer.adamw.eps`` in the yml or ``--adamw_eps`` on the CLI.
 
     ``precision`` (optional :class:`PrecisionConfig`) is forwarded
     to both optimizers; the model weights themselves are
@@ -1851,7 +1856,7 @@ def build_param_groups(
         adamw_params,
         lr=lr_adamw,
         betas=(adamw_beta1, adamw_beta2),
-        eps=1e-8,
+        eps=adamw_eps,
         weight_decay=weight_decay,
         precision=precision,
     )

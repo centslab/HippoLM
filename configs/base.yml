@@ -102,7 +102,9 @@ optimizer:
   # only consumes beta2 for v = β2*v + (1-β2)*m² + bc2. Default
   # values match the v0.0.x hardcoded (0.9, 0.95) so existing
   # checkpoints carry the same math after a config-only refactor.
-  adamw: { lr: 0.004, weight_decay: 0.01, beta1: 0.9, beta2: 0.95 }
+  # ``eps`` is the AdamW epsilon inside ``sqrt(v/bc2) + eps``. Default
+  # 1e-8 matches the previously-hardcoded value in build_param_groups.
+  adamw: { lr: 0.004, weight_decay: 0.01, beta1: 0.9, beta2: 0.95, eps: 1e-8 }
   muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95 }
 max_grad_norm: 1.0       # Pre-clip L2 norm (TP-reduced). <=0 disables clipping.
 seed: 42                 # RNG seed for replicated-param init on each device.

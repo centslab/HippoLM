@@ -525,6 +525,7 @@ def _setup_worker(
         weight_decay=args.weight_decay,
         adamw_beta1=args.adamw_beta1,
         adamw_beta2=args.adamw_beta2,
+        adamw_eps=args.adamw_eps,
         muon_momentum=args.muon_momentum,
         muon_weight_decay=args.muon_weight_decay,
         precision=precision,
