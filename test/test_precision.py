@@ -59,10 +59,21 @@ from src.training.precision_config import (
 # --------------------------------------------------------------------------- #
 # PrecisionConfig parsing.                                                    #
 # --------------------------------------------------------------------------- #
-def test_precision_config_defaults_match_canonical_yml():
-    """The dataclass defaults should match the yml in
-    ``configs/base.yml``: FP16 weights, BF16 gradients, int8 +
-    per-channel Muon momentum, BF16 AdamW m/v.
+def test_precision_config_dataclass_defaults():
+    """Pin the dataclass field defaults for :class:`PrecisionConfig`.
+
+    These are the *fallback* values used when no yml / dict is
+    supplied. The production training config (``configs/base.yml``)
+    overrides several of these — see
+    ``test_precision_config_base_yml_overrides_dataclass_defaults``
+    below for the yml-level pin.
+
+    History: the dataclass defaults reflect the original KDA-only
+    project state (FP16 weights, int8 muon momentum). They were
+    intentionally NOT updated when ``base.yml`` switched to BF16
+    weights + MXFP8 muon momentum — callers always pass
+    ``PrecisionConfig.from_dict(yml['precision'])`` so the dataclass
+    defaults are only seen in unit tests.
     """
     p = PrecisionConfig()
     assert p.model_weights.dtype == DType.FP16
@@ -71,6 +82,50 @@ def test_precision_config_defaults_match_canonical_yml():
     assert p.muon_momentum.scale == ScaleMode.PER_CHANNEL
     assert p.adamw_m.dtype == DType.BF16
     assert p.adamw_v.dtype == DType.BF16
+
+
+def test_precision_config_base_yml_overrides_dataclass_defaults():
+    """``configs/base.yml`` (the production precision config) must
+    override the dataclass defaults for the keys that drifted.
+
+    Current production values:
+      - ``model_weights`` : BF16 (not the dataclass default FP16 —
+        moved when W4A16 NVFP4 FFN shipped, since BF16 master weights
+        are required for NVFP4 packing).
+      - ``muon_momentum``  : MXFP8 (not INT8 — moved when MXFP8
+        muon shipped, with the per-32 E8M0 block scale).
+      - ``activations``    : BF16 (not FP16 — autocast over BF16
+        activations is what the W4A16 + MXFP8 stack expects).
+
+    A future yml edit that reverts any of these to the dataclass
+    default would silently run the wrong precision on prod and
+    inflate the W4A16 savings comparison. This test catches it.
+    """
+    from pathlib import Path
+    import yaml
+
+    base_yml = Path(__file__).resolve().parent.parent / "configs" / "base.yml"
+    if not base_yml.exists():
+        pytest.skip("configs/base.yml not present (out-of-tree checkout)")
+
+    raw = yaml.safe_load(base_yml.read_text())
+    assert "precision" in raw, (
+        f"configs/base.yml must have a `precision:` block; got keys: {list(raw)}"
+    )
+    p = PrecisionConfig.from_dict(raw["precision"])
+
+    assert p.model_weights.dtype == DType.BF16, (
+        f"base.yml precision.model_weights is {p.model_weights.dtype}, "
+        f"expected BF16 (NVFP4 FFN packing requires BF16 master weights)"
+    )
+    assert p.muon_momentum.dtype == DType.MXFP8, (
+        f"base.yml precision.muon_momentum is {p.muon_momentum.dtype}, "
+        f"expected MXFP8 (per-32 E8M0 block scale path)"
+    )
+    assert p.activations.dtype == DType.BF16, (
+        f"base.yml precision.activations is {p.activations.dtype}, "
+        f"expected BF16 (autocast over BF16 activations)"
+    )
 
 
 def test_precision_config_from_dict_partial():
@@ -134,9 +189,14 @@ def test_precision_config_float_clears_scale_silently():
 # --------------------------------------------------------------------------- #
 # activations (autocast dtype).                                               #
 # --------------------------------------------------------------------------- #
-def test_precision_config_default_activations_is_fp16():
-    """The dataclass default for ``activations`` is FP16 — matches
-    the canonical yml and the historical hardcoded autocast dtype.
+def test_precision_config_activations_dataclass_default_is_fp16():
+    """Pin the dataclass default for ``activations``.
+
+    The production yml (``configs/base.yml``) currently sets
+    ``activations: { dtype: bf16 }`` — the dataclass default (FP16)
+    is *not* what production uses. See
+    ``test_precision_config_base_yml_overrides_dataclass_defaults``
+    for the yml-level pin.
     """
     p = PrecisionConfig()
     assert p.activations.dtype == DType.FP16
