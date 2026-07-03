@@ -1,26 +1,47 @@
-"""Numerical correctness: CPU vs GPU muon step produce same mom_buf.
+"""Regression test: production CPUMuon.step() matches an independent
+inline GPU reference implementation.
 
-Compares:
-  - mom_buf (the quantized momentum) after one muon step
-  - mom_scale (per-row BF16 scale) after one muon step
-  - s.param.data (the updated param)
+Historical context
+------------------
+``e513852 feat(offload): CPUMuon GPU step + bf16/fp16/fp32 momentum
+storage`` moved the muon step's dequant / SGD / requant cycle from CPU
+DRAM to GPU HBM. The optimization had to be **bit-equivalent** to the
+original CPU path within FP16 / int8 quantization noise — losing even
+a few percent on this test would mean the production optimizer was
+silently producing different (and unverified) updates.
 
-The comparison is done against the production CPUMuon.step()
-output. Differences are expected to be within FP16 / int8
-quantization noise (~1 ULP per element).
+The test pins that contract by running the production step() on one
+copy of a model and an inlined, hand-written GPU reference on a
+second copy, then comparing mom_buf, mom_scale, and the post-step
+param. The reference is reconstructed from the algorithm
+description (dequant → requant → NS → apply), so a future change to
+the production step() that changes the math will trip the test
+even if the change is locally consistent.
 
-TEMPORARY in test/_tmp/. Delete before commit.
+Test layout
+-----------
+- Build two identical TP models, do the same fwd + bwd + flush on
+  both.
+- Copy the pre-step state from A to B so they start identical.
+- Run production ``CPUMuon.step()`` on A.
+- Run the inline GPU reference on B.
+- Assert the three outputs agree within tight thresholds
+  (mom_buf ≤ 5/255, mom_scale ≤ 1e-3, param ≤ 5e-3).
+
+The thresholds match the original (pre-conversion) values; tightening
+any of them would catch a real divergence.
 """
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 _REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO))
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 from src.models import HippoConfig
 from src.models.tp_layers import init_tp
@@ -33,14 +54,19 @@ from src.training.param_offload import (
 from src.training.precision_config import PrecisionConfig
 
 
-def muon_step_gpu(muon_opt: CPUMuon) -> None:
-    """Same as in test_muon_gpu_step.py — duplicated here to keep
-    this test independent of that file's edit history.
+def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
+    """Independent GPU reference implementation of the muon step.
 
-    In the merged-accumulator design, ``mom_buf`` doubles as the
-    grad accumulator (mu=1 accumulation). The step just reads
-    mom_buf (dequantized for int8), requantizes, orthogonalizes,
-    applies, and resets mom_buf to zero.
+    Mirrors the algorithm (dequant → requant → NS → apply) but inlined
+    with explicit per-tensor operations. The production ``CPUMuon.step()``
+    went through a sequence of optimizations after this test was
+    written; the inlined version is the "what the math should do"
+    reference that the test compares against.
+
+    In the merged-accumulator design, ``mom_buf`` doubles as the grad
+    accumulator (mu=1 accumulation). The step just reads mom_buf
+    (dequantized for int8), requantizes, orthogonalizes, applies, and
+    resets mom_buf to zero.
     """
     lr = muon_opt.lr
     wd = muon_opt.weight_decay
@@ -84,54 +110,71 @@ def muon_step_gpu(muon_opt: CPUMuon) -> None:
         s.mom_buf.zero_()
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--seq-len", type=int, default=512)
-    p.add_argument("--num-layers", type=int, default=2)
-    p.add_argument("--hidden-size", type=int, default=512)
-    p.add_argument("--intermediate", type=int, default=1536)
-    p.add_argument("--num-heads", type=int, default=8)
-    p.add_argument("--head-dim", type=int, default=64)
-    args = p.parse_args()
+def _build_matched_pair(
+    cfg: HippoConfig, device: int,
+) -> tuple[TPHippoModel, TPHippoModel, CPUMuon, CPUMuon, object, object]:
+    """Build two identical TP models + muon opts for the A/B comparison.
 
+    Returns the two models, their muon opts, and the two adamw opts
+    (not under test but needed to set up the offload hooks).
+    """
     torch.manual_seed(42)
+    model_a = TPHippoModel(cfg, devices=[device], dtype=torch.float16)
+    model_b = TPHippoModel(cfg, devices=[device], dtype=torch.float16)
+    precision = PrecisionConfig()
+    muon_a, adamw_a = build_param_groups(
+        model_a, device=device,
+        lr_muon=0.02, lr_adamw=3e-4, weight_decay=0.01,
+        muon_momentum=0.95, precision=precision,
+    )
+    muon_b, adamw_b = build_param_groups(
+        model_b, device=device,
+        lr_muon=0.02, lr_adamw=3e-4, weight_decay=0.01,
+        muon_momentum=0.95, precision=precision,
+    )
+    register_grad_offload_hooks([muon_a, adamw_a])
+    register_grad_offload_hooks([muon_b, adamw_b])
+    return model_a, model_b, muon_a, muon_b, adamw_a, adamw_b
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_muon_step_gpu_matches_inline_reference():
+    """Production ``CPUMuon.step()`` must match the inlined GPU
+    reference implementation on mom_buf, mom_scale, and post-step
+    param.
+
+    A divergence here means the production step changed its math
+    (likely a refactor of the dequant/requant boundary or the NS
+    chunking). Either is a real regression — the muon update must
+    stay bit-equivalent to the inline reference, or the W4A16
+    100-step sweep that validated the W4A16 path is invalidated.
+    """
+    torch.manual_seed(0)
     device = 0
     torch.cuda.set_device(device)
     torch.set_float32_matmul_precision("high")
     init_tp(world_size=1, devices=[device], backend="gloo")
 
-    def build():
-        cfg = HippoConfig(
-            vocab_size=8192, hidden_size=args.hidden_size,
-            tie_word_embeddings=True, use_bias=False,
-            num_heads=args.num_heads, head_dim=args.head_dim,
-            expand_v=1.0,
-            kda_mode="chunk", use_short_conv=True,
-            allow_neg_eigval=False, safe_gate=False,
-            lower_bound=None, conv_size=4, conv_bias=False,
-            num_layers=args.num_layers, num_blocks=2,
-            intermediate_size=args.intermediate,
-            rms_norm_eps=1e-6,
-        )
-        model = TPHippoModel(cfg, devices=[device], dtype=torch.float16)
-        precision = PrecisionConfig()
-        muon_opt, adamw_opt = build_param_groups(
-            model, device=device,
-            lr_muon=0.02, lr_adamw=3e-4, weight_decay=0.01,
-            muon_momentum=0.95, precision=precision,
-        )
-        register_grad_offload_hooks([muon_opt, adamw_opt])
-        return cfg, model, muon_opt, adamw_opt
+    cfg = HippoConfig(
+        vocab_size=8192, hidden_size=256,
+        tie_word_embeddings=True, use_bias=False,
+        num_heads=4, head_dim=64, expand_v=1.0,
+        kda_mode="chunk", use_short_conv=True,
+        allow_neg_eigval=False, safe_gate=False,
+        lower_bound=None, conv_size=4, conv_bias=False,
+        num_layers=2, num_blocks=2,
+        intermediate_size=768,
+        rms_norm_eps=1e-6,
+    )
+    model_a, model_b, muon_a, muon_b, adamw_a, adamw_b = (
+        _build_matched_pair(cfg, device)
+    )
 
-    cfg_a, model_a, muon_a, adamw_a = build()
-    cfg_b, model_b, muon_b, adamw_b = build()
-
-    loader_a = iter(dummy_dataloader(args.batch_size, args.seq_len, cfg_a.vocab_size))
-    loader_b = iter(dummy_dataloader(args.batch_size, args.seq_len, cfg_b.vocab_size))
+    loader_a = iter(dummy_dataloader(2, 128, cfg.vocab_size))
+    loader_b = iter(dummy_dataloader(2, 128, cfg.vocab_size))
     mb = 4
 
-    # Forward + backward + flush on both models with the SAME inputs.
+    # Forward + backward + flush on both models with the same inputs.
     for _ in range(mb):
         for model, muon_opt, adamw_opt, loader in (
             (model_a, muon_a, adamw_a, loader_a),
@@ -145,14 +188,6 @@ def main():
             (out["loss"] / mb).backward()
             flush_pending_grads(sync_device=device)
 
-    # Snapshot state pre-step.
-    pre_mom_buf = {id(p): s.mom_buf.clone() for p, s in
-                   [(s.param, s) for s in muon_a.state.values()]}
-    pre_scale = {id(p): s.mom_scale.clone() for p, s in
-                 [(s.param, s) for s in muon_a.state.values()]}
-    pre_param = {id(p): p.data.clone() for p in
-                 [s.param for s in muon_a.state.values()]}
-
     # Copy pre-step state from A to B so they start identical.
     for s_a, s_b in zip(muon_a.state.values(), muon_b.state.values()):
         assert s_a.param is not s_b.param
@@ -161,61 +196,33 @@ def main():
         s_b.param.data.copy_(s_a.param.data)
         s_b.step = s_a.step
 
-    # Run CPU step on A, GPU step on B.
+    # Run production step on A, inline reference on B.
     muon_a.step()
-    muon_step_gpu(muon_b)
+    _muon_step_gpu_inline(muon_b)
 
-    # Compare mom_buf, mom_scale, param.data for every param.
-    print(f"\n[correctness] comparing {len(muon_a.state)} muon params:")
-    mom_buf_max_diff = 0
-    scale_max_diff = 0.0
-    param_max_diff = 0.0
-    mom_buf_total_diff = 0
-    mom_buf_total_elt = 0
-    scale_total_diff = 0.0
-    scale_total_elt = 0
-    param_total_diff = 0.0
-    param_total_elt = 0
+    # Compare the three post-step outputs.
+    failures = []
     for s_a, s_b in zip(muon_a.state.values(), muon_b.state.values()):
-        # mom_buf: element-wise abs diff in [-255, 255]
+        # mom_buf: int8, diff in [-255, 255]
         d_q = (s_a.mom_buf.to(torch.int32) - s_b.mom_buf.to(torch.int32)).abs()
-        mom_buf_max_diff = max(mom_buf_max_diff, int(d_q.max()))
-        mom_buf_total_diff += int(d_q.sum())
-        mom_buf_total_elt += d_q.numel()
-
+        if int(d_q.max()) > 5:
+            failures.append(
+                f"mom_buf max diff {int(d_q.max())}/255 exceeds 5"
+            )
         # mom_scale: BF16, compare in FP32
         d_s = (s_a.mom_scale.float() - s_b.mom_scale.float()).abs()
-        scale_max_diff = max(scale_max_diff, float(d_s.max()))
-        scale_total_diff += float(d_s.sum())
-        scale_total_elt += d_s.numel()
-
+        if float(d_s.max()) > 1e-3:
+            failures.append(
+                f"mom_scale max diff {float(d_s.max()):.4e} exceeds 1e-3"
+            )
         # param.data: FP16, compare in FP32
         d_p = (s_a.param.data.float() - s_b.param.data.float()).abs()
-        param_max_diff = max(param_max_diff, float(d_p.max()))
-        param_total_diff += float(d_p.sum())
-        param_total_elt += d_p.numel()
+        if float(d_p.max()) > 5e-3:
+            failures.append(
+                f"param max diff {float(d_p.max()):.4e} exceeds 5e-3"
+            )
 
-    print(f"  mom_buf:       max diff={mom_buf_max_diff:>3d}/255"
-          f"  mean diff={mom_buf_total_diff / mom_buf_total_elt:.4f}/255"
-          f"  ({mom_buf_total_elt:,} elts)")
-    print(f"  mom_scale:     max diff={scale_max_diff:.4e}"
-          f"  mean diff={scale_total_diff / scale_total_elt:.4e}")
-    print(f"  param.data:    max diff={param_max_diff:.4e}"
-          f"  mean diff={param_total_diff / param_total_elt:.4e}")
-
-    # Sanity thresholds:
-    #   mom_buf:   each value can differ by 1-2 (FP16 cast noise in
-    #              the dequant/requant boundary).
-    #   mom_scale: tiny (BF16 mantissa loss on the divide).
-    #   param.data: tiny (small momentum update * FP16 NS noise).
-    ok = (
-        mom_buf_max_diff <= 5
-        and scale_max_diff <= 1e-3
-        and param_max_diff <= 5e-3
+    assert not failures, (
+        "production CPUMuon.step() diverged from the inline reference:\n  "
+        + "\n  ".join(failures)
     )
-    print(f"\n[verdict] {'PASS' if ok else 'FAIL'}"
-          f"  (thresholds: mom_buf<=5, scale<=1e-3, param<=5e-3)")
-
-
-if __name__ == "__main__":
-    main()
