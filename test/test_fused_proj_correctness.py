@@ -1,31 +1,49 @@
-"""Correctness test for fused TPKDA / TPSwiGLU projections.
+"""Regression test for the fused TPKDA / TPSwiGLU projection layout.
 
-Builds SPLIT versions of TPKDA and TPSwiGLU (mirror of the
-pre-fusion design) and FUSED versions, then copies the split
-weights into the fused module with the correct slice / concat
-order and runs forward on the same input, checking the
-per-projection outputs match within FP16 noise.
+Historical context
+------------------
+``9c6bc9a feat(tp): fuse QKV / FG-first / gate+up projections in
+TPKDA + TPSwiGLU`` merged what used to be 9 separate matmuls per KDA
+layer (q, k, v, f[0], f[1], g[0], g[1], b, o) and 3 per SwiGLU
+(gate, up, down) into 6 + 2 — saving 4 kernel launches per layer.
+The perf gain is real, but only if the fused layout produces the
+**same outputs** as the split layout for any given weight + input.
+
+A future refactor that swaps the slice order, drops a column, or
+rearranges the bias would silently produce different activations
+downstream — the KDA chunk kernel would then compute on wrong q/k/v
+and the loss would drift without any single test catching it (the
+smoke test only logs step loss, not per-projection equivalence).
+
+These tests pin the math by:
+  1. Building hand-written SPLIT versions of TPKDA / TPSwiGLU that
+     mirror the pre-fusion structure (separate q/k/v ColumnParallel,
+     f_proj / g_proj as Sequential, separate gate_proj / up_proj).
+  2. Building hand-written FUSED versions that mirror the post-fusion
+     structure (qkv_proj, fg_first, f_proj1, g_proj1; gate_up_proj).
+  3. Copying the split weights into the fused module with the
+     correct slice / concat order.
+  4. Forwarding the same input and asserting the per-projection
+     outputs match within FP16 noise.
+
+The threshold is loose (max abs diff < 5e-3) because the FP16 matmul
+on a 5060 Ti accumulates in a different order when the weight is one
+big block vs two small ones (the matmul kernel picks different tile
+sizes), and order-of-summation noise in FP16 can be ~1e-3 absolute
+on a unit-magnitude output.
 
 The fused layout per rank (world=1 for this test):
   qkv_proj  weight: [2*key_dim + value_dim, hidden_size]
   fg_first  weight: [2*d_v, hidden_size]
   f_proj1   weight: [gate_dim, d_v]
   g_proj1   weight: [value_dim, d_v], bias [value_dim]
-
-The assertion threshold is loose (max abs diff < 5e-3) because the
-FP16 matmul on a 5060 Ti accumulates in a different order when the
-weight is one big block vs two small ones (the matmul kernel picks
-different tile sizes), and order-of-summation noise in FP16 can be
-~1e-3 absolute on a unit-magnitude output.
-
-TEMPORARY test in test/_tmp/. Delete before commit per the user's
-CLAUDE.md guidance.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -241,13 +259,8 @@ def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a.float() - b.float()).abs().max().item()
 
 
-def main():
-    device = 0
-    torch.cuda.set_device(device)
-    init_tp(world_size=1, devices=[device], backend="gloo")
-    torch.manual_seed(0)
-
-    cfg = HippoConfig(
+def _build_cfg() -> HippoConfig:
+    return HippoConfig(
         vocab_size=8192, hidden_size=512, tie_word_embeddings=True,
         use_bias=False, num_heads=8, head_dim=64, expand_v=1.0,
         kda_mode="chunk", use_short_conv=False,  # skip conv to keep test focused
@@ -255,37 +268,73 @@ def main():
         conv_size=4, conv_bias=False, num_layers=4, num_blocks=2,
         intermediate_size=1536, rms_norm_eps=1e-6,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for matmul tests")
+def test_tpkda_fused_matches_split():
+    """The fused TPKDA projection layout (qkv_proj / fg_first /
+    f_proj1 / g_proj1) must produce the same per-projection outputs
+    as the pre-fusion split layout, given the same weights.
+
+    Failure here means the slice / concat order in the fused module
+    is wrong, or a projection was dropped. Either regresses the KDA
+    math without the smoke test noticing for many steps.
+    """
+    device = 0
+    torch.cuda.set_device(device)
+    init_tp(world_size=1, devices=[device], backend="gloo")
+    torch.manual_seed(0)
+
+    cfg = _build_cfg()
     B, T = 2, 256
     x = torch.randn(B, T, cfg.hidden_size, device=device, dtype=torch.float16)
 
-    # ---- TPKDA projection equivalence ---- #
-    print("[1/2] TPKDA projection equivalence...")
     split = _TPKDASplit(cfg, device)
     fused = _TPKDAFused(cfg, device)
     _copy_split_to_fused_kda(split, fused)
     out_split = split(x)
     out_fused = fused(x)
+
+    failures = []
     for name in ("q", "k", "v", "f", "g", "b"):
         diff = _max_abs_diff(out_split[name], out_fused[name])
-        rng = f"[{out_split[name].min().item():.3f}, {out_split[name].max().item():.3f}]"
-        print(f"  {name}: range={rng}  max abs diff = {diff:.2e}")
-        assert diff < 5e-3, f"TPKDA {name} fused vs split diverged: {diff:.4e}"
+        if diff >= 5e-3:
+            failures.append(
+                f"TPKDA {name}: max abs diff {diff:.4e} >= 5e-3"
+            )
+    assert not failures, (
+        "fused TPKDA diverged from the pre-fusion split layout:\n  "
+        + "\n  ".join(failures)
+    )
 
-    # ---- SwiGLU gate+up equivalence ---- #
-    print("\n[2/2] TPSwiGLU gate+up equivalence...")
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for matmul tests")
+def test_tpswiglu_fused_matches_split():
+    """The fused TPSwiGLU projection (gate_up_proj + down_proj) must
+    produce the same output as the pre-fusion split gate_proj /
+    up_proj / down_proj layout, given the same weights.
+
+    Failure here means the slice order in the fused module is wrong
+    or a projection was dropped. The FFN path is the single largest
+    cost in the layer (~70% of step time at prod), so a silent math
+    regression here would be expensive to track down.
+    """
+    device = 0
+    torch.cuda.set_device(device)
+    init_tp(world_size=1, devices=[device], backend="gloo")
+    torch.manual_seed(0)
+
+    cfg = _build_cfg()
+    B, T = 2, 256
+    x = torch.randn(B, T, cfg.hidden_size, device=device, dtype=torch.float16)
+
     split = _TPSwiGLUSplit(cfg, device)
     fused = _TPSwiGLUFused(cfg, device)
     _copy_split_to_fused_swiglu(split, fused)
     y_split = split(x)
     y_fused = fused(x)
+
     diff = _max_abs_diff(y_split, y_fused)
-    print(f"  split output range: [{y_split.min().item():.4f}, {y_split.max().item():.4f}]")
-    print(f"  fused output range: [{y_fused.min().item():.4f}, {y_fused.max().item():.4f}]")
-    print(f"  max abs diff: {diff:.2e}")
-    assert diff < 5e-3, f"TPSwiGLU fused vs split diverged: {diff:.4e}"
-
-    print("\n[PASS] All fused projections are numerically equivalent to the split versions.")
-
-
-if __name__ == "__main__":
-    main()
+    assert diff < 5e-3, (
+        f"TPSwiGLU fused vs split diverged: max abs diff {diff:.4e} >= 5e-3"
+    )
