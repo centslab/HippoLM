@@ -4,6 +4,23 @@ The block-boundary AttnRes is a single per-device replicated
 module that lives on :class:`TPHippoModel`; it is invoked once
 per non-first block to compute the next block's input. Inside
 a block the residual is standard ``x = x + SubLayer(x)``.
+
+Pre-RMSNorm fusion (Opt-1)
+--------------------------
+When ``config.ffn_prenorm_fusion`` is True, the FFN path absorbs
+``mlp_norm`` into ``TPSwiGLU.gate_up_proj`` (a single fused
+autograd Function that does ``rms_norm(x) @ W.T`` in one call).
+This saves one full ``[T, hidden]`` save per layer (~48 MiB at
+prod shape; ~1500 MiB stacked across 32 layers).
+
+In fusion mode:
+  * ``self.mlp_norm`` is None (no separate RMSNorm module).
+  * ``self.ffn(x)`` expects ``x`` to be the pre-norm residual
+    stream (not the post-norm tensor).
+
+When ``config.ffn_prenorm_fusion`` is False (default for backward
+compat), the original ``rms_norm`` + ``gate_up_proj`` chain is
+preserved — ``mlp_norm`` is applied externally.
 """
 from __future__ import annotations
 
@@ -26,6 +43,10 @@ class TPHippoLayer(nn.Module):
     it is invoked once per non-first block to compute the next
     block's input. Inside a block the residual is standard
     ``x = x + SubLayer(x)``.
+
+    When ``config.ffn_prenorm_fusion`` is True, ``self.mlp_norm``
+    is omitted and the FFN absorbs the RMSNorm into its first
+    matmul.
     """
 
     def __init__(self, layer_idx: int, config, device=None, dtype=None) -> None:
@@ -43,7 +64,12 @@ class TPHippoLayer(nn.Module):
             return m.to(device=device)
 
         self.attn_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
-        self.mlp_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
+        self._ffn_prenorm_fusion = getattr(config, "ffn_prenorm_fusion", False)
+        if self._ffn_prenorm_fusion:
+            # mlp_norm is absorbed into gate_up_proj (see TPSwiGLU doc).
+            self.mlp_norm = None
+        else:
+            self.mlp_norm = _to(RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
         self.kda = _to(TPKDA(config, layer_idx=layer_idx))
         self.ffn = TPSwiGLU(config, device=device, dtype=dtype)
 
@@ -80,5 +106,10 @@ class TPHippoLayer(nn.Module):
             initial_state=initial_state,
         )
         x = x + kda_out
-        x = x + self.ffn(self.mlp_norm(x))
+        if self._ffn_prenorm_fusion:
+            # FFN absorbs its own RMSNorm via the fused Function in
+            # gate_up_proj. Pass the pre-norm residual stream.
+            x = x + self.ffn(x)
+        else:
+            x = x + self.ffn(self.mlp_norm(x))
         return x, final_state

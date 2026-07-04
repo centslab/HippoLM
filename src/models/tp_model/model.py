@@ -289,8 +289,16 @@ class TPHippoModel(nn.Module):
         # mlp_norm). AttnRes is no longer per-layer; the block
         # boundary version lives at the model level and is
         # already synced above.
+        # When ``ffn_prenorm_fusion`` is True, ``mlp_norm`` is
+        # ``None`` (the FFN absorbed it into ``gate_up_proj.norm_
+        # weight``), so we skip it here — the fused
+        # ``gate_up_proj`` is already handled by the sharded-sync
+        # path below because it is a column-parallel module.
         for li, src_layer in enumerate(self.layers_per_device[str(src_device)]):
-            for sub_name in ("kda", "attn_norm", "mlp_norm"):
+            sub_names = ("kda", "attn_norm")
+            if src_layer.mlp_norm is not None:
+                sub_names = sub_names + ("mlp_norm",)
+            for sub_name in sub_names:
                 src_sub = getattr(src_layer, sub_name)
                 src_params = dict(src_sub.named_parameters(recurse=True))
                 for dst_device, dst_layers in self.layers_per_device.items():

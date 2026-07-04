@@ -227,3 +227,8 @@ kda_skip_aqk_akk_saved: false
 # the 16 GB target). The optimizer updates the BF16 master weight;
 # ``repack_nvfp4_weights`` re-quantizes after each step.
 ffn_nvfp4: true
+# Pre-RMSNorm fusion into the FFN gate_up projection (Opt-1).
+# Absorbs mlp_norm into the gate_up_proj forward via the fused
+# RMSNorm+NVFP4 matmul Function. Saves ~48 MiB per layer of saved
+# activations (~1500 MiB across 32 layers).
+ffn_prenorm_fusion: true

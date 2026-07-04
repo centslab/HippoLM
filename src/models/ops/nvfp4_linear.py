@@ -107,6 +107,121 @@ class _NVFP4Matmul(torch.autograd.Function):
         return grad_x, grad_w, None, None, grad_bias, None, None
 
 
+class _RmsNormNvfp4Matmul(torch.autograd.Function):
+    """Fused RMSNorm + NVFP4 BF16-activation matmul.
+
+    Drops one full ``x`` save from the unfused chain
+    (``rms_norm`` saves x via res_out; ``_NVFP4Matmul`` saves y_norm
+    = the matmul input). The fused function saves ``x`` once and
+    *recomputes* ``y_norm`` in backward from ``(x, w_norm, rstd)``,
+    avoiding the second activation save.
+
+    Forward:  y = rms_norm(x); out = NVFP4_dequant(W) @ y.T
+    Backward: Recompute y from x; NVFP4 bwd → d_y, d_w_master;
+              RMSNorm bwd → d_x, d_w_norm.
+
+    Saved tensors: x, w_bf16, w_norm, rstd  (no y!). Compared to the
+    unfused chain (rms_norm saves x; NVFP4 saves y_norm = matmul
+    input): saves one full ``[T, hidden]`` per call (≈ 48 MiB at
+    prod shape for a single layer).
+
+    Why not also drop x for rms bwd? ``x`` is needed for the
+    RMSNorm backward dx computation. Could be eliminated only via
+    fusing the previous sublayer's residual add into this Function
+    (out of scope; would require graph traversal).
+
+    Why keep w_bf16? The dequantized BF16 weight is needed for the
+    NVFP4 backward (``grad_y = grad_out @ w_bf16``). Both paths
+    save it; net is the same.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        x: torch.Tensor,
+        w_norm: torch.Tensor,
+        w_master: torch.Tensor,
+        packed_w: torch.Tensor,
+        scales_w: torch.Tensor,
+        bias: torch.Tensor | None,
+        K_orig: int,
+        block_size: int,
+        eps: float,
+    ) -> torch.Tensor:
+        # Fused RMSNorm forward via fla Triton kernel. The kernel
+        # works on 2D [T, D] input; res_out is x (no residual case).
+        from src.models.ops._vendored.fla.modules.layernorm import layer_norm_fwd
+        x_shape = x.shape
+        x_2d = x.reshape(-1, x_shape[-1])
+        y_2d, _mean, rstd, res_out_2d = layer_norm_fwd(
+            x_2d, w_norm, None, eps=eps, is_rms_norm=True,
+        )
+        y = y_2d.reshape(x_shape)
+        # res_out is x_2d for RMSNorm w/o residual (res_out=None → return x).
+        # The fla fwd returns res_out=x when no residual — confirm:
+        assert res_out_2d is x_2d, "expected res_out=x for RMSNorm w/o residual"
+
+        # NVFP4 dequant + matmul (same path as _NVFP4Matmul).
+        w_bf16 = dequantize_nvfp4(
+            packed_w, scales_w, K_orig,
+            block_size=block_size,
+            out_dtype=y.dtype,
+        )
+        out = F.linear(y, w_bf16, bias)
+
+        # Save for backward: x (rms bwd), w_bf16 (nvfp4 dx),
+        # w_norm + rstd (rms dweight + rms dx). Do NOT save y —
+        # recompute it in backward from (x, w_norm, rstd).
+        ctx.save_for_backward(x, w_bf16, w_norm, rstd)
+        ctx.has_bias = bias is not None
+        ctx.eps = eps
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # type: ignore[override]
+        x, w_bf16, w_norm, rstd = ctx.saved_tensors
+        K = w_bf16.shape[1]
+        N = w_bf16.shape[0]
+        grad_out_2d = grad_out.reshape(-1, N)
+        x_shape = x.shape
+
+        # Recompute y_norm from saved (x, w_norm, rstd). y = x * rstd * w_norm
+        # (this is what fla layer_norm_fwd computes for RMSNorm).
+        x_2d = x.reshape(-1, K)
+        y_2d = (x_2d.to(w_norm.dtype) * rstd.unsqueeze(-1) * w_norm).to(x_2d.dtype)
+        y = y_2d.reshape(x_shape)
+
+        # NVFP4 bwd (same as _NVFP4Matmul.backward but on y instead of x).
+        # grad_y = grad_out @ W
+        # grad_w = grad_out.T @ y
+        d_y = grad_out @ w_bf16
+        d_w_master = (grad_out_2d.t().to(y_2d.dtype)) @ y_2d
+        d_bias = grad_out_2d.sum(dim=0) if ctx.has_bias else None
+
+        # RMSNorm bwd on (x, d_y, w_norm, rstd) → (d_x, d_w_norm).
+        from src.models.ops._vendored.fla.modules.layernorm import layer_norm_bwd
+        d_y_2d = d_y.reshape(-1, K)
+        d_x_2d, d_w_norm_2d, _db, _dresidual_in = layer_norm_bwd(
+            d_y_2d,
+            x_2d,
+            w_norm,
+            None,  # bias
+            None, rstd,  # mean=None, rstd
+            None,  # dresidual
+            False,  # has_residual
+            True,  # is_rms_norm
+        )
+        d_x = d_x_2d.reshape(x_shape)
+        d_w_norm = d_w_norm_2d.reshape(w_norm.shape) if d_w_norm_2d is not None else None
+
+        return (
+            d_x, d_w_norm, d_w_master,
+            None, None,  # packed_w, scales_w (no grad)
+            d_bias,
+            None, None, None,  # K_orig, block_size, eps (no grad)
+        )
+
+
 class NVFP4Linear(nn.Module):
     """``nn.Linear``-equivalent module that stores its weight in NVFP4.
 
