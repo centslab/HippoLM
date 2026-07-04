@@ -90,19 +90,11 @@ class NVFP4ColumnParallelLinear(nn.Module):
     """Column-parallel NVFP4 linear.
 
     Weight shape: ``[out_features_per_partition, in_features]`` (BF16 master).
-
-    Optional ``prenorm`` mode absorbs a pre-RMSNorm into the forward:
-    the module holds its own ``norm_weight`` parameter and the forward
-    applies ``rms_norm_linear`` (RMSNorm + the NVFP4 BF16-activation
-    matmul fused in one autograd Function). The fused path drops one
-    full ``x`` save vs the unfused ``rms_norm`` → ``_NVFP4Matmul``
-    chain (~48 MiB per layer at prod shape).
     """
 
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False,
         device=None, dtype=None, block_size: int = 16,
-        prenorm: bool = False, norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         assert block_size == 16, f"NVFP4 block_size must be 16, got {block_size}"
@@ -114,8 +106,6 @@ class NVFP4ColumnParallelLinear(nn.Module):
         self.out_features = out_features
         self.out_features_per_partition = out_features // world
         self.block_size = block_size
-        self.prenorm = prenorm
-        self.norm_eps = norm_eps
 
         self.weight = nn.Parameter(
             torch.empty(
@@ -147,16 +137,6 @@ class NVFP4ColumnParallelLinear(nn.Module):
             )
         else:
             self.register_parameter("bias", None)
-        if prenorm:
-            # Replicated RMSNorm weight — not TP-sharded (the residual
-            # stream is replicated, so the norm is too). Same dtype as
-            # the activation so fla rms_norm_linear can run without
-            # dtype juggling.
-            self.norm_weight = nn.Parameter(
-                torch.ones(in_features, device=device, dtype=dtype or torch.bfloat16)
-            )
-        else:
-            self.register_parameter("norm_weight", None)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -173,13 +153,6 @@ class NVFP4ColumnParallelLinear(nn.Module):
         self.scales.copy_(scales)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.prenorm:
-            from src.models.ops.nvfp4_linear import _RmsNormNvfp4Matmul
-            return _RmsNormNvfp4Matmul.apply(
-                x, self.norm_weight, self.weight,
-                self.packed_weight, self.scales, self.bias,
-                self.in_features, self.block_size, self.norm_eps,
-            )
         # The column-parallel case is byte-identical to the base
         # _NVFP4Matmul (no all-reduce, bias in the F.linear call),
         # so we reuse that Function rather than re-implementing.

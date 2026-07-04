@@ -342,7 +342,6 @@ def _setup_worker(
         pack_buffer_size=args.pack_buffer_size,
         kda_skip_aqk_akk_saved=getattr(args, "kda_skip_aqk_akk_saved", False),
         ffn_nvfp4=getattr(args, "ffn_nvfp4", False),
-        ffn_prenorm_fusion=getattr(args, "ffn_prenorm_fusion", False),
     )
     if rank == 0:
         logger.info(f"Model config: {config}")

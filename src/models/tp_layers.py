@@ -264,8 +264,6 @@ class ColumnParallelLinear(nn.Module):
         bias: bool = False,
         device=None,
         dtype=None,
-        prenorm: bool = False,
-        norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -275,8 +273,6 @@ class ColumnParallelLinear(nn.Module):
             f"out_features={out_features} not divisible by tp_world={self.world}"
         )
         self.out_features_per_partition = out_features // self.world
-        self.prenorm = prenorm
-        self.norm_eps = norm_eps
         # Store the full logical size so checkpoints / state_dicts look
         # like a normal Linear to a non-TP consumer.
         self.weight = nn.Parameter(
@@ -288,15 +284,6 @@ class ColumnParallelLinear(nn.Module):
             )
         else:
             self.register_parameter("bias", None)
-        if prenorm:
-            # Replicated RMSNorm weight (the residual stream is
-            # replicated, so the norm is too). Held here so the fused
-            # forward is a single Function call.
-            self.norm_weight = nn.Parameter(
-                torch.ones(in_features, device=device, dtype=dtype)
-            )
-        else:
-            self.register_parameter("norm_weight", None)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -306,15 +293,7 @@ class ColumnParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., in_features]; weight: [out/world, in]
-        if self.prenorm:
-            from src.models.ops._vendored.fla.modules.layernorm import rms_norm_linear
-            # rms_norm_linear does F.linear(y, linear_weight, linear_bias)
-            # internally — the local weight shard produces the local
-            # output shard, same as the unfused path.
-            return rms_norm_linear(
-                x, self.norm_weight, None, self.weight, self.bias,
-                eps=self.norm_eps, is_rms_norm=True,
-            )
+        # F.linear computes x @ weight.T -> [..., out/world]
         return F.linear(x, self.weight, self.bias)
 
     def extra_repr(self) -> str:
@@ -322,8 +301,7 @@ class ColumnParallelLinear(nn.Module):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"out_features_per_partition={self.out_features_per_partition}, "
-            f"tp_world={self.world}, bias={self.bias is not None}, "
-            f"prenorm={self.prenorm}"
+            f"tp_world={self.world}, bias={self.bias is not None}"
         )
 
 

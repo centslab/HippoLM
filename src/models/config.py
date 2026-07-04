@@ -82,14 +82,6 @@ class HippoConfig:
     # Default False (legacy BF16 path).
     ffn_nvfp4: bool = False
 
-    # Pre-RMSNorm fusion into the FFN gate_up projection (Opt-1).
-    # When True, the FFN absorbs the previous ``mlp_norm`` into
-    # ``gate_up_proj`` via a fused autograd Function. Saves one full
-    # ``[T, hidden]`` activation save per layer (~48 MiB at prod
-    # shape; ~1500 MiB stacked across 32 layers). Default False
-    # (legacy separate-RMSNorm path, for backward compat).
-    ffn_prenorm_fusion: bool = False
-
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
             f"num_layers ({self.num_layers}) must be divisible by num_blocks ({self.num_blocks})"
