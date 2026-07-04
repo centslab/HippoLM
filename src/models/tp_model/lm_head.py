@@ -40,56 +40,12 @@ class _TiedFusedLCEFunction(torch.autograd.Function):
 
     This wrapper:
       - forward: calls the raw ``fused_linear_cross_entropy_forward``
-        with the narrow view of the embed as the weight, then
-        **immediately** ``add_``'s the resulting ``dw`` into
-        ``embed_weight.grad[start:start+vp]``. Only ``dx`` is
-        saved for backward (NOT ``dw``, NOT ``embed_weight``).
-      - backward: scales ``dx`` by ``do`` via the fla backward
-        kernel and returns ``dx`` as the gradient w.r.t. the
-        hidden state. ``embed_weight.grad`` already contains
-        this rank's contribution.
-
-    Opt-3 (FLCE dw chunking)
-    ------------------------
-    At prod config (V=248320, H=1536, BF16), the old code saved
-    ``(dx, dw, embed_weight)`` in ``ctx.save_for_backward``,
-    costing:
-
-      * dx:           [N, H] BF16 =  16384 × 1536 × 2 =   48 MiB
-      * dw:           [V, H] BF16 = 248320 × 1536 × 2 =  727 MiB
-      * embed_weight: [V, H] BF16 = same               =  727 MiB
-      * TOTAL OLD:                                       1502 MiB
-
-    After Opt-3, only ``dx`` is saved:
-
-      * dx:                                              48 MiB
-      * SAVINGS:                                        1454 MiB
-
-    The contract: ``do == 1.0`` is the standard PyTorch
-    seed gradient for a scalar loss output, so the ``dw``
-    that we ``add_`` during forward does NOT need do-scaling.
-    The fla kernel confirms this with its own skip-mul:
-    ``if torch.ne(do, torch.tensor(1.0, ...))``. We rely on
-    this contract — if a caller ever seeds ``do != 1.0`` here
-    the gradient will be off by that factor (and we should add
-    a do-scaling pass before the ``add_``).
-
-    First-call grad allocation
-    --------------------------
-    PyTorch's ``AccumulateGrad`` for the ``nn.Embedding`` lookup
-    path runs during ``backward()`` and writes to
-    ``embed_weight.grad`` via ``+=``. If ``embed_weight.grad``
-    is None, AccumulateGrad allocates it. Our forward's ``add_``
-    runs BEFORE backward, so we may need to allocate ourselves
-    on the very first call within an optimizer step (before
-    any natural-path grad has been written). The pattern:
-
-      if embed_weight.grad is None:
-          embed_weight.grad = torch.zeros_like(embed_weight)
-      embed_weight.grad[start:start+vp].add_(dw)
-
-    Subsequent ``add_``'s (from subsequent microbatches'
-    forward calls) accumulate on top.
+        with the narrow view of the embed as the weight; saves
+        ``(dx, dw, embed_weight, start, vp)`` for backward.
+      - backward: scales ``dx`` and ``dw`` by ``do`` via the fla
+        backward kernel, then ``add_``'s ``dw`` into
+        ``embed_weight.grad[start:start+vp]`` and returns ``dx``
+        as the gradient w.r.t. the hidden state.
 
     The full ``[B, T, V // world]`` sharded logits tensor is
     never materialised, and the per-chunk logits are written
@@ -140,58 +96,51 @@ class _TiedFusedLCEFunction(torch.autograd.Function):
                 reduction="mean",
             )
 
-        # ``dw`` comes out of the kernel in the embed's dtype (BF16
-        # in our setup); see the comment on line ~433 of
-        # ``fused_linear_cross_entropy.py``. The ``add_`` below is
-        # in-place into the rank's slice of ``embed_weight.grad``.
-        #
-        # First-call allocation: ``embed_weight.grad`` may be None
-        # if no natural-path grad has been written yet this step
-        # (e.g. we're called before any ``nn.Embedding`` lookup
-        # backward has fired). Standard pattern: zero-init then
-        # ``add_``; subsequent calls in the same step will ``add_``
-        # onto this allocation.
-        if dw is not None:
-            if embed_weight.grad is None:
-                embed_weight.grad = torch.zeros_like(embed_weight)
-            embed_weight.grad[start:start + vp].add_(dw)
+        # ``dw`` comes out as FP32 from the kernel (accumulated in
+        # FP32 inside the chunked loop for precision); cast to the
+        # embed weight's dtype (FP16 in our setup) so the add into
+        # ``embed_weight.grad`` doesn't need a type-promoted copy.
+        if dw is not None and dw.dtype != embed_weight.dtype:
+            dw = dw.to(embed_weight.dtype)
 
-        # ``dx`` stays 2D ``[N, H]`` in the saved tensors because
-        # the fla ``fused_linear_cross_entropy_backward`` kernel
-        # does ``N, H = dx.shape`` — passing a 3D dx (e.g.
-        # ``[B, T, H]``) blows up with "too many values to unpack
-        # (expected 2)". We reshape dx back to ``hidden``'s
-        # original shape in :meth:`backward` after the do-scaling
-        # kernel is done with it.
-        #
-        # Opt-3: ONLY dx is saved. ``dw`` and ``embed_weight``
-        # are no longer in saved_tensors — the dw has been
-        # accumulated directly into ``embed_weight.grad`` above
-        # (saving 1454 MiB at prod), and embed_weight is not
-        # needed in backward (we don't need to scatter anything).
-        ctx.save_for_backward(dx)
+        # ``dx`` and ``dw`` stay 2D ``[N, H]`` / ``[V/world, H]``
+        # in the saved tensors because the fla
+        # ``fused_linear_cross_entropy_backward`` kernel does
+        # ``N, H = dx.shape`` and ``V, H = dw.shape`` — passing a
+        # 3D dx (e.g. ``[B, T, H]``) blows up with "too many
+        # values to unpack (expected 2)". We reshape dx back to
+        # ``hidden``'s original shape in :meth:`backward` after
+        # the do-scaling kernel is done with it.
+        ctx.save_for_backward(dx, dw, embed_weight)
+        ctx.start = start
+        ctx.vp = vp
         ctx.hidden_shape = hidden.shape
         return loss
 
     @staticmethod
     def backward(ctx, do):
-        (dx,) = ctx.saved_tensors
+        dx, dw, embed_weight = ctx.saved_tensors
 
-        # Scale dx by do via the fla backward kernel. dw=None
-        # because we don't have (or need) a dw tensor anymore.
-        # The kernel skips the multiplication if do is exactly
-        # 1.0 (the standard case for a scalar loss seed).
-        dx, _, _ = fused_linear_cross_entropy_backward(do, dx, None, None)
+        # Scale dx and dw by do via the fla backward kernel. Both
+        # must be 2D here (see comment in forward). The kernel
+        # skips the multiplication if do is exactly 1.0 (the
+        # common case for a scalar loss seed).
+        dx, dw, _ = fused_linear_cross_entropy_backward(do, dx, dw, None)
 
         # Reshape dx back to ``hidden``'s original shape so the
         # caller (autograd) sees the right gradient for the
         # hidden state.
         dx = dx.view(ctx.hidden_shape)
 
-        # No dw scatter: it was already accumulated into
-        # ``embed_weight.grad`` during forward. The natural-path
-        # ``nn.Embedding`` AccumulateGrad will add its own grad
-        # during backward (or use the one we allocated).
+        # Scatter the (now do-scaled) dw back into the parent
+        # embedding's gradient. ``embed_weight.grad`` may not
+        # exist yet (PyTorch lazily allocates it on first .grad
+        # access); standard pattern is to alloc and assign.
+        if dw is not None:
+            if embed_weight.grad is None:
+                embed_weight.grad = torch.zeros_like(embed_weight)
+            embed_weight.grad[ctx.start:ctx.start + ctx.vp].add_(dw)
+
         return dx, None, None, None, None, None, None, None
 
 
