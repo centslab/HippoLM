@@ -95,6 +95,7 @@ class NVFP4ColumnParallelLinear(nn.Module):
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False,
         device=None, dtype=None, block_size: int = 16,
+        bf16_only: bool = False,
     ) -> None:
         super().__init__()
         assert block_size == 16, f"NVFP4 block_size must be 16, got {block_size}"
@@ -106,6 +107,7 @@ class NVFP4ColumnParallelLinear(nn.Module):
         self.out_features = out_features
         self.out_features_per_partition = out_features // world
         self.block_size = block_size
+        self.bf16_only = bf16_only
 
         self.weight = nn.Parameter(
             torch.empty(
@@ -114,20 +116,21 @@ class NVFP4ColumnParallelLinear(nn.Module):
             )
         )
         K_padded = in_features + (-in_features % block_size)
-        self.register_buffer(
-            "packed_weight",
-            torch.zeros(
-                self.out_features_per_partition, K_padded // 2,
-                device=device, dtype=torch.uint8,
-            ),
-        )
-        self.register_buffer(
-            "scales",
-            torch.zeros(
-                self.out_features_per_partition, K_padded // block_size,
-                device=device, dtype=torch.float8_e4m3fn,
-            ),
-        )
+        if not bf16_only:
+            self.register_buffer(
+                "packed_weight",
+                torch.zeros(
+                    self.out_features_per_partition, K_padded // 2,
+                    device=device, dtype=torch.uint8,
+                ),
+            )
+            self.register_buffer(
+                "scales",
+                torch.zeros(
+                    self.out_features_per_partition, K_padded // block_size,
+                    device=device, dtype=torch.float8_e4m3fn,
+                ),
+            )
         if bias:
             self.bias = nn.Parameter(
                 torch.empty(
@@ -143,16 +146,23 @@ class NVFP4ColumnParallelLinear(nn.Module):
         nn.init.xavier_uniform_(self.weight)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-        self.repack_weights()
+        if not self.bf16_only:
+            self.repack_weights()
 
     @torch.no_grad()
     def repack_weights(self) -> None:
+        if self.bf16_only:
+            return
         from src.models.ops.nvfp4 import quantize_nvfp4
         packed, scales = quantize_nvfp4(self.weight.data, block_size=self.block_size)
         self.packed_weight.copy_(packed)
         self.scales.copy_(scales)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bf16_only:
+            # Plain BF16 GEMM (column-parallel: no comm). Matches
+            # ColumnParallelLinear's forward exactly.
+            return F.linear(x, self.weight, self.bias)
         # The column-parallel case is byte-identical to the base
         # _NVFP4Matmul (no all-reduce, bias in the F.linear call),
         # so we reuse that Function rather than re-implementing.
@@ -172,6 +182,7 @@ class NVFP4RowParallelLinear(nn.Module):
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False,
         device=None, dtype=None, block_size: int = 16,
+        bf16_only: bool = False,
     ) -> None:
         super().__init__()
         assert block_size == 16, f"NVFP4 block_size must be 16, got {block_size}"
@@ -183,6 +194,7 @@ class NVFP4RowParallelLinear(nn.Module):
         self.out_features = out_features
         self.in_features_per_partition = in_features // world
         self.block_size = block_size
+        self.bf16_only = bf16_only
 
         self.weight = nn.Parameter(
             torch.empty(
@@ -191,20 +203,21 @@ class NVFP4RowParallelLinear(nn.Module):
             )
         )
         K_padded = self.in_features_per_partition + (-self.in_features_per_partition % block_size)
-        self.register_buffer(
-            "packed_weight",
-            torch.zeros(
-                out_features, K_padded // 2,
-                device=device, dtype=torch.uint8,
-            ),
-        )
-        self.register_buffer(
-            "scales",
-            torch.zeros(
-                out_features, K_padded // block_size,
-                device=device, dtype=torch.float8_e4m3fn,
-            ),
-        )
+        if not bf16_only:
+            self.register_buffer(
+                "packed_weight",
+                torch.zeros(
+                    out_features, K_padded // 2,
+                    device=device, dtype=torch.uint8,
+                ),
+            )
+            self.register_buffer(
+                "scales",
+                torch.zeros(
+                    out_features, K_padded // block_size,
+                    device=device, dtype=torch.float8_e4m3fn,
+                ),
+            )
         if bias:
             self.bias = nn.Parameter(
                 torch.empty(out_features, device=device, dtype=dtype or torch.bfloat16)
@@ -217,16 +230,26 @@ class NVFP4RowParallelLinear(nn.Module):
         nn.init.xavier_uniform_(self.weight)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-        self.repack_weights()
+        if not self.bf16_only:
+            self.repack_weights()
 
     @torch.no_grad()
     def repack_weights(self) -> None:
+        if self.bf16_only:
+            return
         from src.models.ops.nvfp4 import quantize_nvfp4
         packed, scales = quantize_nvfp4(self.weight.data, block_size=self.block_size)
         self.packed_weight.copy_(packed)
         self.scales.copy_(scales)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bf16_only:
+            # Plain BF16 GEMM (row-parallel: all-reduce on output).
+            # Matches RowParallelLinear's forward exactly.
+            out = F.linear(x, self.weight, None)  # bias added after all-reduce
+            if self.bias is not None and _TP_RANK == 0:
+                out = out + self.bias
+            return tp_all_reduce(out)
         return _NVFP4RowMatmul.apply(
             x, self.weight, self.packed_weight, self.scales, self.bias,
             self.in_features_per_partition, self.block_size,

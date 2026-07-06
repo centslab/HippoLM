@@ -218,12 +218,18 @@ empty_cache_between_mb: true
 # of saved-tensor memory per KDA layer (~1 GB at 30 layers).
 kda_skip_aqk_akk_saved: false
 
-# W4A16 NVFP4 FFN (research path). When True, every FFN linear
-# stores its weight in NVFP4 packed format (E2M1 + FP8-e4m3fn 1x16
-# microblock scales). Activation stays in BF16; the matmul itself
-# runs in BF16 (dequantize-on-fwd) since PyTorch 2.9.1's
-# ``torch._scaled_mm`` NVFP4 path requires both A and B to be FP4.
-# Memory saving: ~3.5x on FFN weights (the dominant FFN cost on
-# the 16 GB target). The optimizer updates the BF16 master weight;
-# ``repack_nvfp4_weights`` re-quantizes after each step.
-ffn_nvfp4: true
+# W4A16 NVFP4 FFN (research path, disabled as of 2026-07-06 — opt-5/2
+# VRAM initiative). When True, every FFN linear stores its weight in
+# NVFP4 packed format (E2M1 + FP8-e4m3fn 1x16 microblock scales).
+# Activation stays in BF16; the matmul itself runs in BF16
+# (dequantize-on-fwd) since PyTorch 2.9.1's ``torch._scaled_mm`` NVFP4
+# path requires both A and B to be FP4.
+#
+# 2026-07-06: flipped to False — only the BF16 master is held on GPU,
+# saving the per-layer packed_weight (uint8) + scales (fp8_e4m3fn)
+# buffers. At TP=1 / 32 layers / 3 NVFP4 modules per FFN, that drop
+# is ~324 MiB off the 5060 Ti 16G peak. The matmul becomes plain
+# ``F.linear(x, weight, bias)`` (BF16 GEMM, no dequant round-trip).
+# Training loss ratio BF16 / NVFP4 was 1.00x at 100 steps per
+# ``project_w4a16_nvfp4.md``, so this is a clean VRAM win.
+ffn_nvfp4: false

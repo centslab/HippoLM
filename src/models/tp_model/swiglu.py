@@ -32,7 +32,17 @@ class TPSwiGLU(nn.Module):
 
     def __init__(self, config, device=None, dtype=None) -> None:
         super().__init__()
-        if getattr(config, "ffn_nvfp4", False):
+        # ``ffn_nvfp4_bf16_only`` toggles the W4A16 FFN linears to a
+        # plain-BF16 mode: the BF16 master is the only GPU storage, no
+        # ``packed_weight`` / ``scales`` buffers are allocated. Saves
+        # the per-layer packed/scales VRAM at the cost of losing the
+        # FP4 round-trip in the forward (the matmul is plain BF16 GEMM).
+        # Useful on small-VRAM boxes where the packed buffer footprint
+        # outweighs the dequant-on-fwd benefit.
+        if (
+            getattr(config, "ffn_nvfp4", False)
+            and not getattr(config, "ffn_nvfp4_bf16_only", False)
+        ):
             ColCls, RowCls = NVFP4ColumnParallelLinear, NVFP4RowParallelLinear
         else:
             ColCls, RowCls = ColumnParallelLinear, RowParallelLinear

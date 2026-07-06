@@ -340,7 +340,9 @@ class TPHippoModel(nn.Module):
                 layer_kda_states[i] if layer_kda_states is not None
                 else None
             )
-            x, s = layer(x, cu_seqlens=cu_seqlens, initial_state=init)
+            x, s = layer(
+                x, cu_seqlens=cu_seqlens, initial_state=init,
+            )
             if return_states:
                 collected.append(s)
         if return_states:

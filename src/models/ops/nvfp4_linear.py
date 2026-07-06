@@ -127,6 +127,7 @@ class NVFP4Linear(nn.Module):
         device=None,
         dtype=None,
         block_size: int = 16,
+        bf16_only: bool = False,
     ) -> None:
         super().__init__()
         assert block_size == 16, (
@@ -135,22 +136,26 @@ class NVFP4Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = block_size
+        self.bf16_only = bf16_only
 
         # BF16 master weight — the parameter the optimizer updates.
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype or torch.bfloat16)
         )
         # NVFP4-packed view + scales (buffers, not parameters; recomputed
-        # by ``repack_weights`` after each optimizer step).
+        # by ``repack_weights`` after each optimizer step). Skipped when
+        # ``bf16_only=True`` (the BF16 master IS the storage; forward
+        # uses ``F.linear`` directly and no FP4 round-trip happens).
         K_padded = in_features + (-in_features % block_size)
-        self.register_buffer(
-            "packed_weight",
-            torch.zeros(out_features, K_padded // 2, device=device, dtype=torch.uint8),
-        )
-        self.register_buffer(
-            "scales",
-            torch.zeros(out_features, K_padded // block_size, device=device, dtype=torch.float8_e4m3fn),
-        )
+        if not bf16_only:
+            self.register_buffer(
+                "packed_weight",
+                torch.zeros(out_features, K_padded // 2, device=device, dtype=torch.uint8),
+            )
+            self.register_buffer(
+                "scales",
+                torch.zeros(out_features, K_padded // block_size, device=device, dtype=torch.float8_e4m3fn),
+            )
 
         if bias:
             self.bias = nn.Parameter(
@@ -168,7 +173,8 @@ class NVFP4Linear(nn.Module):
         # Populate the FP4 buffers from the freshly-initialized BF16
         # master so the layer is fully ready on construction — no
         # lazy-repack branch in the forward.
-        self.repack_weights()
+        if not self.bf16_only:
+            self.repack_weights()
 
     @torch.no_grad()
     def repack_weights(self) -> None:
@@ -177,13 +183,28 @@ class NVFP4Linear(nn.Module):
         Call AFTER each optimizer step (NOT after each forward). This
         keeps the packed buffers in sync with the (now-updated) BF16
         master, so the next forward sees the latest quantized weights.
+
+        No-op in ``bf16_only`` mode (there are no NVFP4 buffers to
+        repack). Callers in
+        :func:`src.training.loop.repack_nvfp4_weights` and elsewhere
+        treat ``bf16_only`` modules uniformly; this no-op keeps the
+        semantics identical from the caller's perspective.
         """
+        if self.bf16_only:
+            return
         from src.models.ops.nvfp4 import quantize_nvfp4
         packed, scales = quantize_nvfp4(self.weight.data, block_size=self.block_size)
         self.packed_weight.copy_(packed)
         self.scales.copy_(scales)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bf16_only:
+            # Plain BF16 GEMM. The BF16 master is the source of truth
+            # for the optimizer — no FP4 round-trip needed. Identical
+            # numerics to a plain ``nn.Linear`` with the same weight;
+            # the STE-on-quantize-noise the dequant path provided is
+            # no longer relevant because there is no quantize noise.
+            return F.linear(x, self.weight, self.bias)
         return _NVFP4Matmul.apply(
             x, self.weight,
             self.packed_weight, self.scales,
@@ -192,10 +213,13 @@ class NVFP4Linear(nn.Module):
         )
 
     def extra_repr(self) -> str:
+        storage = (
+            "NVFP4(E2M1+FP8-e4m3fn 1x16)" if not self.bf16_only else "BF16(bf16_only)"
+        )
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, block_size={self.block_size}, "
-            f"weight_storage=NVFP4(E2M1+FP8-e4m3fn 1x16)"
+            f"weight_storage={storage}"
         )
 
 

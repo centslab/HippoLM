@@ -1,0 +1,16 @@
+# VRAM probe — measures peak VRAM with a moderately sized model.
+# Used to compare ffn_nvfp4=True vs False on the same shape.
+extends: ../base.yml
+use_dummy_data: true
+max_steps: 2
+gradient_accumulation_steps: 1
+batch_size: 2
+seq_len: 4096
+num_layers: 8
+num_blocks: 4
+intermediate_size: 1024
+output_dir: output/nvfp4_vram_probe
+log_interval: 1
+checkpoint_interval: 0
+lr_warmup_steps: 0
+lr_decay_steps: 0

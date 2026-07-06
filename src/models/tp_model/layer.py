@@ -52,6 +52,7 @@ class TPHippoLayer(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         initial_state: torch.Tensor | None = None,
+        save_residual: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Standard residual transformer layer on the local device.
 
@@ -68,6 +69,17 @@ class TPHippoLayer(nn.Module):
                 entry of ``None`` at the model level) means
                 "start from zeros".
 
+        ``save_residual`` is accepted for API stability (some
+        callers — e.g. the block-level ``_block_forward`` — pass
+        ``False`` historically) but is currently unused: the
+        standard ``x = x + sub`` always allocates a fresh sum
+        tensor. See "opt-5/1 RMSNorm/residual no-op" in the
+        project memory for the empirical / theoretical analysis
+        showing this is a true zero-savings no-op (the saved
+        ``x`` in the rmsnorm Function is a reference already
+        held by the residual chain's autograd history; removing
+        the save frees no storage in this project's setup).
+
         Returns:
             ``(output, final_state)``: ``output`` is
             ``[B, T, hidden_size]`` after KDA and FFN with
@@ -75,6 +87,7 @@ class TPHippoLayer(nn.Module):
             the KDA state at the last token, to be passed as
             ``initial_state`` to the next chunk's layer call.
         """
+        del save_residual  # empirically a zero-savings no-op — see memory note
         kda_out, final_state = self.kda(
             self.attn_norm(x), cu_seqlens=cu_seqlens,
             initial_state=initial_state,
