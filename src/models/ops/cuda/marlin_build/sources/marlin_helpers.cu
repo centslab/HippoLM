@@ -143,8 +143,8 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
 }
 
 MarlinFuncPtr get_marlin_kernel(
-    const marlin::vllm::ScalarType a_type, const marlin::vllm::ScalarType b_type,
-    const marlin::vllm::ScalarType c_type, const marlin::vllm::ScalarType s_type,
+    const vllm::ScalarType a_type, const vllm::ScalarType b_type,
+    const vllm::ScalarType c_type, const vllm::ScalarType s_type,
     int thread_m_blocks, int thread_n_blocks, int thread_k_blocks,
     bool m_block_size_8, bool has_act_order, bool has_zp, int group_blocks,
     int threads, bool is_zp_float, int stages) {
@@ -157,8 +157,8 @@ MarlinFuncPtr get_marlin_kernel(
 }
 
 exec_config_t determine_exec_config(
-    const marlin::vllm::ScalarType& a_type, const marlin::vllm::ScalarType& b_type,
-    const marlin::vllm::ScalarType& c_type, const marlin::vllm::ScalarType& s_type, int prob_m,
+    const vllm::ScalarType& a_type, const vllm::ScalarType& b_type,
+    const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
     int prob_n, int prob_k, int thread_m_blocks, bool m_block_size_8,
     int num_bits, int group_size, bool has_act_order, bool is_k_full,
     bool has_zp, bool is_zp_float, int is_a_8bit, int stages,

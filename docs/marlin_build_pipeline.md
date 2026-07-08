@@ -201,19 +201,29 @@ The vendored sources declare `namespace vllm { ... ScalarType,
 kFloat16, kFE4M3fn, ... }`. To avoid leaking any global `vllm::`
 symbol from the standalone `.so`, the namespace is wrapped as
 `namespace marlin { namespace vllm { ... } }` in
-`core/scalar_type.hpp`. All `vllm::ScalarType`,
-`vllm::kFloat16`, etc. references are rewritten to
-`marlin::vllm::ScalarType` / `marlin::vllm::kFloat16` throughout
-the vendored sources (~10,951 reference sites — the vast majority
-in the generated `kernel_selector.h` dispatch chain).
+`core/scalar_type.hpp`. Crucially, the **`vllm::X` references
+themselves are NOT rewritten** — they resolve correctly via
+ordinary namespace lookup because all the references appear inside
+`namespace marlin { ... }` blocks (the wrappers, the sm_80/sm_89
+instantiation files, and the template parameter lists of the
+Marlin<> kernel inside `marlin_template.h`):
 
-This is mechanical-edit minimal: option (a) would rename the
-namespace itself to `marlin_kernels::` (doubles the edit count,
-forces the same mangle work, no semantic gain); option (b) keeps
-the namespace but introduces `using` aliases (creates a parallel
-namespace tree). Option (c) — what we ship — wraps under
-`marlin::vllm::` and keeps the references one-character shorter
-than full rename.
+```cpp
+namespace marlin {
+  // marlin::vllm::ScalarTypeId is found via ordinary lookup:
+  // first search `marlin::vllm::ScalarTypeId`, fall back to `::vllm::`.
+  // (The fallback no longer matches because the global `::vllm` was
+  //  removed by the wrap; the search finds `::marlin::vllm::ScalarTypeId`
+  //  via the current-scope lookup.)
+  template <const vllm::ScalarTypeId a_type_id, ...>
+  __global__ void Marlin(...);
+}
+```
+
+This is the minimal-edit option: only `core/scalar_type.hpp` is
+touched. The mangled C++ symbol shifts because the underlying
+namespace nesting changes (`vllm::ScalarType` → `marlin::vllm::ScalarType`),
+but the source-level references stay as `vllm::ScalarType`.
 
 **Mangled symbol change:** `vllm::ScalarType` → `marlin::vllm::ScalarType`
 shifts the Itanium ABI prefix from `_ZN4vllm10ScalarType` to
@@ -229,7 +239,20 @@ The Python loader (`src/models/ops/nvfp4_marlin.py:_resolve_lib`)
 holds the mangle as `FN_NAME`; recompute after any further
 namespace edit. The maintainer contract: when re-extracting from
 upstream vLLM, the extractor must preserve the `namespace marlin
-{ namespace vllm { ... } }` wrapper.
+{ namespace vllm { ... } }` wrapper in `core/scalar_type.hpp`.
+
+Why this option was chosen over alternatives:
+
+- **Option (a)** — full rename to `marlin_kernels::ScalarType`
+  would mean touching all ~10,951 reference sites plus the mangle.
+  No semantic gain over option (c).
+- **Option (b)** — `namespace vllm { using namespace marlin::vllm; }`
+  creates a parallel `::vllm` namespace at file scope, which is the
+  exact thing we wanted to avoid (a global `vllm::` symbol leaks
+  out of the .so).
+- **Option (c)** — what we ship. Only `core/scalar_type.hpp`
+  changes; the rest of the vendored sources compile unmodified
+  thanks to standard namespace lookup.
 
 ### Patches NOT applied (the "kernel-only" extraction)
 

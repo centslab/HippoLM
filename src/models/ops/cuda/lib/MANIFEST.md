@@ -102,16 +102,21 @@ The vendored vllm Marlin FP4 sources are derivative of upstream vllm
 under Apache 2.0; this commit adds attribution (`LICENSE-APACHE-2.0`
 + `NOTICE` under `marlin_build/sources/`) and wraps the
 `namespace vllm { ... }` declaration in `core/scalar_type.hpp` as
-`namespace marlin { namespace vllm { ... } }`. All `vllm::X`
-references across the vendored sources (~10,951 occurrences,
-dominated by the generated `kernel_selector.h` dispatch chain) are
-rewritten to `marlin::vllm::X`. This keeps the standalone .so from
+`namespace marlin { namespace vllm { ... } }`. The `vllm::X`
+references throughout the rest of the vendored sources are NOT
+rewritten — they resolve correctly via ordinary namespace lookup
+because they appear inside `namespace marlin { ... }` blocks (the
+wrappers, the sm_80/sm_89 instantiation files, and the template
+parameter lists of `Marlin<>`). This keeps the standalone .so from
 leaking any global `vllm::` symbol while staying semantically
-identical to vllm's original layout.
+identical to vllm's original layout, with only one file modified
+(`core/scalar_type.hpp`).
 
 Consequence: the C++ ABI mangle for `vllm::ScalarType` shifts
-from `_ZN4vllm10ScalarType` to `_ZN6marlin4vllm10ScalarType`.
-The full `marlin::marlin_mm` mangle in
+from `_ZN4vllm10ScalarType` to `_ZN6marlin4vllm10ScalarType`
+(because the underlying namespace nesting changed even though the
+source-level reference is still `vllm::ScalarType`). The full
+`marlin::marlin_mm` mangle in
 `src/models/ops/nvfp4_marlin.py:182` (`FN_NAME`) is recomputed and
 updated.
 

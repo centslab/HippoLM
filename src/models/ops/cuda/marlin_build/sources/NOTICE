@@ -65,17 +65,23 @@ CUDA 13.0; none change the kernel semantics.
    ``Tensor::mutable_data_ptr``, ``TORCH_BOX``) which torch 2.12.0+cu130
    does provide, but we vendor only the minimal subset.
 
-4. C++ namespace wrap — every ``namespace vllm { ... }`` declaration
-   in the vendored headers is wrapped as
-   ``namespace marlin { namespace vllm { ... } }``. References to
-   ``vllm::ScalarType``, ``vllm::kFloat16``, etc. are rewritten to
-   ``marlin::vllm::ScalarType`` / ``marlin::vllm::kFloat16`` throughout.
+4. C++ namespace wrap — the ``namespace vllm { ... }`` declaration
+   in ``core/scalar_type.hpp`` is wrapped as
+   ``namespace marlin { namespace vllm { ... } }``. The
+   ``vllm::ScalarType`` / ``vllm::kFloat16`` / etc. references in
+   the other vendored sources are NOT rewritten — they resolve
+   correctly via ordinary namespace lookup because they appear
+   inside ``namespace marlin { ... }`` blocks (the wrappers, the
+   sm_80/sm_89 instantiation files, and the template parameter
+   lists of the ``Marlin<>`` kernel inside ``marlin_template.h``).
    This avoids leaking any global ``vllm::`` symbol from the
    standalone .so while keeping the mechanical edits minimal
-   (no semantic rename). The mangled C++ symbol for
-   ``marlin::marlin_mm`` therefore becomes
-   ``_ZN6marlin9marlin_mmE...RKN6marlin4vllm10ScalarTypeE...``
-   (cf. vLLM's original ``_ZN4vllm10ScalarTypeE``).
+   (only one file modified). The mangled C++ symbol for
+   ``marlin::vllm::ScalarType`` therefore becomes
+   ``_ZN6marlin4vllm10ScalarType`` (cf. vLLM's original
+   ``_ZN4vllm10ScalarType``), and the full ``marlin::marlin_mm``
+   mangle becomes
+   ``_ZN6marlin9marlin_mmE...RKN6marlin4vllm10ScalarTypeE...``.
 
 5. STABLE_TORCH_LIBRARY_IMPL removed — the standalone wrappers
    ``marlin_kernel_only.cu`` and ``marlin_repack_adapter.cu`` do not

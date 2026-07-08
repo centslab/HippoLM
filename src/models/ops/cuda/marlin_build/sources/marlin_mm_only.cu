@@ -113,9 +113,9 @@ __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                void* a_s, void* b_s, void* g_s, void* zp, void* g_idx,
                void* perm, void* a_tmp, int prob_m, int prob_n, int prob_k,
-               int lda, void* workspace, marlin::vllm::ScalarType const& a_type,
-               marlin::vllm::ScalarType const& b_type, marlin::vllm::ScalarType const& c_type,
-               marlin::vllm::ScalarType const& s_type, bool has_bias,
+               int lda, void* workspace, vllm::ScalarType const& a_type,
+               vllm::ScalarType const& b_type, vllm::ScalarType const& c_type,
+               vllm::ScalarType const& s_type, bool has_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k_init,
                int thread_n_init, int sms, bool use_atomic_add,
@@ -194,10 +194,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int stages = 4;
   if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
-    STD_TORCH_CHECK(a_type == marlin::vllm::kFloat16 || a_type == marlin::vllm::kS8,
+    STD_TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
                     "Turing only support FP16 or INT8 activation.");
   }
-  if (a_type == marlin::vllm::kFE4M3fn) {
+  if (a_type == vllm::kFE4M3fn) {
     STD_TORCH_CHECK(major_capability * 10 + minor_capability >= 89,
                     "FP8 only support Ada Lovelace or newer GPUs.");
     STD_TORCH_CHECK(
