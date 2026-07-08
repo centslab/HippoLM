@@ -277,16 +277,11 @@ src/models/ops/cuda/lib/marlin_fp4_repack_sm{NN}.so        # SASS for SM {NN}
 ```
 
 For the PTX fallback (universal `.so` carrying PTX for sm_80/89/120):
-
-```bash
-python scripts/build_marlin.py --ptx  # emits marlin_fp4_{kind}_ptx.so
-```
-
-The loader (`src/models/ops/nvfp4_marlin.py:_resolve_so`) does
-SASS-first lookup, then PTX, then the legacy
-`marlin_fp4_{kind}.so` (sm_120 hard-coded, pre-rename). If none of
-these is present, you get a `FileNotFoundError` that points at
-this script.
+**not yet implemented** — the `--ptx` flag is on the build script
+roadmap. Today the loader (`src/models/ops/nvfp4_marlin.py:_resolve_so`)
+does SASS-first lookup, then the legacy `marlin_fp4_{kind}.so`
+(sm_120 hard-coded, pre-rename). If none of these is present, you
+get a `FileNotFoundError` that points at this script.
 
 ## Build cost
 

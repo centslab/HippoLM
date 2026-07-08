@@ -18,8 +18,8 @@ Why a custom build (and not JIT)
 --------------------------------
 vLLM's ``gptq_marlin_repack.cu`` (and several siblings) use the
 ``torch::stable::Tensor`` API at a level that requires a newer Stable ABI
-than torch 2.9.1 ships with. JIT via ``torch.utils.cpp_extension.load``
-hits errors like::
+than the precompiled torch 2.12.0+cu130 ships with. JIT via
+``torch.utils.cpp_extension.load`` hits errors like::
 
     error: class "torch::stable::Tensor" has no member "const_data_ptr"
     error: identifier "TORCH_BOX" is undefined
@@ -30,14 +30,18 @@ text-extracting just the kernel + repack functions (no
 ``STABLE_TORCH_LIBRARY_IMPL`` registration, no ``torch::stable::Tensor``
 plumbing) and exposing them as ``extern "C"`` symbols. The vendored vllm
 headers have two small patches (see :file:`docs/marlin_build_pipeline.md`
-section *Patches applied*).
+section *Patches applied*) and a namespace wrap (see *Namespace wrap*).
 
 Why per-arch
 ------------
-The .so files are gitignored (``*.so`` rule in the repo root). Each arch
-needs its own SASS — the sm_120 SASS the 5060 Ti ships with is not
-optimal on V100 (sm_70), A100 (sm_80), RTX 3090 (sm_86), RTX 4090
-(sm_89), or RTX 5090 (sm_120). Run this script once per machine.
+The per-arch .so files are gitignored (``*.so`` rule in the repo root,
+with an explicit whitelist for ``src/models/ops/cuda/lib/`` so a
+specific arch's .so can be tracked). Each arch needs its own SASS —
+the sm_120 SASS the 5060 Ti ships with is not optimal on A100
+(sm_80), RTX 4090 (sm_89), or RTX 5090 (sm_120). Run this script
+once per machine. A universal PTX-fallback ``.so`` is on the
+roadmap (will be ``--ptx``); today's loader does SASS-first lookup
+only.
 
 Usage
 -----
@@ -101,7 +105,7 @@ def _find_nvcc() -> str:
     if not os.path.exists(nvcc):
         raise FileNotFoundError(
             f"nvcc not found on PATH and not at {nvcc}. "
-            f"Install CUDA toolkit (we test on 12.8)."
+            f"Install CUDA toolkit (we test on 13.0)."
         )
     return nvcc
 
