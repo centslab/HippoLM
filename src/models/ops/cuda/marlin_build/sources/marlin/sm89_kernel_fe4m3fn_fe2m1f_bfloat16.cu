@@ -7,28 +7,28 @@
 namespace MARLIN_NAMESPACE_NAME {
 
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 256, 1, 8, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 256, 1, 8, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 1, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 1, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 1, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 1, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 256, 2, 16, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 256, 2, 16, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 2, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 2, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 2, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 2, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 256, 3, 16, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 256, 3, 16, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 3, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 3, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 3, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 3, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 256, 4, 16, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 256, 4, 16, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 4, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 4, 8, 4, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
-template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(), 128, 4, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
+template __global__ void Marlin<marlin::vllm::kFE4M3fn.id(), marlin::vllm::kFE2M1f.id(), marlin::vllm::kBFloat16.id(), marlin::vllm::kFE8M0fnu.id(), 128, 4, 4, 8, false, 4, 2, false>( MARLIN_KERNEL_PARAMS );
 
 }

@@ -40,9 +40,12 @@ counts, block sizes, and precision flags.
 
 ## Training
 
-- Hardware target: 8x V100-class 16G GPUs or single 5060 Ti 16G
-  GPU, tight VRAM budget — most optimization work targets the
-  boundary, not the center.
+- Hardware target: single RTX 4090 (sm_89, production training) or
+  single 5060 Ti 16G (sm_120, dev box). V100 (sm_70) was dropped on
+  2026-07-08 — Marlin FP4 + W4A16 NVFP4 FFN both require sm_80+ BF16
+  MMA, which V100 lacks. V100-friendly configs are no longer tested;
+  tight VRAM budget work targets the 16 GB ceiling on the 5060 Ti
+  dev box.
 - Training is data-parallel-style across the TP group: forward
   and backward on GPU, optimizer state on CPU pinned memory
   (BF16 for AdamW, int8-quantized momentum for Muon).

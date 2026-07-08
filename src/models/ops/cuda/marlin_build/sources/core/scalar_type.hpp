@@ -9,6 +9,7 @@
 // For STD_TORCH_CHECK
 #include <torch/headeronly/util/Exception.h>
 
+namespace marlin {
 namespace vllm {
 
 //
@@ -358,3 +359,4 @@ static inline constexpr auto kBFloat16 = kFE8M7;
 
 static inline constexpr auto kFloat16Id = kFloat16.id();
 };  // namespace vllm
+}  // namespace marlin

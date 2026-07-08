@@ -181,7 +181,7 @@ def _ensure_libs_loaded() -> None:
     # the upstream call site.
     FN_NAME = (
         "_ZN6marlin9marlin_mmEPKvS1_PvS2_S2_S2_S2_S2_S2_S2_S2_S2_iiiiS2_"
-        "RKN4vllm10ScalarTypeES6_S6_S6_bbbbiiiP11CUstream_stiiibbb"
+        "RKN6marlin4vllm10ScalarTypeES6_S6_S6_bbbbiiiP11CUstream_stiiibbb"
     )
     mm = getattr(kernel_lib, FN_NAME)
     mm.argtypes = [
