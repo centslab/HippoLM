@@ -95,3 +95,33 @@ nvcc --version | tail -1
 - Files rebuilt:
   - `marlin_fp4_kernel_only_sm120.so`
   - `marlin_fp4_repack_sm120.so`
+
+### 2026-07-08 — Apache 2.0 attribution + `vllm::` namespace wrap
+
+The vendored vllm Marlin FP4 sources are derivative of upstream vllm
+under Apache 2.0; this commit adds attribution (`LICENSE-APACHE-2.0`
++ `NOTICE` under `marlin_build/sources/`) and wraps the
+`namespace vllm { ... }` declaration in `core/scalar_type.hpp` as
+`namespace marlin { namespace vllm { ... } }`. All `vllm::X`
+references across the vendored sources (~10,951 occurrences,
+dominated by the generated `kernel_selector.h` dispatch chain) are
+rewritten to `marlin::vllm::X`. This keeps the standalone .so from
+leaking any global `vllm::` symbol while staying semantically
+identical to vllm's original layout.
+
+Consequence: the C++ ABI mangle for `vllm::ScalarType` shifts
+from `_ZN4vllm10ScalarType` to `_ZN6marlin4vllm10ScalarType`.
+The full `marlin::marlin_mm` mangle in
+`src/models/ops/nvfp4_marlin.py:182` (`FN_NAME`) is recomputed and
+updated.
+
+The committed `.so` files are stale until rebuilt — the ctypes bind
+in `_resolve_lib` will fail with `AttributeError: undefined symbol`.
+Rebuild via:
+
+```
+python scripts/build_marlin.py --arch 120
+```
+
+then `git add src/models/ops/cuda/lib/marlin_fp4_*_sm120.so` and
+commit with a new *History* entry.
