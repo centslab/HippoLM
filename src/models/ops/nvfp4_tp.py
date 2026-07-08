@@ -83,6 +83,43 @@ class _NVFP4RowMatmul(torch.autograd.Function):
         return grad_x, grad_w, None, None, grad_bias, None, None
 
 
+class _MarlinNvFp4RowMatmul(torch.autograd.Function):
+    """Row-parallel NVFP4 matmul via Marlin fused kernel + all-reduce.
+
+    Same TP contract as :class:`_NVFP4RowMatmul`: bias added by rank 0
+    after the all-reduce. The forward uses vLLM's Marlin FP4 kernel
+    (BF16 MMA + register dequant + cp.async double-buffered prefetch)
+    for ~3.5x speedup over the dequant+cuBLAS path at FFN shapes.
+
+    Backward: standard BF16 matmul backward on the BF16 master weight
+    (STE for the quantize noise). The all-reduce's backward is identity.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx, x, w_master, packed_w, scales_w, global_scale, bias, K_orig, block_size,
+    ):
+        from src.models.ops.nvfp4_marlin import marlin_nvfp4_matmul
+        out = marlin_nvfp4_matmul(x, w_master, packed_w, scales_w, global_scale, None)
+        ctx.save_for_backward(x, w_master)
+        ctx.has_bias = bias is not None
+        if bias is not None and _TP_RANK == 0:
+            out = out + bias
+        return tp_all_reduce(out)
+
+    @staticmethod
+    def backward(ctx, grad_out):  # type: ignore[override]
+        x, w_bf16 = ctx.saved_tensors
+        K = w_bf16.shape[1]
+        N = w_bf16.shape[0]
+        grad_out_2d = grad_out.reshape(-1, N)
+        x_2d = x.reshape(-1, K)
+        grad_x = grad_out @ w_bf16
+        grad_w = (grad_out_2d.t().to(x_2d.dtype)) @ x_2d
+        grad_bias = grad_out_2d.sum(dim=0) if ctx.has_bias else None
+        return grad_x, grad_w, None, None, None, grad_bias, None, None
+
+
 # ---------------------------------------------------------------------------
 # nn.Module wrappers
 # ---------------------------------------------------------------------------
@@ -96,6 +133,7 @@ class NVFP4ColumnParallelLinear(nn.Module):
         self, in_features: int, out_features: int, bias: bool = False,
         device=None, dtype=None, block_size: int = 16,
         bf16_only: bool = False,
+        use_marlin: bool = False,
     ) -> None:
         super().__init__()
         assert block_size == 16, f"NVFP4 block_size must be 16, got {block_size}"
@@ -108,6 +146,7 @@ class NVFP4ColumnParallelLinear(nn.Module):
         self.out_features_per_partition = out_features // world
         self.block_size = block_size
         self.bf16_only = bf16_only
+        self.use_marlin = use_marlin
 
         self.weight = nn.Parameter(
             torch.empty(
@@ -131,6 +170,11 @@ class NVFP4ColumnParallelLinear(nn.Module):
                     device=device, dtype=torch.float8_e4m3fn,
                 ),
             )
+            if use_marlin:
+                self.register_buffer(
+                    "global_scale",
+                    torch.ones(1, dtype=torch.float32, device=device),
+                )
         if bias:
             self.bias = nn.Parameter(
                 torch.empty(
@@ -153,6 +197,16 @@ class NVFP4ColumnParallelLinear(nn.Module):
     def repack_weights(self) -> None:
         if self.bf16_only:
             return
+        if self.use_marlin:
+            from src.models.ops.nvfp4_marlin import quantize_nvfp4_with_global_scale, _cached_repack
+            packed, scales, global_scale = quantize_nvfp4_with_global_scale(
+                self.weight.data, block_size=self.block_size,
+            )
+            self.packed_weight.copy_(packed)
+            self.scales.copy_(scales)
+            self.global_scale.copy_(global_scale.view(1))
+            _cached_repack._cache.clear()
+            return
         from src.models.ops.nvfp4 import quantize_nvfp4
         packed, scales = quantize_nvfp4(self.weight.data, block_size=self.block_size)
         self.packed_weight.copy_(packed)
@@ -163,6 +217,12 @@ class NVFP4ColumnParallelLinear(nn.Module):
             # Plain BF16 GEMM (column-parallel: no comm). Matches
             # ColumnParallelLinear's forward exactly.
             return F.linear(x, self.weight, self.bias)
+        if self.use_marlin:
+            from src.models.ops.nvfp4_marlin import marlin_nvfp4_matmul
+            return marlin_nvfp4_matmul(
+                x, self.weight, self.packed_weight, self.scales,
+                self.global_scale, self.bias,
+            )
         # The column-parallel case is byte-identical to the base
         # _NVFP4Matmul (no all-reduce, bias in the F.linear call),
         # so we reuse that Function rather than re-implementing.
@@ -183,6 +243,7 @@ class NVFP4RowParallelLinear(nn.Module):
         self, in_features: int, out_features: int, bias: bool = False,
         device=None, dtype=None, block_size: int = 16,
         bf16_only: bool = False,
+        use_marlin: bool = False,
     ) -> None:
         super().__init__()
         assert block_size == 16, f"NVFP4 block_size must be 16, got {block_size}"
@@ -195,6 +256,7 @@ class NVFP4RowParallelLinear(nn.Module):
         self.in_features_per_partition = in_features // world
         self.block_size = block_size
         self.bf16_only = bf16_only
+        self.use_marlin = use_marlin
 
         self.weight = nn.Parameter(
             torch.empty(
@@ -218,6 +280,11 @@ class NVFP4RowParallelLinear(nn.Module):
                     device=device, dtype=torch.float8_e4m3fn,
                 ),
             )
+            if use_marlin:
+                self.register_buffer(
+                    "global_scale",
+                    torch.ones(1, dtype=torch.float32, device=device),
+                )
         if bias:
             self.bias = nn.Parameter(
                 torch.empty(out_features, device=device, dtype=dtype or torch.bfloat16)
@@ -237,6 +304,16 @@ class NVFP4RowParallelLinear(nn.Module):
     def repack_weights(self) -> None:
         if self.bf16_only:
             return
+        if self.use_marlin:
+            from src.models.ops.nvfp4_marlin import quantize_nvfp4_with_global_scale, _cached_repack
+            packed, scales, global_scale = quantize_nvfp4_with_global_scale(
+                self.weight.data, block_size=self.block_size,
+            )
+            self.packed_weight.copy_(packed)
+            self.scales.copy_(scales)
+            self.global_scale.copy_(global_scale.view(1))
+            _cached_repack._cache.clear()
+            return
         from src.models.ops.nvfp4 import quantize_nvfp4
         packed, scales = quantize_nvfp4(self.weight.data, block_size=self.block_size)
         self.packed_weight.copy_(packed)
@@ -250,6 +327,12 @@ class NVFP4RowParallelLinear(nn.Module):
             if self.bias is not None and _TP_RANK == 0:
                 out = out + self.bias
             return tp_all_reduce(out)
+        if self.use_marlin:
+            return _MarlinNvFp4RowMatmul.apply(
+                x, self.weight, self.packed_weight, self.scales,
+                self.global_scale, self.bias,
+                self.in_features_per_partition, self.block_size,
+            )
         return _NVFP4RowMatmul.apply(
             x, self.weight, self.packed_weight, self.scales, self.bias,
             self.in_features_per_partition, self.block_size,

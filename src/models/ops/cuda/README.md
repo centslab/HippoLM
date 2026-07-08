@@ -52,6 +52,16 @@ fast enough or has a numerical issue.
 
 ## Current state
 
-Empty. The EFKDA rewrite (replacing GDN2) is the first
-candidate; see the project's auto-memory for the
-performance targets.
+- `kda_fwd/` — KDA custom Triton kernel (the project dropped GDN2 in
+  June 2026; KDA is the production path). See the project's
+  auto-memory for the perf state.
+- `marlin_build/` — vendored sources + per-arch build pipeline for
+  vLLM's Marlin FP4 kernel, the W4A16 NVFP4 FFN matmul (sm_80 /
+  sm_89 / sm_120 etc.). Outputs are loaded via ctypes from `lib/`
+  (gitignored) by `src/models/ops/nvfp4_marlin.py`. See
+  [`docs/marlin_build_pipeline.md`](../../../docs/marlin_build_pipeline.md)
+  for the build command, the per-arch table, and the patches applied
+  to vLLM's headers to keep the build torch-2.9.1-compatible.
+- `lib/marlin_fp4_{kernel_only,repack}_sm{arch}.so` — built artifacts,
+  gitignored. Built locally per machine via
+  `python scripts/build_marlin.py --arch <sm_list>`.

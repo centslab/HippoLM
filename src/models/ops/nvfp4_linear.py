@@ -128,6 +128,7 @@ class NVFP4Linear(nn.Module):
         dtype=None,
         block_size: int = 16,
         bf16_only: bool = False,
+        use_marlin: bool = False,
     ) -> None:
         super().__init__()
         assert block_size == 16, (
@@ -137,6 +138,7 @@ class NVFP4Linear(nn.Module):
         self.out_features = out_features
         self.block_size = block_size
         self.bf16_only = bf16_only
+        self.use_marlin = use_marlin
 
         # BF16 master weight — the parameter the optimizer updates.
         self.weight = nn.Parameter(
@@ -156,6 +158,15 @@ class NVFP4Linear(nn.Module):
                 "scales",
                 torch.zeros(out_features, K_padded // block_size, device=device, dtype=torch.float8_e4m3fn),
             )
+            # The Marlin kernel expects an explicit FP32 global_scale
+            # scalar alongside the per-block scales (proper NVFP4 spec).
+            # The dequant+cuBLAS path doesn't need it — its scales are
+            # stored at their natural magnitude.
+            if use_marlin:
+                self.register_buffer(
+                    "global_scale",
+                    torch.ones(1, dtype=torch.float32, device=device),
+                )
 
         if bias:
             self.bias = nn.Parameter(
@@ -192,6 +203,19 @@ class NVFP4Linear(nn.Module):
         """
         if self.bf16_only:
             return
+        if self.use_marlin:
+            from src.models.ops.nvfp4_marlin import quantize_nvfp4_with_global_scale
+            packed, scales, global_scale = quantize_nvfp4_with_global_scale(
+                self.weight.data, block_size=self.block_size,
+            )
+            self.packed_weight.copy_(packed)
+            self.scales.copy_(scales)
+            self.global_scale.copy_(global_scale.view(1))
+            # Invalidate the Marlin repack cache (the packed buffer's
+            # data_ptr is stable but its contents have changed).
+            from src.models.ops.nvfp4_marlin import _cached_repack
+            _cached_repack._cache.clear()
+            return
         from src.models.ops.nvfp4 import quantize_nvfp4
         packed, scales = quantize_nvfp4(self.weight.data, block_size=self.block_size)
         self.packed_weight.copy_(packed)
@@ -205,6 +229,12 @@ class NVFP4Linear(nn.Module):
             # the STE-on-quantize-noise the dequant path provided is
             # no longer relevant because there is no quantize noise.
             return F.linear(x, self.weight, self.bias)
+        if self.use_marlin:
+            from src.models.ops.nvfp4_marlin import marlin_nvfp4_matmul
+            return marlin_nvfp4_matmul(
+                x, self.weight, self.packed_weight, self.scales,
+                self.global_scale, self.bias,
+            )
         return _NVFP4Matmul.apply(
             x, self.weight,
             self.packed_weight, self.scales,
@@ -213,14 +243,18 @@ class NVFP4Linear(nn.Module):
         )
 
     def extra_repr(self) -> str:
-        storage = (
-            "NVFP4(E2M1+FP8-e4m3fn 1x16)" if not self.bf16_only else "BF16(bf16_only)"
-        )
+        if self.bf16_only:
+            storage = "BF16(bf16_only)"
+        elif self.use_marlin:
+            storage = "NVFP4(E2M1+FP8-e4m3fn 1x16) [Marlin fused]"
+        else:
+            storage = "NVFP4(E2M1+FP8-e4m3fn 1x16)"
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, block_size={self.block_size}, "
             f"weight_storage={storage}"
         )
+
 
 
 def repack_nvfp4_weights(model: nn.Module) -> int:

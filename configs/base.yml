@@ -233,3 +233,12 @@ kda_skip_aqk_akk_saved: false
 # Training loss ratio BF16 / NVFP4 was 1.00x at 100 steps per
 # ``project_w4a16_nvfp4.md``, so this is a clean VRAM win.
 ffn_nvfp4: false
+# ffn_nvfp4_marlin: when True (and ffn_nvfp4 is also True), the FFN
+# forward matmul uses vLLM's Marlin FP4 kernel (BF16 MMA + register
+# dequant + cp.async double-buffered prefetch). ~3.5x speedup over
+# the dequant+cuBLAS path at FFN shapes on sm_120 (47-49 TFLOPS).
+# Backward stays as BF16 matmul (STE for the quantize noise).
+# Requires the prebuilt Marlin .so at src/models/ops/cuda/lib/
+# (shipped in this repo for the 5060 Ti dev box). No-op when
+# ffn_nvfp4 is False.
+ffn_nvfp4_marlin: false

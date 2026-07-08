@@ -82,6 +82,18 @@ class HippoConfig:
     # Default False (legacy BF16 path).
     ffn_nvfp4: bool = False
 
+    # When ``ffn_nvfp4`` is True, use vLLM's Marlin FP4 kernel for
+    # the forward matmul (BF16 MMA + register dequant + cp.async
+    # double-buffered prefetch). ~3.5x speedup over the
+    # dequant+cuBLAS path at FFN shapes on sm_120 (47-49 TFLOPS).
+    # Backward stays as BF16 matmul (STE for the quantize noise).
+    # Requires the prebuilt Marlin .so to be present at
+    # ``src/models/ops/cuda/lib/`` (true on the 5060 Ti dev box).
+    # Ignored when ``ffn_nvfp4`` is False. Default False (use the
+    # safer dequant+cuBLAS path until the Marlin flow has been
+    # smoke-tested on this config).
+    ffn_nvfp4_marlin: bool = False
+
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
             f"num_layers ({self.num_layers}) must be divisible by num_blocks ({self.num_blocks})"
@@ -115,4 +127,9 @@ class HippoConfig:
         # constraint here is a sanity check that the flag is a bool.
         assert isinstance(self.ffn_nvfp4, bool), (
             f"ffn_nvfp4 must be bool, got {type(self.ffn_nvfp4).__name__}"
+        )
+        # ffn_nvfp4_marlin must be bool, and is a no-op if ffn_nvfp4
+        # is False.
+        assert isinstance(self.ffn_nvfp4_marlin, bool), (
+            f"ffn_nvfp4_marlin must be bool, got {type(self.ffn_nvfp4_marlin).__name__}"
         )

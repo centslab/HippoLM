@@ -39,13 +39,19 @@ class TPSwiGLU(nn.Module):
         # FP4 round-trip in the forward (the matmul is plain BF16 GEMM).
         # Useful on small-VRAM boxes where the packed buffer footprint
         # outweighs the dequant-on-fwd benefit.
+        #
+        # ``ffn_nvfp4_marlin`` flips the forward matmul to vLLM's
+        # Marlin FP4 kernel (~3.5x speedup at FFN shapes on sm_120).
+        # Backward stays as BF16 matmul (STE for quantize noise).
         if (
             getattr(config, "ffn_nvfp4", False)
             and not getattr(config, "ffn_nvfp4_bf16_only", False)
         ):
             ColCls, RowCls = NVFP4ColumnParallelLinear, NVFP4RowParallelLinear
+            use_marlin = getattr(config, "ffn_nvfp4_marlin", False)
         else:
             ColCls, RowCls = ColumnParallelLinear, RowParallelLinear
+            use_marlin = False
 
         # Fused gate+up projection: one ColumnParallelLinear with
         # output = 2 * intermediate_size. The first ``intermediate``
@@ -56,13 +62,19 @@ class TPSwiGLU(nn.Module):
         # is one tensor of size ``2 * intermediate_per_partition``
         # on this rank (gate half then up half); we expose it as
         # ``self.gate_up_bias`` so the forward can split it.
+        # ``use_marlin`` propagates the ffn_nvfp4_marlin flag into
+        # the NVFP4 layer constructors; the plain BF16 TP classes
+        # don't accept it (no NVFP4 buffers to allocate).
+        col_kwargs = {"bias": config.use_bias, "device": device, "dtype": dtype}
+        row_kwargs = {"bias": config.use_bias, "device": device, "dtype": dtype}
+        if use_marlin:
+            col_kwargs["use_marlin"] = True
+            row_kwargs["use_marlin"] = True
         self.gate_up_proj = ColCls(
-            config.hidden_size, 2 * config.intermediate_size,
-            bias=config.use_bias, device=device, dtype=dtype,
+            config.hidden_size, 2 * config.intermediate_size, **col_kwargs,
         )
         self.down_proj = RowCls(
-            config.intermediate_size, config.hidden_size,
-            bias=config.use_bias, device=device, dtype=dtype,
+            config.intermediate_size, config.hidden_size, **row_kwargs,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
