@@ -174,25 +174,36 @@ def _ensure_libs_loaded() -> None:
     repack.restype = None
     _repack_fn = repack
 
-    # marlin::marlin_mm — mangled symbol pulled from the v3 test driver
-    # (which we validated against the same .so). See vllm
-    # model_executor/layers/quantization/utils/marlin_utils_fp4.py
-    # for the C++ source.
+    # marlin::marlin_mm — mangled symbol pulled from the .so via `nm -D`.
+    # Matches the C++ signature in vllm marlin_mm_only.cu (4 ScalarTypes:
+    # a_type, b_type, c_type, s_type). 34 args total. See
+    # model_executor/layers/quantization/utils/marlin_utils_fp4.py for
+    # the upstream call site.
     FN_NAME = (
         "_ZN6marlin9marlin_mmEPKvS1_PvS2_S2_S2_S2_S2_S2_S2_S2_S2_iiiiS2_"
         "RKN4vllm10ScalarTypeES6_S6_S6_bbbbiiiP11CUstream_stiiibbb"
     )
     mm = getattr(kernel_lib, FN_NAME)
     mm.argtypes = [
+        # void* A, B, C, C_tmp, b_bias, a_s, b_s, g_s, zp, g_idx, perm, a_tmp (12)
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        # int prob_m, prob_n, prob_k, lda (4)
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        # void* workspace (1)
         ctypes.c_void_p,
+        # ScalarType const& a_type, b_type, c_type, s_type (4)
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        # bool has_bias, has_act_order, is_k_full, has_zp (4)
         ctypes.c_bool, ctypes.c_bool, ctypes.c_bool, ctypes.c_bool,
-        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        # int num_groups, group_size, dev (3)
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        # cudaStream_t stream (1)
+        ctypes.c_void_p,
+        # int thread_k_init, thread_n_init, sms (3)
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        # bool use_atomic_add, use_fp32_reduce, is_zp_float (3)
         ctypes.c_bool, ctypes.c_bool, ctypes.c_bool,
     ]
     mm.restype = None

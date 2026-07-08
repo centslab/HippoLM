@@ -1,13 +1,21 @@
-// Standalone wrapper for vllm Marlin FP4 kernel against torch 2.9.1.
+// Standalone wrapper for vllm Marlin FP4 kernel.
 //
 // Goal: compile `marlin::marlin_mm()` and the FP4 (sm89) Marlin kernel
 // template instantiations into a single shared library that can be
-// loaded from Python via torch.utils.cpp_extension.load.
+// loaded from Python via ctypes (see src/models/ops/nvfp4_marlin.py).
 //
 // Key constraint: vllm's headers (kernel.h, marlin_template.h,
 // scalar_type.hpp) include <string>, <tuple>, <variant>, etc. These
 // pull in <bits/stringfwd.h> which expects `std::` to be at FILE SCOPE.
 // So we must include them BEFORE entering `namespace marlin { ... }`.
+//
+// The torch stable headers (<torch/csrc/stable/*.h>) use a
+// HIDDEN_NAMESPACE_BEGIN(torch, stable, detail) macro that expands to
+// `namespace torch::stable::detail { ... }`. If we include them
+// INSIDE `namespace marlin`, nvcc 13.0 / torch 2.12 expands that macro
+// to `namespace marlin::torch::stable::detail`, which then can't find
+// sibling detail symbols. So torch stable headers must also be at
+// FILE SCOPE.
 //
 // kernel.h and marlin_template.h themselves open/close
 // `namespace marlin` (via MARLIN_NAMESPACE_NAME + #if/#else trick in
@@ -24,6 +32,15 @@
 // "allocator is not a template".
 #include "kernel.h"           // marlin_dtypes.cuh + core/scalar_type.hpp
 #include "marlin_template.h"  // defines Marlin<...> template in namespace marlin
+
+// Torch stable headers at FILE SCOPE — see comment block above.
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+
 #include "libtorch_stable/torch_utils.h"  // STD_TORCH_CHECK, raw CUDA helpers
 
 // Now enter namespace marlin and define the helpers / marlin_mm.

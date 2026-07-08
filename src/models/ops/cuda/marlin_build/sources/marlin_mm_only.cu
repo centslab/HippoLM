@@ -19,26 +19,19 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
-// kernel.h brings in marlin_template.h (defines Marlin<>) and
-// core/scalar_type.hpp (defines vllm::kFloat16 etc.). Pulled in by
+// kernel.h + torch stable headers are pulled in by
 // marlin_kernel_only.cu BEFORE this file is wrapped in
-// `namespace marlin { ... }` so its transitive std headers are
-// processed at file scope.
+// `namespace marlin { ... }` so the HIDDEN_NAMESPACE_BEGIN macros in
+// torch's stable library.h expand to `namespace torch::stable::detail`
+// at file scope (not `namespace marlin::torch::stable::detail`).
+// Don't re-include those headers here — that would re-introduce the
+// nested-namespace bug.
 
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
 #include "kernel.h"
-
-#include <torch/csrc/stable/accelerator.h>
-#include <torch/csrc/stable/library.h>
-#include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
-#include <torch/headeronly/util/Exception.h>
-
-#include "libtorch_stable/torch_utils.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
