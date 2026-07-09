@@ -1,0 +1,41 @@
+# configs/test/nvfp4_marlin_tp2.yml
+# --------------------------------
+# Smoke test for the W4A16 NVFP4 FFN path with the Marlin fused kernel
+# in TP=2 mode (nvfp4 + ffn_nvfp4_marlin + tp_sim + tp_size=2). This
+# exercises the row-parallel Marlin path (down_proj all-reduce) which
+# the tp1 variant does NOT cover (tp_size=1 means the row-parallel
+# case degenerates to a no-all-reduce fast path).
+#
+# Run: python scripts/train.py --config configs/test/nvfp4_marlin_tp2.yml
+#
+# Inherits from ../base.yml (the production defaults).
+extends: ../base.yml
+
+# Diff vs base.yml:
+#   * ffn_nvfp4=true — every FFN linear uses the NVFP4 storage path
+#   * ffn_nvfp4_marlin=true — the forward matmul uses vLLM's Marlin
+#     FP4 kernel
+#   * tp_sim=true, tp_size=2 — exercises the row-parallel Marlin
+#     path (down_proj all-reduce) on a single GPU via gloo
+ffn_nvfp4: true
+ffn_nvfp4_marlin: true
+
+tp_sim: true
+tp_size: 2
+
+num_heads: 2
+head_dim: 64
+hidden_size: 128
+intermediate_size: 256
+vocab_size: 512
+
+use_dummy_data: true
+
+batch_size: 2
+seq_len: 512
+gradient_accumulation_steps: 1
+max_steps: 4
+
+output_dir: output/nvfp4_marlin_tp2
+log_interval: 1
+checkpoint_interval: 0

@@ -1,0 +1,114 @@
+HippoLM Marlin FP4 vendored sources
+====================================
+
+This directory contains source code vendored from vLLM
+(https://github.com/vllm-project/vllm), which is licensed under the
+Apache License, Version 2.0. The full Apache 2.0 license text is in
+LICENSE-APACHE-2.0 alongside this NOTICE.
+
+Source of truth
+---------------
+The vendored sources are extracted from vLLM's stable-ABI Marlin FP4
+path, snapshot circa vLLM 0.7/0.8. The vendored files are:
+
+Hand-extracted wrappers (5 files, ~960 lines):
+  marlin_kernel_only.cu
+  marlin_repack_adapter.cu
+  marlin_helpers.cu
+  marlin_mm_only.cu
+  marlin/gptq_marlin_repack_kernel_only.cu
+
+Patched vLLM headers (~6,600 lines):
+  marlin/kernel.h
+  marlin/marlin.cuh          (patch: <iostream> dropped)
+  marlin/marlin_dtypes.cuh
+  marlin/marlin_mma.h
+  marlin/marlin_template.h   (patch: #pragma once added)
+  marlin/dequant.h
+  marlin/kernel_selector.h
+  core/scalar_type.hpp
+
+Per-SM explicit-instantiation files (~290 lines, NVFP4 + FP8 × BF16/FP16):
+  marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu
+  marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu
+  marlin/sm80_kernel_float16_fe2m1f_float16.cu
+  marlin/sm80_kernel_float16_fe4m3fn_float16.cu
+  marlin/sm89_kernel_fe4m3fn_fe2m1f_bfloat16.cu
+
+Helper:
+  libtorch_stable/torch_utils.h
+
+Modifications made for the vendored copy
+----------------------------------------
+The following changes were applied to the vLLM originals. They are
+necessary for the standalone build to compile against torch 2.12 +
+CUDA 13.0; none change the kernel semantics.
+
+1. marlin/marlin.cuh — dropped ``#include <iostream>``. vLLM includes
+   ``<iostream>`` at the top of the file, which transitively pulls in
+   ``<bits/stringfwd.h>``. When processed inside ``namespace marlin``
+   (as our standalone wrapper does), the standard library's allocator
+   lookup fails with ``error: 'allocator' is not a template``.
+
+2. marlin/marlin_template.h — added ``#pragma once`` at the top.
+   vLLM relies on include-order idempotency in ``marlin.cu``. Our
+   standalone build textually includes ``sm89_kernel_*.cu`` after
+   ``marlin_template.h``; without the guard, template definitions
+   (``marlin::scale_float`` etc.) are duplicated and nvcc errors.
+
+3. libtorch_stable/torch_utils.h — replaced vLLM's torch 2.9.1 shim
+   (which used ``torch_get_current_cuda_blas_handle``) with a 36-line
+   version that defines ``STD_TORCH_CHECK_NOT_IMPLEMENTED`` via
+   ``<torch/headeronly/util/Exception.h>`` and provides the raw CUDA
+   helpers via ``<torch/csrc/stable/...>``. The full vLLM shim depends
+   on torch 2.12's stable ABI symbols (``Tensor::const_data_ptr``,
+   ``Tensor::mutable_data_ptr``, ``TORCH_BOX``) which torch 2.12.0+cu130
+   does provide, but we vendor only the minimal subset.
+
+4. C++ namespace wrap — the ``namespace vllm { ... }`` declaration
+   in ``core/scalar_type.hpp`` is wrapped as
+   ``namespace marlin { namespace vllm { ... } }``. The
+   ``vllm::ScalarType`` / ``vllm::kFloat16`` / etc. references in
+   the other vendored sources are NOT rewritten — they resolve
+   correctly via ordinary namespace lookup because they appear
+   inside ``namespace marlin { ... }`` blocks (the wrappers, the
+   sm_80/sm_89 instantiation files, and the template parameter
+   lists of the ``Marlin<>`` kernel inside ``marlin_template.h``).
+   This avoids leaking any global ``vllm::`` symbol from the
+   standalone .so while keeping the mechanical edits minimal
+   (only one file modified). The mangled C++ symbol shifts when
+   emitted from inside ``namespace marlin``: Itanium ABI's ``S_``
+   "source-name abbreviation" rule compresses an inner namespace
+   that is the same as the enclosing one, so the actual emission
+   is ``_ZN6marlin9marlin_mmEPKv..._RKNS_4vllm10ScalarType...``
+   (the ``S_`` is ``marlin`` abbreviated, NOT ``6marlin``).
+   Verified post-rebuild 2026-07-09 via
+   ``nm -D marlin_fp4_kernel_only_sm120.so | grep marlin_mm``.
+
+5. STABLE_TORCH_LIBRARY_IMPL removed — the standalone wrappers
+   ``marlin_kernel_only.cu`` and ``marlin_repack_adapter.cu`` do not
+   register the kernels via ``STABLE_TORCH_LIBRARY_IMPL``; they
+   expose ``extern "C"`` entries for ctypes. This decouples us from
+   the ``torch::stable::Tensor`` ABI and lets us load the .so against
+   any torch 2.12.x+cu130 build.
+
+Build environment
+-----------------
+Toolchain pinned as of 2026-07-08:
+  - torch 2.12.0+cu130 (CPython 3.11)
+  - CUDA 13.0 (nvcc 13.0.88 from cuda-toolkit-13-0)
+  - driver 580.76.05+
+  - gcc 11 host compiler
+  - SM architectures in scope: sm80 (A100), sm89 (RTX 4090), sm120
+    (5060 Ti / RTX 50 series). sm70 / sm75 / sm100 are out of scope.
+
+License
+-------
+The vendored vLLM sources are licensed under the Apache License,
+Version 2.0 (see LICENSE-APACHE-2.0). You may obtain a copy of the
+license at http://www.apache.org/licenses/LICENSE-2.0.
+
+HippoLM itself is a research project; the kernel wrappers and
+namespace-wrap changes are HippoLM's contribution and are subject
+to the HippoLM project's own license terms (see /LICENSE at the repo
+root).

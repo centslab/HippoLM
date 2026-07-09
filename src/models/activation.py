@@ -9,6 +9,12 @@ microblock scales) instead of BF16. The matmul still runs in BF16
 path requires BOTH A and B to be FP4-packed. The optimizer updates
 the BF16 master weight; :func:`repack_nvfp4_weights` is called
 once per training step to keep the FP4 buffers in sync.
+
+When ``config.ffn_nvfp4_marlin`` is True (and ``ffn_nvfp4`` is
+also True), the forward matmul uses vLLM's Marlin FP4 kernel
+(BF16 MMA + register dequant + cp.async double-buffered prefetch)
+instead of the dequant+cuBLAS path. ~3.5x speedup at FFN shapes
+on sm_120 (47-49 TFLOPS).
 """
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,16 +32,18 @@ class SwiGLU(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        Cls = NVFP4Linear if getattr(config, "ffn_nvfp4", False) else nn.Linear
-        self.gate_proj = Cls(
-            config.hidden_size, config.intermediate_size, bias=config.use_bias,
-        )
-        self.up_proj = Cls(
-            config.hidden_size, config.intermediate_size, bias=config.use_bias,
-        )
-        self.down_proj = Cls(
-            config.intermediate_size, config.hidden_size, bias=config.use_bias,
-        )
+        use_nvfp4 = getattr(config, "ffn_nvfp4", False)
+        # ``use_marlin`` only takes effect when ``ffn_nvfp4`` is also
+        # True (the NVFP4 modules own the use_marlin flag — nn.Linear
+        # ignores it).
+        use_marlin = use_nvfp4 and getattr(config, "ffn_nvfp4_marlin", False)
+        Cls = NVFP4Linear if use_nvfp4 else nn.Linear
+        kwargs = {"bias": config.use_bias}
+        if use_nvfp4:
+            kwargs["use_marlin"] = use_marlin
+        self.gate_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
+        self.up_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
+        self.down_proj = Cls(config.intermediate_size, config.hidden_size, **kwargs)
 
     def forward(self, x):
         gate = F.silu(self.gate_proj(x))

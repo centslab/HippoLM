@@ -2,7 +2,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 .Python
 build/
 develop-eggs/
@@ -67,3 +66,12 @@ htmlcov/
 # Secrets / env files
 .env
 .env.*
+
+# --- Tracked binaries -------------------------------------------------
+# Prebuilt Marlin FP4 kernels are versioned as code: per-arch SASS whose
+# build provenance (GPU / driver / CUDA / torch) is recorded in
+# src/models/ops/cuda/lib/MANIFEST.md. These override the generic *.so
+# / lib/ ignores above so the .so ships in-tree (no 35-min JIT on first
+# step). Rebuild per machine via scripts/build_marlin.py.
+!src/models/ops/cuda/lib/
+!src/models/ops/cuda/lib/**

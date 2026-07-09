@@ -57,47 +57,49 @@ from src.training.precision_config import PrecisionConfig
 def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
     """Independent GPU reference implementation of the muon step.
 
-    Mirrors the algorithm (dequant → requant → NS → apply) but inlined
+    Mirrors the algorithm (dequant → NS → apply → requant) but inlined
     with explicit per-tensor operations. The production ``CPUMuon.step()``
     went through a sequence of optimizations after this test was
     written; the inlined version is the "what the math should do"
     reference that the test compares against.
 
-    In the merged-accumulator design, ``mom_buf`` doubles as the grad
-    accumulator (mu=1 accumulation). The step just reads mom_buf
-    (dequantized for int8), requantizes, orthogonalizes, applies, and
-    resets mom_buf to zero.
+    Storage design (production default = int8 + separate bf16 accum):
+    the per-cycle grad sum lives in ``s.accum`` (bf16, no scale), NOT
+    ``s.mom_buf`` (which is zero at step start). The step reads
+    ``s.accum``, casts to FP32, orthogonalizes, applies the update,
+    then requantizes ``s.accum`` into ``s.mom_buf`` / ``s.mom_scale``
+    (per-row int8) — mirroring ``_quantize_accum_to_mom_buf`` — and
+    zeros ``s.accum`` for the next cycle.
+
+    For fp* muon (``s.accum is None``) the merged-accumulator design
+    applies: ``s.mom_buf`` doubles as the accumulator, so the step
+    reads it directly, recasts to storage dtype, and zeros it.
     """
     lr = muon_opt.lr
     wd = muon_opt.weight_decay
     CHUNK_ROWS = CPUMuon._STREAM_CHUNK_ROWS
     for s in muon_opt.state.values():
-        if s.mom_buf.abs().sum().item() == 0:
+        # int8 muon: cycle grad is in ``s.accum``. fp* muon:
+        # ``s.mom_buf`` is the merged accumulator.
+        use_separate_accum = s.accum is not None
+        g_buf = s.accum if use_separate_accum else s.mom_buf
+        if g_buf.abs().sum().item() == 0:
             continue
         shape = s.shape
         rows, cols = shape[0], shape[1]
         device = s.param.device
 
-        mom_buf_gpu = s.mom_buf.to(device, non_blocking=True)
-        scale_gpu = s.mom_scale.to(device, non_blocking=True)
+        # ---- Dequantize the cycle's accumulated grad to FP32. ----
+        # Both paths store the accumulator as a raw (unscaled) buffer:
+        # ``accum`` is bf16, fp* ``mom_buf`` is its storage dtype.
+        m_fp32_gpu = g_buf.to(device, non_blocking=True).float() \
+                                    .view(rows, cols)
 
-        q_2d = mom_buf_gpu.float().view(rows, cols)
-        scale_2d = scale_gpu.float().unsqueeze(1)
-        m_fp32_gpu = q_2d * scale_2d
-
-        row_max = m_fp32_gpu.abs().amax(dim=1).clamp(min=1e-8)
-        new_scale_fp32 = row_max / 127.0
-        new_scale_bf16 = new_scale_fp32.to(torch.bfloat16)
-        new_scale_2d = new_scale_bf16.float().unsqueeze(1)
-        q_int8_gpu = (m_fp32_gpu / new_scale_2d).round() \
-                        .clamp(-128, 127).to(torch.int8)
-
-        s.mom_buf.copy_(q_int8_gpu.view(-1), non_blocking=True)
-        s.mom_scale.copy_(new_scale_bf16, non_blocking=True)
-
+        # ---- Decoupled weight decay on the full param. ----
         if wd != 0.0:
             s.param.data.mul_(1.0 - lr * wd)
 
+        # ---- Stream NS over rows and apply the update. ----
         m_fp16 = m_fp32_gpu.to(torch.float16)
         for r_start in range(0, rows, CHUNK_ROWS):
             r_end = min(r_start + CHUNK_ROWS, rows)
@@ -107,7 +109,26 @@ def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
             s.param.data[r_start:r_end].add_(update, alpha=-lr)
 
         torch.cuda.current_stream(device).synchronize()
-        s.mom_buf.zero_()
+
+        # ---- Step-end requantize + cycle reset. ----
+        if use_separate_accum:
+            # int8 per-row requant of accum into mom_buf / mom_scale
+            # (mirrors _quantize_accum_to_mom_buf), then zero accum.
+            row_max = m_fp32_gpu.abs().amax(dim=1).clamp(min=1e-8)
+            new_scale_fp32 = row_max / 127.0
+            new_scale_bf16 = new_scale_fp32.to(torch.bfloat16)
+            new_scale_2d = new_scale_bf16.float().unsqueeze(1)
+            q_int8_gpu = (m_fp32_gpu / new_scale_2d).round() \
+                            .clamp(-128, 127).to(torch.int8)
+            s.mom_buf.copy_(q_int8_gpu.view(-1), non_blocking=True)
+            s.mom_scale.copy_(new_scale_bf16, non_blocking=True)
+            s.accum.zero_()
+        else:
+            # fp* merged accumulator: recast to storage dtype, reset.
+            s.mom_buf.copy_(
+                m_fp32_gpu.to(s.mom_buf.dtype).view(-1), non_blocking=True
+            )
+            s.mom_buf.zero_()
 
 
 def _build_matched_pair(
@@ -188,11 +209,17 @@ def test_muon_step_gpu_matches_inline_reference():
             (out["loss"] / mb).backward()
             flush_pending_grads(sync_device=device)
 
-    # Copy pre-step state from A to B so they start identical.
+    # Copy pre-step state from A to B so they start identical. Under
+    # the separate-accum design the cycle's grad lives in ``accum``
+    # (bf16) for int8 muon — ``mom_buf`` is zero at step start — so
+    # ``accum`` is the buffer that must match for the two steps to be
+    # comparable. Copy it too (when present) alongside mom_buf/scale.
     for s_a, s_b in zip(muon_a.state.values(), muon_b.state.values()):
         assert s_a.param is not s_b.param
         s_b.mom_buf.copy_(s_a.mom_buf)
         s_b.mom_scale.copy_(s_a.mom_scale)
+        if s_a.accum is not None:
+            s_b.accum.copy_(s_a.accum)
         s_b.param.data.copy_(s_a.param.data)
         s_b.step = s_a.step
 
