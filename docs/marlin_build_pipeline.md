@@ -225,15 +225,22 @@ touched. The mangled C++ symbol shifts because the underlying
 namespace nesting changes (`vllm::ScalarType` → `marlin::vllm::ScalarType`),
 but the source-level references stay as `vllm::ScalarType`.
 
-**Mangled symbol change:** `vllm::ScalarType` → `marlin::vllm::ScalarType`
-shifts the Itanium ABI prefix from `_ZN4vllm10ScalarType` to
-`_ZN6marlin4vllm10ScalarType`. The full `marlin::marlin_mm` mangle
-becomes:
+**Mangled symbol change (with a twist):** the kernel template lives in
+`namespace marlin`, and when an inner type reference (`vllm::ScalarType`)
+resolves to the SAME namespace as the enclosing scope, nvcc's Itanium
+ABI emission compresses it to `S_` (the "source-name abbreviation for a
+name that refers to one of the enclosing namespaces"). So the actual
+mangle pulled from `nm -D marlin_fp4_kernel_only_sm120.so` is:
 
 ```
-_ZN6marlin9marlin_mmEPKvS1_PvS2_S2_S2_S2_S2_S2_S2_S2_S2_iiiiS2_
-RKN6marlin4vllm10ScalarTypeES6_S6_S6_bbbbiiiP11CUstream_stiiibbb
+_ZN6marlin9marlin_mmEPKvS1_PvS2_S2_S2_S2_S2_S2_S2_S2_S2_iiiiS2_RKNS_4vllm10ScalarTypeES6_S6_S6_bbbbiiiP11CUstream_stiiibbb
 ```
+
+Note `RKNS_4vllm10ScalarType` (the `S_` is `marlin` abbreviated), NOT
+`RKN6marlin4vllm10ScalarType`. If you naively write the latter, the
+ctypes bind fails with `AttributeError: undefined symbol`. The Python
+loader (`src/models/ops/nvfp4_marlin.py:_resolve_lib`) holds the
+mangle as `FN_NAME`; recompute after any further namespace change.
 
 The Python loader (`src/models/ops/nvfp4_marlin.py:_resolve_lib`)
 holds the mangle as `FN_NAME`; recompute after any further

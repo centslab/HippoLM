@@ -76,12 +76,14 @@ CUDA 13.0; none change the kernel semantics.
    lists of the ``Marlin<>`` kernel inside ``marlin_template.h``).
    This avoids leaking any global ``vllm::`` symbol from the
    standalone .so while keeping the mechanical edits minimal
-   (only one file modified). The mangled C++ symbol for
-   ``marlin::vllm::ScalarType`` therefore becomes
-   ``_ZN6marlin4vllm10ScalarType`` (cf. vLLM's original
-   ``_ZN4vllm10ScalarType``), and the full ``marlin::marlin_mm``
-   mangle becomes
-   ``_ZN6marlin9marlin_mmE...RKN6marlin4vllm10ScalarTypeE...``.
+   (only one file modified). The mangled C++ symbol shifts when
+   emitted from inside ``namespace marlin``: Itanium ABI's ``S_``
+   "source-name abbreviation" rule compresses an inner namespace
+   that is the same as the enclosing one, so the actual emission
+   is ``_ZN6marlin9marlin_mmEPKv..._RKNS_4vllm10ScalarType...``
+   (the ``S_`` is ``marlin`` abbreviated, NOT ``6marlin``).
+   Verified post-rebuild 2026-07-09 via
+   ``nm -D marlin_fp4_kernel_only_sm120.so | grep marlin_mm``.
 
 5. STABLE_TORCH_LIBRARY_IMPL removed — the standalone wrappers
    ``marlin_kernel_only.cu`` and ``marlin_repack_adapter.cu`` do not

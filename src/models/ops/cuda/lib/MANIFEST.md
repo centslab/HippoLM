@@ -113,12 +113,16 @@ identical to vllm's original layout, with only one file modified
 (`core/scalar_type.hpp`).
 
 Consequence: the C++ ABI mangle for `vllm::ScalarType` shifts
-from `_ZN4vllm10ScalarType` to `_ZN6marlin4vllm10ScalarType`
-(because the underlying namespace nesting changed even though the
-source-level reference is still `vllm::ScalarType`). The full
-`marlin::marlin_mm` mangle in
-`src/models/ops/nvfp4_marlin.py:182` (`FN_NAME`) is recomputed and
-updated.
+when emitted from inside `namespace marlin`. Itanium ABI's `S_`
+"source-name abbreviation" rule kicks in when the inner namespace
+is the same as the enclosing one, so the emitted prefix is
+`_ZN6marlin9marlin_mmEPKv..._RKNS_4vllm10ScalarType...` — the `S_`
+is `marlin` abbreviated, NOT `6marlin`. If you write
+`RKN6marlin4vllm10ScalarType` in the ctypes bind, you'll get
+`AttributeError: undefined symbol`. Verified via
+`nm -D marlin_fp4_kernel_only_sm120.so | grep marlin_mm` on
+2026-07-09. The full `marlin::marlin_mm` mangle in
+`src/models/ops/nvfp4_marlin.py:182` (`FN_NAME`) reflects this.
 
 The committed `.so` files are stale until rebuilt — the ctypes bind
 in `_resolve_lib` will fail with `AttributeError: undefined symbol`.

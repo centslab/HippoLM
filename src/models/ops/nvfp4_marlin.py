@@ -179,9 +179,14 @@ def _ensure_libs_loaded() -> None:
     # a_type, b_type, c_type, s_type). 34 args total. See
     # model_executor/layers/quantization/utils/marlin_utils_fp4.py for
     # the upstream call site.
+    # Verified post-wrap via `nm -D marlin_fp4_kernel_only_sm120.so`.
+    # Note `S_4vllm` (not `6marlin4vllm`) for the ScalarType ref: the kernel
+    # template lives in `namespace marlin`, and when the qualifier resolves
+    # to the same namespace as the enclosing scope, nvcc compresses it to
+    # `S_` (Itanium ABI "source-name" abbreviation rule).
     FN_NAME = (
         "_ZN6marlin9marlin_mmEPKvS1_PvS2_S2_S2_S2_S2_S2_S2_S2_S2_iiiiS2_"
-        "RKN6marlin4vllm10ScalarTypeES6_S6_S6_bbbbiiiP11CUstream_stiiibbb"
+        "RKNS_4vllm10ScalarTypeES6_S6_S6_bbbbiiiP11CUstream_stiiibbb"
     )
     mm = getattr(kernel_lib, FN_NAME)
     mm.argtypes = [
