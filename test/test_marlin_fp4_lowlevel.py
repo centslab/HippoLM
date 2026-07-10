@@ -53,7 +53,7 @@ sys.path.insert(0, str(_REPO))
 from src.models.ops import nvfp4_marlin
 from src.models.ops.nvfp4_marlin import (
     _MarlinNvFp4Matmul,
-    _cached_repack,
+    _build_marlin_scales_caches,
     _resolve_so,
     quantize_nvfp4_with_global_scale,
 )
@@ -143,6 +143,28 @@ def test_ensure_libs_loaded_binds_marlin_mm_symbol():
     )
 
 
+def _make_caches_holder(
+    scales: torch.Tensor,
+    global_scale: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    block_size: int = 16,
+) -> torch.nn.Module:
+    """Build a tiny ``nn.Module`` whose ``_scales_for_kernel`` /
+    ``_global_scale_adj`` attributes are populated by
+    ``_build_marlin_scales_caches``. Mirrors the production
+    ``NVFP4*Linear.repack_weights`` setup, but for tests that exercise
+    ``_MarlinNvFp4Matmul.apply`` directly without going through the
+    module wrapper.
+    """
+    holder = torch.nn.Module()
+    _build_marlin_scales_caches(
+        holder, scales, global_scale,
+        size_k=size_k, size_n=size_n, block_size=block_size,
+    )
+    return holder
+
+
 def test_marlin_fp4_forward_shape_dtype_finite_nonzero(tiny_quantized_weight):
     """Single-tensor forward invariants: shape, dtype, finiteness, non-zero.
 
@@ -157,11 +179,14 @@ def test_marlin_fp4_forward_shape_dtype_finite_nonzero(tiny_quantized_weight):
          NaN/Inf or segfaults).
     """
     w_master, packed, scales, global_scale, K, block_size, M = tiny_quantized_weight
+    N = w_master.shape[0]
+    holder = _make_caches_holder(scales, global_scale, K, N, block_size)
 
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     out = _MarlinNvFp4Matmul.apply(
-        x, w_master, packed, scales, global_scale, None,
-        K, block_size,
+        x, w_master, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
 
     assert out.shape == (M, w_master.shape[0]), (
@@ -180,96 +205,96 @@ def test_marlin_fp4_forward_shape_dtype_finite_nonzero(tiny_quantized_weight):
     )
 
 
-def test_marlin_fp4_cached_repack_returns_identical_output(tiny_quantized_weight):
-    """Calling forward twice with the same ``packed`` buffer must
-    hit the repack cache and return bit-identical output.
+def test_marlin_fp4_recompute_path_is_deterministic(tiny_quantized_weight):
+    """Two forward calls with the same inputs must return bit-identical
+    output.
 
-    The cache key is ``(packed.data_ptr(), tuple(packed.shape))`` —
-    stable across forwards, so the second call should reuse the
-    repacked buffer. If the cache miss path runs anyway (e.g. the
-    key was changed to a value-difference scheme), the repack result
-    should still be deterministic on the same input.
+    Previously this test relied on the module-level ``_cached_repack``
+    dict to skip repacking on the second call. That cache is now gone —
+    the large ``repacked`` buffer is recomputed each forward (the
+    ``_repack_for_marlin`` ctypes call is ~110 µs). The repack output
+    must still be deterministic on the same input.
     """
     w_master, packed, scales, global_scale, K, block_size, M = tiny_quantized_weight
+    N = w_master.shape[0]
+    holder = _make_caches_holder(scales, global_scale, K, N, block_size)
 
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     out1 = _MarlinNvFp4Matmul.apply(
-        x, w_master, packed, scales, global_scale, None,
-        K, block_size,
+        x, w_master, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
     out2 = _MarlinNvFp4Matmul.apply(
-        x, w_master, packed, scales, global_scale, None,
-        K, block_size,
+        x, w_master, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
     assert torch.equal(out1, out2), (
-        "Cached Marlin forward returned different output on second call "
-        "(cache hit path is not deterministic)"
+        "Recompute-path Marlin forward returned different output on "
+        "second call (repack + scale-processing is not deterministic)"
     )
 
 
-def test_marlin_fp4_cache_invalidates_on_repacked_weight(tiny_quantized_weight):
-    """Replacing the ``packed`` buffer (simulating an optimizer step /
-    manual ``repack_weights`` call) must invalidate the cache and
-    yield output that matches a fresh first-call forward.
+def test_marlin_fp4_repack_rebuilds_caches(tiny_quantized_weight):
+    """After re-quantizing with a new BF16 master (simulating an
+    optimizer step + ``repack_weights``), the small Marlin-side
+    caches (``_scales_for_kernel``, ``_global_scale_adj``) must be
+    rebuilt against the new weights. Otherwise the kernel uses stale
+    scales against fresh data and produces wrong output.
 
-    This pins the contract used by the production training loop:
-
-      step → optimizer updates BF16 master → ``repack_nvfp4_weights``
-      clears the cache → next forward sees the updated weight.
-
-    If the cache invalidation is broken (or worse, the cache is keyed
-    only on shape and ignores the new buffer's contents), this test
-    will fail.
+    This pins the contract that ``NVFP4*Linear.repack_weights``
+    satisfies by calling ``_build_marlin_scales_caches`` after the
+    fresh quantize.
     """
     w_master, packed, scales, global_scale, K, block_size, M = tiny_quantized_weight
+    N = w_master.shape[0]
+    holder = _make_caches_holder(scales, global_scale, K, N, block_size)
 
-    # Warm cache with the original weight.
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     out_before = _MarlinNvFp4Matmul.apply(
-        x, w_master, packed, scales, global_scale, None,
-        K, block_size,
+        x, w_master, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
 
     # Simulate an optimizer step: change the BF16 master, re-quantize,
-    # and replace the ``packed`` buffer in-place via copy_(). We can't
-    # reallocate the buffer (the public API takes it by reference), so
-    # we copy the new packed/scales in. This still changes the cache
-    # key (data_ptr unchanged but contents changed) only if the cache
-    # is content-aware. Production's _cached_repack keys on data_ptr,
-    # so the cache WOULD hit here — but production clears the cache
-    # explicitly in NVFP4Linear.repack_weights(). We mirror that:
+    # copy the new packed/scales/global_scale in place (same data_ptr
+    # as before), and rebuild the small caches. This is exactly what
+    # production's ``NVFP4Linear.repack_weights`` does.
     new_w = w_master + 0.1 * torch.randn_like(w_master)
     new_packed, new_scales, new_global_scale = quantize_nvfp4_with_global_scale(
         new_w, block_size=block_size,
     )
     packed.copy_(new_packed)
     scales.copy_(new_scales)
-    # ``quantize_nvfp4_with_global_scale`` returns a 0-dim FP32 scalar;
-    # the fixture stored it as-is, so the new scalar must be 0-dim too.
-    # Production (`NVFP4Linear.repack_weights`) reshapes to [1] because
-    # its own `self.global_scale` buffer is registered as shape [1];
-    # the fixture uses shape [] for simpler equality checks.
     global_scale.copy_(new_global_scale)
-    _cached_repack._cache.clear()  # mirror NVFP4Linear.repack_weights()
+    _build_marlin_scales_caches(
+        holder, new_scales, new_global_scale,
+        size_k=K, size_n=N, block_size=block_size,
+    )
 
     out_after = _MarlinNvFp4Matmul.apply(
-        x, new_w, packed, scales, global_scale, None,
-        K, block_size,
+        x, new_w, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
     # Output must have changed (we changed the BF16 master).
     assert not torch.equal(out_before, out_after), (
-        "Forward output did not change after repack — cache may not have "
-        "been invalidated, or NVFP4Linear.repack_weights's cache-clear "
-        "contract is broken."
+        "Forward output did not change after repack — caches were not "
+        "rebuilt against the new weights, or repack_weights's "
+        "_build_marlin_scales_caches hook is broken."
     )
 
-    # Re-running with the same (now-new) packed buffer should be stable.
+    # Re-running with the same (now-new) state must be stable.
     out_after_repeat = _MarlinNvFp4Matmul.apply(
-        x, new_w, packed, scales, global_scale, None,
-        K, block_size,
+        x, new_w, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
     assert torch.equal(out_after, out_after_repeat), (
-        "Cached Marlin forward returned different output after cache invalidation"
+        "Marlin forward returned different output on repeat call after "
+        "repack"
     )
 
 
@@ -285,13 +310,16 @@ def test_marlin_fp4_backward_grads_finite_nonzero(tiny_quantized_weight):
       - bwd math regressed to NaN (e.g. zero-row grad_out)
     """
     w_master, packed, scales, global_scale, K, block_size, M = tiny_quantized_weight
+    N = w_master.shape[0]
+    holder = _make_caches_holder(scales, global_scale, K, N, block_size)
 
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     w_master = w_master.detach().clone().requires_grad_(True)
 
     y = _MarlinNvFp4Matmul.apply(
-        x, w_master, packed, scales, global_scale, None,
-        K, block_size,
+        x, w_master, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
     y.sum().backward()
 
@@ -312,17 +340,21 @@ def test_marlin_fp4_with_bias_adds_bias(tiny_quantized_weight):
     that contract: ``out[..., n]`` shifts by ``bias[n]`` exactly.
     """
     w_master, packed, scales, global_scale, K, block_size, M = tiny_quantized_weight
+    N = w_master.shape[0]
+    holder = _make_caches_holder(scales, global_scale, K, N, block_size)
 
     bias = torch.randn(w_master.shape[0], dtype=torch.bfloat16, device="cuda")
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
 
     out_no_bias = _MarlinNvFp4Matmul.apply(
-        x, w_master, packed, scales, global_scale, None,
-        K, block_size,
+        x, w_master, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        None, K, block_size,
     )
     out_with_bias = _MarlinNvFp4Matmul.apply(
-        x, w_master, packed, scales, global_scale, bias,
-        K, block_size,
+        x, w_master, packed,
+        holder._scales_for_kernel, holder._global_scale_adj,
+        bias, K, block_size,
     )
 
     # bias adds to every row of the M-dim output.

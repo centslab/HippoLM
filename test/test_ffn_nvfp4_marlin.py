@@ -188,6 +188,15 @@ def test_nvfp4_marlin_packed_state_dict_roundtrip():
     """Saving and loading the state_dict of an NVFP4-Marlin layer must
     preserve packed_weight + scales + global_scale (so checkpoints stay
     small AND the kernel doesn't NaN from missing global_scale).
+
+    The derived Marlin caches (``_scales_for_kernel``,
+    ``_global_scale_adj``) are registered as ``persistent=False``
+    buffers so they participate in ``.cuda()`` device transfer but are
+    excluded from ``state_dict()`` — they're derived state,
+    reproducible from the source ``scales`` / ``global_scale`` buffers.
+    A post-``load_state_dict`` hook auto-refreshes them against the
+    loaded data, so the very next forward uses the correct weights
+    without the caller having to remember to call ``repack_weights()``.
     """
     torch.manual_seed(0)
     layer = NVFP4Linear(128, 64, bias=True, use_marlin=True).cuda()
@@ -198,11 +207,20 @@ def test_nvfp4_marlin_packed_state_dict_roundtrip():
     assert "packed_weight" in sd
     assert "scales" in sd
     assert "global_scale" in sd, "Marlin layer state_dict missing global_scale"
+    # Derived Marlin caches must NOT be in state_dict (recomputed by
+    # repack_weights against the source buffers).
+    assert "_scales_for_kernel" not in sd, (
+        "_scales_for_kernel should be persistent=False; not in state_dict"
+    )
+    assert "_global_scale_adj" not in sd, (
+        "_global_scale_adj should be persistent=False; not in state_dict"
+    )
     assert sd["packed_weight"].dtype == torch.uint8
     assert sd["scales"].dtype == torch.float8_e4m3fn
     assert sd["global_scale"].dtype == torch.float32
 
-    # Reconstruct from the dict and verify forward matches.
+    # Reconstruct from the dict and verify forward matches. The
+    # post-load hook refreshes the derived caches automatically.
     layer2 = NVFP4Linear(128, 64, bias=True, use_marlin=True).cuda()
     layer2.load_state_dict(sd)
 
