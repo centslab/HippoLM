@@ -49,7 +49,6 @@ from src.training.param_offload import (
     accumulate_grads_to_cpu,
     build_param_groups,
     flush_manual_flush_params,
-    flush_pending_grads,
     register_grad_offload_hooks,
     zero_cpu_grad_accum,
 )
@@ -343,6 +342,7 @@ def _setup_worker(
         kda_skip_aqk_akk_saved=getattr(args, "kda_skip_aqk_akk_saved", False),
         ffn_nvfp4=getattr(args, "ffn_nvfp4", False),
         ffn_nvfp4_marlin=getattr(args, "ffn_nvfp4_marlin", False),
+        ffn_nvfp4_no_bf16_master=getattr(args, "ffn_nvfp4_no_bf16_master", False),
     )
     if rank == 0:
         logger.info(f"Model config: {config}")
@@ -505,8 +505,37 @@ def _setup_worker(
         trainable = sum(
             p.numel() for p in model.trainable_parameters(gpus[0])
         )
+        # NVFP4 mode-3 modules register their weights as
+        # ``register_buffer`` (FP4 packed bytes), NOT as
+        # ``nn.Parameter`` — see :class:`NVFP4Linear` /
+        # :class:`NVFP4ColumnParallelLinear`. So
+        # ``trainable_parameters()`` (which iterates
+        # ``nn.Parameter``) misses the SwiGLU weights entirely,
+        # undercounting the model by ~604M elements at
+        # base.yml (32 layers × 18.87M / layer for gate_up +
+        # down). Those weights ARE trainable (the optimizer
+        # updates them via the side-channel material/commit
+        # API), so the log must include their element count to
+        # match the per-optimizer Muon+AdamW param totals that
+        # follow. We walk ``model.modules()`` and add the
+        # ``out_features × in_features[_per_partition]`` for
+        # every ``no_bf16_master`` NVFP4 module. Element
+        # count, not byte count — each FP4 element is one
+        # weight value (the 2-bits-per-element packing is a
+        # storage detail, not a "fewer params" detail).
+        nvfp4_params = 0
+        for m in model.modules():
+            if not getattr(m, "no_bf16_master", False):
+                continue
+            cols = getattr(
+                m, "in_features_per_partition", m.in_features,
+            )
+            nvfp4_params += m.out_features * cols
+        total_trainable = trainable + nvfp4_params
         logger.info(
-            f"TP model built. Per-device trainable params: {trainable:,}"
+            f"TP model built. Per-device trainable params:"
+            f" {total_trainable:,}"
+            f" (BF16 leaf={trainable:,}, NVFP4 FP4={nvfp4_params:,})"
         )
 
     # ---- GradScaler (disabled) ----
@@ -536,9 +565,11 @@ def _setup_worker(
     # autograd computes it (during ``backward()``), not after.
     # This keeps the peak GPU grad memory to "at most one
     # param's grad" rather than "the sum of all grads". The
-    # training loop calls :func:`flush_pending_grads` once per
-    # microbatch to sync CUDA and apply the CPU adds. See
-    # :func:`register_grad_offload_hooks` for the design.
+    # training loop calls :func:`accumulate_grads_to_cpu` once per
+    # microbatch to sync CUDA and apply the CPU adds — it
+    # drains both the per-param hook queue (normal params) and
+    # the NVFP4 mode-3 stash (``module._latest_grad_w``) in one
+    # pass. See :func:`register_grad_offload_hooks` for the design.
     #
     # ``manual_flush_params`` are the tied-embed params whose
     # grad is the sum of (a) the natural-path grad from
@@ -561,8 +592,18 @@ def _setup_worker(
         [muon_opt, adamw_opt],
         manual_flush_params=manual_flush or None,
     )
-    n_muon = sum(s.param.numel() for s in muon_opt.state.values())
-    n_adamw = sum(s.param.numel() for s in adamw_opt.state.values())
+    # NVFP4 mode-3 entries have ``s.param is None`` (the
+    # weight lives on the module as FP4 packed buffers, not as a
+    # leaf Parameter). Fall back to ``s.nvfp4_n`` (cached at
+    # :meth:`register_nvfp4_module` time) for those.
+    n_muon = sum(
+        s.param.numel() if s.param is not None else s.nvfp4_n
+        for s in muon_opt.state.values()
+    )
+    n_adamw = sum(
+        s.param.numel() if s.param is not None else s.nvfp4_n
+        for s in adamw_opt.state.values()
+    )
     n_muon_rows = sum(s.shape[0] for s in muon_opt.state.values())
     # Per-param byte breakdown, kept in named variables so the log
     # line below (and any future debugger) can see the components
@@ -610,7 +651,8 @@ def _setup_worker(
         # first) so a heterogeneous model still computes
         # correctly.
         quantized_muon_params = sum(
-            s.param.numel() for s in muon_states if s.accum is not None
+            (s.param.numel() if s.param is not None else s.nvfp4_n)
+            for s in muon_states if s.accum is not None
         )
     else:
         muon_mom_dtype = torch.int8
@@ -934,10 +976,18 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     step_loss_chunk_sum += chunk_loss.item()
                     # Per-chunk immediate backward. Per-param
                     # accumulate-grad hooks fire as the autograd graph
-                    # walks; flush_pending_grads syncs the D2H
-                    # transfers into the CPU accumulator.
+                    # walks for non-NVFP4 params (their grads land in
+                    # ``_pending_grads``); ``accumulate_grads_to_cpu``
+                    # drains that queue AND consumes the NVFP4 mode-3
+                    # stash (``module._latest_grad_w``) in one pass.
+                    # ``flush_manual_flush_params`` then handles the
+                    # tied-embed param whose hook was deliberately
+                    # skipped (idempotent: grad is already None after
+                    # accumulate_grads_to_cpu drained it).
                     chunk_loss.backward()
-                    flush_pending_grads(sync_device=gpus[rank])
+                    accumulate_grads_to_cpu(
+                        [muon_opt, adamw_opt], sync_device=gpus[rank],
+                    )
                     flush_manual_flush_params([muon_opt, adamw_opt])
                     if getattr(args, "empty_cache_between_mb", True):
                         torch.cuda.empty_cache()
@@ -999,7 +1049,11 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # gradient_accumulation_steps" gate collapses to
                 # "every step is a step" — the chunked forward IS
                 # the gradient accumulation (n_chunks = gas).
-                flush_pending_grads(sync_device=gpus[rank])
+                # Drain any remaining NVFP4 stashes (idempotent if
+                # already drained per-chunk).
+                accumulate_grads_to_cpu(
+                    [muon_opt, adamw_opt], sync_device=gpus[rank],
+                )
                 # Inf/nan check on the accumulated CPU grads.
                 found_inf = False
                 n_nan_accum_total = 0

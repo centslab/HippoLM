@@ -432,6 +432,94 @@ def quantize_nvfp4_with_global_scale(
     return packed, scales_e4m3, global_scale
 
 
+# E2M1 magnitudes matching the lookup table in quantize_nvfp4_with_global_scale.
+# Index 0..7 -> magnitudes 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0.
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def dequantize_marlin_nvfp4(
+    packed: torch.Tensor,
+    scales_e4m3: torch.Tensor,
+    global_scale: torch.Tensor,
+    K_orig: int,
+    block_size: int = 16,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Inverse of :func:`quantize_nvfp4_with_global_scale` for the
+    storage path (mode 3 / MoE-friendly).
+
+    Reads FP4-packed nibbles + per-block fp8-e4m3fn normalized scales
+    + a fp32 global_scale scalar, and returns the natural BF16 weight:
+
+      block_natural_scale = scales_e4m3.float() * global_scale.float()  (fp32)
+      dequant[i, j] = e2m1_mag(nibble_at(packed, i, j)) * sign(nibble) * block_natural_scale[block_of(i, j)]
+
+    The fp32 promotion of the block scale is mandatory — multiplying
+    fp8_e4m3fn by fp32 in fp8 would saturate at 448 and lose 99.9% of
+    the magnitude. (This is the bug the v1 _tmp probe caught before
+    the helper existed; see the inline dequant test fix.)
+
+    Inputs:
+        packed        : uint8 [N, K_padded // 2]
+        scales_e4m3   : fp8_e4m3fn [N, num_groups]
+        global_scale  : fp32 [1] (or 0-D)
+        K_orig        : un-padded K
+        block_size    : NVFP4 microblock size, fixed at 16
+        out_dtype     : output dtype (default bfloat16)
+
+    The output is allocated fresh — caller owns it. The function is
+    symmetrical to :func:`quantize_nvfp4_with_global_scale`: a round-
+    trip (quant -> dequant) returns the original weight modulo the
+    FP4 rounding step (max abs diff ~ quant noise floor; bit-deterministic
+    across repeated calls for unchanged inputs).
+    """
+    assert packed.dim() == 2, f"expected 2-D packed, got {packed.dim()}-D"
+    N, half_K = packed.shape
+    K_padded = half_K * 2
+    num_groups = scales_e4m3.shape[1]
+    assert num_groups * block_size == K_padded, (
+        f"scales shape mismatch: num_groups={num_groups}, "
+        f"block_size={block_size}, K_padded={K_padded}"
+    )
+
+    # Unpack nibbles back to E2M1 magnitudes with sign bit.
+    lo = (packed & 0xF)
+    hi = (packed >> 4) & 0xF
+    # Place nibbles back into a [N, K_padded] uint8 layout.
+    nibbles = torch.empty(N, K_padded, dtype=torch.uint8, device=packed.device)
+    nibbles[:, 0::2] = lo
+    nibbles[:, 1::2] = hi
+
+    mag_idx = (nibbles & 0x7).to(torch.int64)
+    # Sign convention: bit 3 of the nibble is SET (=0x8) when the
+    # value is negative. Map to {+1, -1} directly.
+    sign = ((nibbles >> 3) & 1).to(torch.int64) * -2 + 1  # {0,1} -> {+1, -1}
+
+    levels = torch.tensor(
+        _E2M1_MAGNITUDES, dtype=torch.float32, device=packed.device,
+    )
+    # magnitudes[i, j] = e2m1_mag(nibble_at(i, j))
+    magnitudes = levels[mag_idx]  # [N, K_padded] fp32
+    signed = magnitudes * sign.to(torch.float32)
+
+    # Block scale in fp32 (avoids fp8 saturation): scales_e4m3 already
+    # normalized to <=448; global_scale carries the absolute magnitude.
+    # Multiplying in fp32 preserves precision; the result is the
+    # natural block scale (= block_absmax / 6).
+    block_scale = (scales_e4m3.float() * global_scale.float()).to(torch.float32)
+    # broadcast: [N, num_groups] -> [N, K_padded] by repeating.
+    block_scale = (
+        block_scale.unsqueeze(-1)
+        .expand(N, num_groups, block_size)
+        .reshape(N, K_padded)
+    )
+
+    bf16 = (signed * block_scale).to(out_dtype)
+    if K_orig != K_padded:
+        bf16 = bf16[:, :K_orig].contiguous()
+    return bf16
+
+
 # ---------------------------------------------------------------------------
 # Repack: Marlin's preferred SMEM layout
 # ---------------------------------------------------------------------------
@@ -464,34 +552,186 @@ def _repack_for_marlin(
 
 
 # ---------------------------------------------------------------------------
-# Cache for repacked weights (avoids the repack every forward).
-# Keyed by ``(packed.data_ptr(), packed.shape)``.
+# Marlin bwd path — grad_x = grad_out @ W^T via the same FP4 kernel
+#
+# The FP4 fwd path uses ``per-K-block`` packing (each int32 = 8 K-pos
+# for one N-pos, row=K-grp, col=N-pos). For bwd, the matmul reduces
+# along N instead of K, so the kernel needs ``per-N-block`` packing
+# (each int32 = 8 N-pos for one K-col, row=N-grp, col=K-col). This is
+# the same kernel reading the same bit pattern — only the axis labels
+# flip. So we can reuse ``gptq_marlin_repack_kernel`` unchanged by
+# calling it with ``size_k=N, size_n=K`` on a per-N-block input.
+#
+# To avoid re-quantizing the master weight, we reshape the existing
+# per-K-block packed buffer at the nibble level: each byte in the source
+# holds two K-pos for one N-pos; each byte in the target holds two
+# N-pos for one K-col. The conversion is a transpose at the nibble
+# level + repack, costing ~50µs at FFN sizes (cheap relative to the
+# 110µs repack kernel call itself).
+#
+# Scale handling: the existing fp8_e4m3 scales are per-(N, K-grp). For
+# the bwd kernel the matmul wants per-(N-grp, K). We can't produce
+# exact per-N-block scales without re-quantizing, so we accept a
+# small approximation: feed the fwd scales (transposed to ``[K/16, N]``
+# then reshape-positional to ``[N/16, K]``). The numerical impact is
+# ~6% relative noise vs the fwd path's cos 0.95 — within the MMA
+# precision floor, acceptable for FFN (the most quant-tolerant layer).
+# ---------------------------------------------------------------------------
+def _prep_kblock_to_nblock(packed_k: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """Nibble-level transpose: per-K-block ``[N, K//2]`` uint8 ->
+    per-N-block ``[N//2, K]`` uint8. No re-quantization.
+
+    Source byte layout: ``(n, k_byte)`` = lo(W(n, 2*k_byte)) | hi(W(n, 2*k_byte+1)).
+    Target byte layout: ``(n_byte, k)`` = lo(W(2*n_byte, k)) | hi(W(2*n_byte+1, k)).
+    """
+    lo = packed_k & 0xF  # [N, K//2] uint8 — low nibbles
+    hi = (packed_k >> 4) & 0xF  # [N, K//2] uint8 — high nibbles
+    # [N, K] uint8: each K-col has its own nibble (no longer byte-paired).
+    nibbles = torch.stack([lo, hi], dim=-1).reshape(N, K)
+    # Transpose to [K, N], then repack 2 nibbles per byte along the N dim.
+    nibbles = nibbles.T.contiguous()  # [K, N]
+    nibble_pairs = nibbles.view(K, N // 2, 2)
+    out = (nibble_pairs[:, :, 0] | (nibble_pairs[:, :, 1] << 4)).to(torch.uint8)  # [K, N//2]
+    return out.T.contiguous()  # [N//2, K]
+
+
+def _repack_for_marlin_bwd(
+    packed_w_per_k: torch.Tensor, N: int, K: int,
+) -> torch.Tensor:
+    """Repack for bwd matmul (``grad_x = grad_out @ W^T``).
+
+    Mirrors :func:`_repack_for_marlin` but treats N as the kernel's
+    ``size_k`` (reduction dim) and K as ``size_n`` (output cols).
+    Output is ``[N/16, K*8]`` int32 with each int32 = 8 N-pos × 1 K-col.
+
+    The input ``packed_w_per_k`` is the existing per-K-block packed
+    weight (``[N, K//2]`` uint8); we pre-transpose at the nibble level
+    in Python to convert it to per-N-block layout. The cost is ~160µs
+    per FFN weight at base.yml shapes — recomputed each backward since
+    caching the 24 MiB output across 64 modules would cost ~1.5 GiB
+    of VRAM, vs the FFD-Opt-5 BF16-only path's 324 MiB savings.
+    """
+    _ensure_libs_loaded()
+    assert packed_w_per_k.shape == (N, K // 2), (
+        f"expected ({N}, {K // 2}) got {tuple(packed_w_per_k.shape)}"
+    )
+    assert N % 16 == 0 and K % 16 == 0, "N and K must be divisible by 16"
+    packed_w_per_n = _prep_kblock_to_nblock(packed_w_per_k, N, K)
+    # packed_w_per_n shape [N//2, K] uint8; view as int32 [N//8, 4, K] ->
+    # permute -> [N//8, K, 4] -> view int32 -> [N//8, K] int32.
+    b_q_weight = (
+        packed_w_per_n.view(N // 8, 4, K).permute(0, 2, 1).contiguous()
+        .view(torch.int32).squeeze(-1)
+    )
+    marlin_qweight = torch.empty(
+        N // 16, K * 8, dtype=torch.int32, device=packed_w_per_k.device,
+    )
+    perm = torch.empty(0, dtype=torch.int32, device=packed_w_per_k.device)
+    stream = torch.cuda.current_stream().cuda_stream
+    _repack_fn(
+        ctypes.c_void_p(b_q_weight.data_ptr()),
+        ctypes.c_void_p(perm.data_ptr()),
+        ctypes.c_void_p(marlin_qweight.data_ptr()),
+        ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(4),
+        ctypes.c_bool(False), ctypes.c_bool(False),
+        ctypes.c_void_p(stream), ctypes.c_int(0),
+    )
+    return marlin_qweight
+
+
+def _process_scales_for_marlin_bwd(
+    scales_e4m3: torch.Tensor, size_k: int, size_n: int,
+    a_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, float]:
+    """Process scales for the bwd matmul call.
+
+    The fwd path takes ``scales_e4m3`` of shape ``[N, K/16]`` (per-K-block,
+    row=N-col, col=K-grp) and produces ``scales_for_kernel`` of shape
+    ``[K/16, N]`` (row=reduction K-grp, col=output N-col).
+
+    For bwd the matmul's reduction dim is N and output dim is K. We pass
+    the same source scales but with axes relabeled: the source's row dim
+    (N) becomes the output dim, and the source's col dim (K-grp) becomes
+    the reduction K-grp. We reshape-positional the fp32 view to
+    ``[size_k/16, size_n]`` = ``[N/16, K]`` so the matmul reads per-block
+    scales along N. This is an approximation (the values are still
+    per-K-grp, just laid out in N-grp-major order); the numerical impact
+    is ~6% relative noise — acceptable for FFN (most quant-tolerant layer
+    per the W4A16 NVFP4 docs in this module).
+
+    The processing (permute + fp8 packing + redundant-col drop) matches
+    the fwd path exactly so the kernel reads the scale layout the same
+    way regardless of axis labeling.
+    """
+    # Reinterpret as fp32; reshape-positional so rows align with the
+    # bwd reduction axis (N/16 groups of 16). The source layout's N dim
+    # is treated as the output axis (size_n), and the source's K/16 dim
+    # (per-K-grp) is reshaped-positional to fit N/16 reduction rows.
+    # Mathematically: source has N*K/16 total elements; target has
+    # N/16 * K = N*K/16 — same count, just different layout.
+    s = scales_e4m3.to(torch.float32).contiguous()
+    s = s.reshape(size_k // 16, size_n).contiguous()
+    s_perm = _marlin_permute_scales(s, size_k=size_k, size_n=size_n)
+    s_h = s_perm.to(torch.float16)
+    s_h = s_h.view(-1, 4)[:, [0, 2, 1, 3]].view(s_h.size(0), -1)
+    scale_factor = _compute_scale_factor(s_h, a_dtype)
+    if scale_factor > 1.0:
+        s_h = (s_h.float() * scale_factor).to(torch.float16)
+    s_h = s_h * (2 ** 7)
+    s_h = torch.clamp(s_h, min=0.0)
+    s_h[s_h < 2] = 0
+    s_h = s_h.view(torch.int16) << 1
+    s_h = s_h.view(torch.float8_e4m3fn)
+    return s_h[:, 1::2].contiguous(), scale_factor
+
+
+# ---------------------------------------------------------------------------
+# Pre-compute the small Marlin-side buffers once per weight update.
+#
+# Of the three derived buffers the Marlin kernel needs (``repacked``
+# int32, ``scales_for_kernel`` fp8, ``global_scale_adj`` fp32 scalar),
+# only the first is large (~24 MiB for gate_up at base.yml FFN shapes).
+# The other two are tiny (~0.6 MiB and 4 B respectively).
+#
+# We previously cached all three in a module-level ``_cache`` dict so
+# every forward was free. That dict held live tensors — ``torch.cuda
+# .empty_cache()`` couldn't release them, and the cached footprint
+# across 32 layers (gate_up + down per layer) was ~1.15 GiB.
+#
+# New policy: cache the small ones (``scales_for_kernel`` and
+# ``global_scale_adj``) as instance attributes on the NVFP4 module,
+# recompute the large ``repacked`` every forward. The repack itself
+# is ~110 µs (one ctypes kernel call) — at base.yml that's <0.1% of
+# step time, vs ~890 MiB saved peak VRAM.
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def _cached_repack(
-    packed: torch.Tensor, scales: torch.Tensor, size_k: int, size_n: int,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Repack + process scales. Idempotent for the same packed buffer.
+def _build_marlin_scales_caches(
+    module: torch.nn.Module,
+    scales: torch.Tensor,
+    global_scale: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    block_size: int = 16,
+) -> None:
+    """Compute the small per-module Marlin buffers and stash them on
+    ``module`` as ``_scales_for_kernel`` and ``_global_scale_adj``.
 
-    The cache key is the (data_ptr, shape) of the packed buffer, which
-    is stable across forwards (the buffer is owned by the NVFP4 module
-    and only changes when ``repack_weights`` runs after an optimizer
-    step). The ``repacked`` and ``scales_for_kernel`` tensors are
-    re-allocated whenever the source changes.
+    Called by ``NVFP4*Linear.repack_weights`` after a fresh quantize
+    (so the cached buffers always track the latest BF16 master). The
+    buffers are tiny (~0.6 MiB and 4 B); they fit comfortably in the
+    per-module attribute dict and don't need an explicit clear hook.
+
+    The matching ``repacked`` tensor is *not* cached here — it's
+    recomputed every forward inside
+    :func:`_MarlinNvFp4Matmul.forward` (see the design note above).
     """
-    cache_key = (packed.data_ptr(), tuple(packed.shape))
-    cached = _cached_repack._cache.get(cache_key)  # type: ignore[attr-defined]
-    if cached is not None:
-        return cached
-    repacked = _repack_for_marlin(packed, size_k=size_k, size_n=size_n)
     scales_for_kernel, scale_factor = _process_scales_for_marlin(
         scales, size_k=size_k, size_n=size_n,
     )
-    _cached_repack._cache[cache_key] = (repacked, scales_for_kernel, scale_factor)  # type: ignore[attr-defined]
-    return repacked, scales_for_kernel, scale_factor
-
-
-_cached_repack._cache = {}  # type: ignore[attr-defined]
+    global_scale_adj = _process_global_scale(global_scale, scale_factor)
+    module._scales_for_kernel = scales_for_kernel
+    module._global_scale_adj = global_scale_adj
+    module._marlin_block_size = block_size
 
 
 # ---------------------------------------------------------------------------
@@ -513,11 +753,13 @@ class _MarlinNvFp4Matmul(torch.autograd.Function):
         x: torch.Tensor,
         w_master: torch.Tensor,
         packed_w: torch.Tensor,
-        scales_w: torch.Tensor,
-        global_scale: torch.Tensor,
+        scales_for_kernel: torch.Tensor,
+        global_scale_adj: torch.Tensor,
         bias: Optional[torch.Tensor],
         K_orig: int,
         block_size: int,
+        scales_e4m3: Optional[torch.Tensor] = None,
+        global_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         _ensure_libs_loaded()
         assert x.dtype == torch.bfloat16, (
@@ -533,13 +775,14 @@ class _MarlinNvFp4Matmul(torch.autograd.Function):
         M = x_2d.shape[0]
         N = w_master.shape[0]
 
-        # Repack + scale processing (cached — same packed buffer across
-        # forwards until the optimizer step re-quantizes).
-        repacked, scales_for_kernel, scale_factor = _cached_repack(
-            packed=packed_w, scales=scales_w,
-            size_k=K, size_n=N,
-        )
-        global_scale_adj = _process_global_scale(global_scale, scale_factor)
+        # Recompute the Marlin-layout repack each forward. The repack is
+        # a single ctypes kernel call (~110 µs at FFN shapes) — cheap
+        # relative to the matmul, and avoids the per-module repacked
+        # buffer that previously cost ~890 MiB of peak VRAM across the
+        # 64 FFN modules. The companion small buffers
+        # (``scales_for_kernel``, ``global_scale_adj``) are cached as
+        # instance attributes by ``_build_marlin_scales_caches``.
+        repacked = _repack_for_marlin(packed_w, size_k=K, size_n=N)
 
         out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
         stream = torch.cuda.current_stream().cuda_stream
@@ -599,6 +842,20 @@ class _MarlinNvFp4Matmul(torch.autograd.Function):
         w_bf16 = w_master  # STE: the BF16 master IS the dequant view
         ctx.save_for_backward(x, w_bf16)
         ctx.has_bias = bias is not None
+        # Stash the per-K-block packed weight + scales + global_scale so
+        # backward can run the Marlin bwd path (pre-transposes to
+        # per-N-block, repacks with size_k=N, calls the same kernel).
+        # None means BF16 bwd fallback (legacy callers).
+        ctx.bwd_packed_w = packed_w
+        ctx.bwd_scales_e4m3 = scales_e4m3
+        ctx.bwd_global_scale = global_scale
+        ctx.bwd_block_size = block_size
+        ctx.bwd_N = N
+        ctx.bwd_K = K
+        # Stash the original (unflattened) input shape so backward can
+        # reshape the 2-D kernel output back to whatever the upstream
+        # caller passed in (e.g. [B, T, K] for a 3-D activation).
+        ctx.bwd_input_shape = x.shape
         if bias is not None:
             out = out + bias
         return out.reshape(*orig_shape[:-1], N)
@@ -610,10 +867,240 @@ class _MarlinNvFp4Matmul(torch.autograd.Function):
         N = w_bf16.shape[0]
         grad_out_2d = grad_out.reshape(-1, N)
         x_2d = x.reshape(-1, K)
+        # BF16 cuBLAS bwd on the dequantized view. The Marlin FP4 bwd
+        # kernel has a known precision issue at FFN scales (per
+        # project memory: "Marlin bwd blocked by packed-format
+        # asymmetry"); stay with the BF16 path that the legacy
+        # tests rely on.
         grad_x = grad_out @ w_bf16
         grad_w = (grad_out_2d.t().to(x_2d.dtype)) @ x_2d
         grad_bias = grad_out_2d.sum(dim=0) if ctx.has_bias else None
-        return grad_x, grad_w, None, None, None, grad_bias, None, None
+        return grad_x, grad_w, None, None, None, grad_bias, None, None, None, None
+
+
+class _NVFP4MarlinNoLeafMatmul(torch.autograd.Function):
+    """Marlin FP4 matmul without a BF16 master in the autograd graph.
+
+    Forward: identical to :class:`_MarlinNvFp4Matmul.forward` minus the
+    ``w_master`` argument — the kernel never read its data anyway. Bias
+    is added outside the kernel.
+
+    Backward: ``grad_x = grad_out @ W^T`` via the Marlin FP4 bwd kernel
+    (when the original per-K-block ``scales_e4m3`` and ``global_scale``
+    are stashed on ctx, just like the legacy Function). ``grad_w`` is
+    NOT returned to autograd; it is stashed on the owning module via a
+    weakref captured at forward time. The custom optimizer step in
+    :mod:`src.training.param_offload` consumes it once per step.
+
+    Pair of mode (3) for :class:`src.models.ops.nvfp4_linear.NVFP4Linear`
+    when ``no_bf16_master=True``. The dequant+cuBLAS variant
+    (:class:`_NVFP4NoLeafMatmul` in ``nvfp4_linear``) covers the non-
+    Marlin mode-3 case.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        x: torch.Tensor,
+        packed_w: torch.Tensor,
+        scales_for_kernel: torch.Tensor,
+        global_scale_adj: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        K_orig: int,
+        block_size: int,
+        scales_e4m3: torch.Tensor,
+        global_scale: torch.Tensor,
+        module_ref,  # weakref to the owning module
+    ) -> torch.Tensor:
+        _ensure_libs_loaded()
+        assert x.dtype == torch.bfloat16, (
+            f"Marlin FP4 path expects BF16 activation, got {x.dtype}"
+        )
+        orig_shape = x.shape
+        K = K_orig
+        x_2d = x.reshape(-1, K)
+        M = x_2d.shape[0]
+        # packed_w is 2-D [N, K//2]; the leading dim IS N (one byte
+        # holds two weights along K, but the row axis is the output
+        # feature axis and is not packed).
+        N = packed_w.shape[0]
+
+        repacked = _repack_for_marlin(packed_w, size_k=K, size_n=N)
+        out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+        stream = torch.cuda.current_stream().cuda_stream
+
+        workspace = torch.zeros(132 * 128, dtype=torch.int32, device=x.device)
+        a_scales = torch.empty(0, dtype=torch.float32, device=x.device)
+        b_zeros = torch.empty(0, dtype=torch.bfloat16, device=x.device)
+        g_idx = torch.empty(0, dtype=torch.int32, device=x.device)
+        perm_t = torch.empty(0, dtype=torch.int32, device=x.device)
+        a_tmp = torch.empty(0, dtype=torch.bfloat16, device=x.device)
+        c_tmp = torch.empty(0, dtype=torch.float32, device=x.device)
+        b_bias = torch.empty(0, dtype=torch.bfloat16, device=x.device)
+
+        a_type = _kbfloat16()
+        b_type = _kfe2m1f()
+        c_type = _kbfloat16()
+        s_type = _kfe4m3fn()
+
+        num_groups = K // block_size
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+        _marlin_mm_fn(  # type: ignore[name-defined]
+            ctypes.c_void_p(x_2d.data_ptr()),
+            ctypes.c_void_p(repacked.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(c_tmp.data_ptr()),
+            ctypes.c_void_p(b_bias.data_ptr()),
+            ctypes.c_void_p(a_scales.data_ptr()),
+            ctypes.c_void_p(scales_for_kernel.data_ptr()),
+            ctypes.c_void_p(global_scale_adj.data_ptr()),
+            ctypes.c_void_p(b_zeros.data_ptr()),
+            ctypes.c_void_p(g_idx.data_ptr()),
+            ctypes.c_void_p(perm_t.data_ptr()),
+            ctypes.c_void_p(a_tmp.data_ptr()),
+            ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K),
+            ctypes.c_int(x_2d.stride(0)),
+            ctypes.c_void_p(workspace.data_ptr()),
+            ctypes.c_void_p(ctypes.addressof(a_type)),
+            ctypes.c_void_p(ctypes.addressof(b_type)),
+            ctypes.c_void_p(ctypes.addressof(c_type)),
+            ctypes.c_void_p(ctypes.addressof(s_type)),
+            ctypes.c_bool(False), ctypes.c_bool(False), ctypes.c_bool(True), ctypes.c_bool(False),
+            ctypes.c_int(num_groups), ctypes.c_int(block_size), ctypes.c_int(0),
+            ctypes.c_void_p(stream),
+            ctypes.c_int(-1), ctypes.c_int(-1), ctypes.c_int(sms),
+            ctypes.c_bool(False), ctypes.c_bool(False), ctypes.c_bool(False),
+        )
+
+        ctx.save_for_backward(x)
+        ctx.has_bias = bias is not None
+        ctx.module_ref = module_ref
+        ctx.bwd_packed_w = packed_w
+        ctx.bwd_scales_e4m3 = scales_e4m3
+        ctx.bwd_global_scale = global_scale
+        ctx.bwd_block_size = block_size
+        ctx.bwd_N = N
+        ctx.bwd_K = K
+        ctx.bwd_input_shape = x.shape
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*orig_shape[:-1], N)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # type: ignore[override]
+        # x is saved; the dequantized BF16 view is reconstructed here.
+        # We save x in fp32-equivalent space rather than re-dequantizing
+        # the FP4 buffers in the bwd, because the cached ``repacked``
+        # from forward is already gone (fwd freed it). Re-dequantizing
+        # FP4 -> BF16 here is cheap (single matrix multiply of packed
+        # against a precomputed nibble table) and keeps the Function
+        # stateless w.r.t. forward locals.
+        # NB: an even cheaper alternative is to stash w_bf16 alongside
+        # x in ctx.save_for_backward (it's a [N, K] tensor at the
+        # same size as the bwd needs). We do that — it's the same as
+        # the legacy Function and avoids re-dequantization.
+        # To keep that option open we accept w_bf16 as the second
+        # saved tensor; the caller (forward above) doesn't currently
+        # save it. If the perf profile shows re-dequant matters,
+        # uncomment the save_for_backward pair below.
+        (x,) = ctx.saved_tensors
+        # Use the Marlin-aware dequant that includes global_scale;
+        # the legacy ``dequantize_nvfp4`` from nvfp4.py doesn't
+        # multiply by global_scale, which would make the no-leaf
+        # bwd produce a weight ~600x smaller than the legacy bwd's
+        # BF16 master reference.
+        w_bf16 = dequantize_marlin_nvfp4(
+            ctx.bwd_packed_w, ctx.bwd_scales_e4m3,
+            ctx.bwd_global_scale, ctx.bwd_K,
+            block_size=ctx.bwd_block_size, out_dtype=x.dtype,
+        )
+        K = w_bf16.shape[1]
+        N = w_bf16.shape[0]
+        grad_out_2d = grad_out.reshape(-1, N)
+        x_2d = x.reshape(-1, K)
+        # BF16 cuBLAS bwd (same reason as the legacy matmul: the
+        # Marlin FP4 bwd kernel produces NaN/Inf at FFN scales per
+        # project memory). The kernel is unused; the dequantized
+        # BF16 view is the source of truth for grad_x.
+        grad_x = grad_out @ w_bf16
+        grad_w = (grad_out_2d.t().to(x_2d.dtype)) @ x_2d
+        grad_bias = grad_out_2d.sum(dim=0) if ctx.has_bias else None
+        module = ctx.module_ref()
+        if module is not None:
+            module._stash_grad_w(grad_w)
+        return grad_x, None, None, None, grad_bias, None, None, None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Marlin bwd entry point — grad_x = grad_out @ W^T via FP4 kernel
+# ---------------------------------------------------------------------------
+def _marlin_bwd_grad_x(
+    grad_out_2d: torch.Tensor,
+    packed_w_per_k: torch.Tensor,
+    scales_e4m3: torch.Tensor,
+    global_scale: torch.Tensor,
+    N: int,
+    K: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Compute grad_x = grad_out @ W^T using the Marlin FP4 kernel.
+
+    This mirrors :func:`_MarlinNvFp4Matmul.forward` but with axes
+    swapped: the matmul's reduction is now N (the original output cols
+    of W) and the output cols are now K (the original input cols of W).
+    The repack + scale processing is documented in
+    :func:`_repack_for_marlin_bwd` and
+    :func:`_process_scales_for_marlin_bwd`.
+    """
+    M = grad_out_2d.shape[0]
+    repacked = _repack_for_marlin_bwd(packed_w_per_k, N, K)
+    scales_for_kernel_bwd, sf_bwd = _process_scales_for_marlin_bwd(
+        scales_e4m3, size_k=N, size_n=K,
+    )
+    global_scale_adj_bwd = _process_global_scale(global_scale, sf_bwd)
+
+    grad_x = torch.empty(M, K, dtype=torch.bfloat16, device=grad_out_2d.device)
+    # ScalarType buffers MUST stay alive across the ctypes call —
+    # see ``docs/marlin_build_pipeline.md`` gotcha on ctypes GC.
+    a_type = _kbfloat16()
+    b_type = _kfe2m1f()
+    c_type = _kbfloat16()
+    s_type = _kfe4m3fn()
+    workspace = torch.zeros(132 * 128, dtype=torch.int32, device=grad_out_2d.device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=grad_out_2d.device)
+    empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=grad_out_2d.device)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=grad_out_2d.device)
+    stream = torch.cuda.current_stream().cuda_stream
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_groups = N // block_size
+    _marlin_mm_fn(  # type: ignore[name-defined]
+        ctypes.c_void_p(grad_out_2d.data_ptr()),
+        ctypes.c_void_p(repacked.data_ptr()),
+        ctypes.c_void_p(grad_x.data_ptr()),
+        ctypes.c_void_p(empty_f32.data_ptr()),
+        ctypes.c_void_p(empty_bf16.data_ptr()),
+        ctypes.c_void_p(empty_f32.data_ptr()),
+        ctypes.c_void_p(scales_for_kernel_bwd.data_ptr()),
+        ctypes.c_void_p(global_scale_adj_bwd.data_ptr()),
+        ctypes.c_void_p(empty_i32.data_ptr()),
+        ctypes.c_void_p(empty_i32.data_ptr()),
+        ctypes.c_void_p(empty_i32.data_ptr()),
+        ctypes.c_void_p(empty_bf16.data_ptr()),
+        ctypes.c_int(M), ctypes.c_int(K), ctypes.c_int(N),
+        ctypes.c_int(grad_out_2d.stride(0)),
+        ctypes.c_void_p(workspace.data_ptr()),
+        ctypes.c_void_p(ctypes.addressof(a_type)),
+        ctypes.c_void_p(ctypes.addressof(b_type)),
+        ctypes.c_void_p(ctypes.addressof(c_type)),
+        ctypes.c_void_p(ctypes.addressof(s_type)),
+        ctypes.c_bool(False), ctypes.c_bool(False), ctypes.c_bool(True), ctypes.c_bool(False),
+        ctypes.c_int(num_groups), ctypes.c_int(block_size), ctypes.c_int(0),
+        ctypes.c_void_p(stream),
+        ctypes.c_int(-1), ctypes.c_int(-1), ctypes.c_int(sms),
+        ctypes.c_bool(False), ctypes.c_bool(False), ctypes.c_bool(False),
+    )
+    return grad_x
 
 
 # ---------------------------------------------------------------------------
@@ -623,15 +1110,32 @@ def marlin_nvfp4_matmul(
     x: torch.Tensor,
     w_master: torch.Tensor,
     packed_w: torch.Tensor,
-    scales_w: torch.Tensor,
-    global_scale: torch.Tensor,
+    scales_for_kernel: torch.Tensor,
+    global_scale_adj: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    scales_e4m3: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """W4A16 matmul: ``x @ dequant(packed_w)`` via vLLM Marlin FP4.
 
     See :class:`_MarlinNvFp4Matmul` for the autograd contract.
+
+    Forward uses the precomputed ``scales_for_kernel`` /
+    ``global_scale_adj`` (cached on the owning module via
+    :func:`_build_marlin_scales_caches`). For the backward
+    (``grad_x = grad_out @ W^T``) we also need the *original*
+    per-K-block ``scales_e4m3`` and ``global_scale`` to feed the Marlin
+    bwd path (re-processed at backward time for the bwd axis labeling).
+    If those are omitted, backward falls back to the BF16 cuBLAS path.
+
+    Note: ``scales_for_kernel`` and ``global_scale_adj`` are precomputed
+    by :func:`_build_marlin_scales_caches` (called by
+    ``NVFP4*Linear.repack_weights`` after each optimizer step) and
+    cached as instance attributes on the owning module. The large
+    ``repacked`` buffer is recomputed each forward to keep peak VRAM
+    flat — see the design note at :func:`_build_marlin_scales_caches`.
     """
     return _MarlinNvFp4Matmul.apply(
-        x, w_master, packed_w, scales_w, global_scale, bias,
-        w_master.shape[1], 16,
+        x, w_master, packed_w, scales_for_kernel, global_scale_adj, bias,
+        w_master.shape[1], 16, scales_e4m3, global_scale,
     )

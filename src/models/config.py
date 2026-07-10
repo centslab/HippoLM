@@ -93,6 +93,16 @@ class HippoConfig:
     # safer dequant+cuBLAS path until the Marlin flow has been
     # smoke-tested on this config).
     ffn_nvfp4_marlin: bool = False
+    # When ``ffn_nvfp4_marlin`` is True, drop the BF16 master weight
+    # from the autograd leaf set entirely. The FP4 packed buffers
+    # ARE the source of truth; the optimizer applies updates at the
+    # FP4 level via chunked material/commit (per-tensor BF16 peak
+    # bounded). Saves ~24 MiB per NVFP4 module (12 MiB on each of
+    # CPU pinned and GPU H2D staging at base.yml). Ignored when
+    # ``ffn_nvfp4_marlin`` is False. Requires the optimizer-side
+    # ``register_nvfp4_module`` path (CPUAdamW / CPUMuon). Default
+    # False for safety.
+    ffn_nvfp4_no_bf16_master: bool = False
 
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (

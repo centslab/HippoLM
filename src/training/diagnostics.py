@@ -65,10 +65,25 @@ def _max_over_states(
     Reads ``getattr(s, attr)`` on each entry and returns the
     scalar max abs. If the dict is empty, returns 0.0 (matches
     the default of ``max(..., default=0.0)`` at the call sites).
+
+    NVFP4 mode-3 entries (``s.nvfp4_module is not None``) have
+    ``s.param is None`` because the weight lives on the module
+    as FP4 packed buffers. Reading ``param`` on those would
+    crash; instead we proxy through ``packed_weight`` (the FP4
+    byte storage) so the diagnostic still emits a meaningful
+    magnitude. The user-visible difference is just the dtype
+    of the value (uint8 for FP4 bytes vs whatever the BF16
+    weight would be) — the abs-max utility handles both.
     """
     if not state:
         return 0.0
-    return max(amax_cpu(getattr(s, attr)) for s in state.values())
+    vals = []
+    for s in state.values():
+        if s.nvfp4_module is not None:
+            vals.append(amax_cpu(s.nvfp4_module.packed_weight))
+        else:
+            vals.append(amax_cpu(getattr(s, attr)))
+    return max(vals)
 
 
 def log_pre_step_diag(
@@ -144,6 +159,21 @@ def log_post_opt_diag(
     nan_pmax = 0.0
     nan_first: Optional[tuple] = None
     for s in state.values():
+        # NVFP4 mode-3 entries have no ``s.param``; substitute
+        # the FP4 packed buffer so the diagnostic still scans
+        # something meaningful (the FP4 byte storage — uint8
+        # always finite, so it never triggers the non-finite
+        # branch, but the all-finite branch will report its
+        # max abs).
+        if s.nvfp4_module is not None:
+            v = s.nvfp4_module.packed_weight
+            if not torch.isfinite(v.float()).all():
+                am = v.detach().float().abs().max().item()
+                if math.isnan(am) or am > nan_pmax:
+                    nan_pmax = am
+                    if nan_first is None:
+                        nan_first = (s.nvfp4_module.packed_weight.shape, am)
+            continue
         v = s.param.data
         if not torch.isfinite(v).all():
             am = v.detach().abs().max().item()

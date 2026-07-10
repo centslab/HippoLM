@@ -15,6 +15,15 @@ also True), the forward matmul uses vLLM's Marlin FP4 kernel
 (BF16 MMA + register dequant + cp.async double-buffered prefetch)
 instead of the dequant+cuBLAS path. ~3.5x speedup at FFN shapes
 on sm_120 (47-49 TFLOPS).
+
+When ``config.ffn_nvfp4_no_bf16_master`` is True (and ``ffn_nvfp4``
+AND ``ffn_nvfp4_marlin`` are both True), the BF16 master weight is
+not allocated at all on either CPU or GPU — only the FP4 packed
+buffers exist. The optimizer streams BF16 views through the module's
+``material/commit/apply_chunk_update`` API during the step (see
+:class:`NVFP4Linear` and :mod:`src.training.param_offload`). This is
+the storage mode that scales to MoE: a per-expert BF16 master at
+8+ experts and 32 layers would dominate VRAM.
 """
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,10 +46,18 @@ class SwiGLU(nn.Module):
         # True (the NVFP4 modules own the use_marlin flag — nn.Linear
         # ignores it).
         use_marlin = use_nvfp4 and getattr(config, "ffn_nvfp4_marlin", False)
+        # Mode (3) requires Marlin — the dequant+cuBLAS no-leaf Function
+        # exists in nvfp4_linear but isn't wired into the SwiGLU path
+        # yet (would need a per-call back-reference; see the comment at
+        # NVFP4Linear.__init__).
+        no_bf16_master = (
+            use_marlin and getattr(config, "ffn_nvfp4_no_bf16_master", False)
+        )
         Cls = NVFP4Linear if use_nvfp4 else nn.Linear
         kwargs = {"bias": config.use_bias}
         if use_nvfp4:
             kwargs["use_marlin"] = use_marlin
+            kwargs["no_bf16_master"] = no_bf16_master
         self.gate_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
         self.up_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
         self.down_proj = Cls(config.intermediate_size, config.hidden_size, **kwargs)

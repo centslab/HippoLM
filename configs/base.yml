@@ -100,5 +100,14 @@ empty_cache_between_mb: true
 kda_skip_aqk_akk_saved: false
 
 # FFN NVFP4 path
-ffn_nvfp4: false
-ffn_nvfp4_marlin: false
+ffn_nvfp4: true
+ffn_nvfp4_marlin: true
+# Drop the BF16 master weight entirely — only the FP4 packed buffers
+# exist on CPU/GPU. The optimizer streams BF16 views through the
+# module's material/commit/apply_chunk_update API at chunk granularity
+# (~8 MiB BF16 peak surface, regardless of module size). MoE-friendly:
+# the per-expert BF16 master that would otherwise scale linearly with
+# N_experts is eliminated. Requires ffn_nvfp4_marlin=true (the dequant+
+# cuBLAS no-leaf Function exists but isn't wired into the SwiGLU
+# pipeline yet).
+ffn_nvfp4_no_bf16_master: true

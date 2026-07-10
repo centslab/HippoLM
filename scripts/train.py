@@ -165,7 +165,14 @@ def train(args):
     # the logger at WARNING level.
     gpus, args.tp_sim = expand_for_tp_sim(gpus, args.tp_size, args.tp_sim)
 
-    log.info(
+    # ``log.warning`` (not ``log.info``) so the line is visible
+    # even before :func:`setup_logging` wires up the root
+    # handler — :func:`main` does not call it, so the default
+    # root logger (level=WARNING, no handler) would silently
+    # drop ``log.info``. Same reason :func:`log.warning` is
+    # used for the "no contiguous run" fallback a few lines
+    # above.
+    log.warning(
         "Selected contiguous TP group: %s (world_size=%d, sim=%s)",
         gpus, len(gpus), args.tp_sim,
     )

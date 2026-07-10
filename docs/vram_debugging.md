@@ -2,8 +2,9 @@
 
 This document captures the methodology, tools, and per-component
 breakdown for `python scripts/train.py --config configs/base.yml`
-(post opt-5/2: H=1536, L=32, num_blocks=8, V=248320, B=1, T=262144,
-**`ffn_nvfp4: false`**, 5060 Ti 16G target).
+(H=1536, L=32, num_blocks=8, V=248320, B=1, T=262144, **NVFP4 mode-3
+on**: `ffn_nvfp4: true` + `ffn_nvfp4_marlin: true` +
+`ffn_nvfp4_no_bf16_master: true`, 5060 Ti 16G target).
 
 **Audited 2026-07-06.** Earlier "RMSNorm.saved = 1.78 GiB" attribution
 in `/tmp/vram_report.md` was a misclassified bucket — the real content
@@ -11,6 +12,12 @@ was the KDA FP32 `g_cumsum` saves misattributed by the frame-based
 classifier. See §6 "Audit findings" below and
 `project_opt5_rmsnorm_residual_skip.md` in auto-memory for the full
 evidence chain.
+
+**Re-audited 2026-07-10.** The opt-5/2 BF16-only state was superseded
+by NVFP4 mode-3 (FP4 packed buffers ARE the source of truth; no BF16
+master on CPU/GPU). See §10 "Re-audit 2026-07-10: NVFP4 mode-3 baseline"
+for the corrected breakdown. §2 / §3.5 / §3.10 / §5.7 retain the
+opt-5/2-era numbers; §10 is the live production baseline.
 
 ## When to reach for this
 
@@ -304,17 +311,20 @@ Function saves. Ckpt'd layers' inner saves = 0 during ckpt'd fwd
 (wrapped fn runs in `no_grad()`; inner Functions don't call
 `save_for_backward`).
 
-### §3.5 FFN / SwiGLU (`src/models/tp_model/swiglu.py`)
+### §3.5 FFN / SwiGLU (`src/models/tp_model/swiglu.py`) — opt-5/2 era
+
+> **2026-07-10:** This section describes the opt-5/2 BF16-only state.
+> Current production runs NVFP4 mode-3 — see §10 for the live breakdown.
 
 Per-layer parameters (BF16 only since opt-5/2 — NVFP4 buffers were
-dropped on 2026-07-06):
+dropped on 2026-07-06, then re-introduced as mode-3 on 2026-07-10):
 - `gate_up_proj.weight` = `[2*I, H]` = `[8192, 1536]` bf16 = 24 MiB
 - `down_proj.weight` = `[H, I]` = `[1536, 4096]` bf16 = 12 MiB
 - **Per-layer FFN parameter total**: 36 MiB. × 32 layers = **1.13 GiB**
 
-There are NO `packed_weight` or `scales` buffers on GPU since opt-5/2
+There are NO `packed_weight` or `scales` buffers on GPU in opt-5/2 mode
 (`swiglu.py:42-48` guard forces plain `ColumnParallelLinear` /
-`RowParallelLinear`).
+`RowParallelLinear`). NVFP4 mode-3 reintroduces them — see §10.
 
 **Forward pass saves** (per F.linear's built-in autograd Function):
 
@@ -390,7 +400,10 @@ this path.
 Per §3.2: 6 boundary stacks `[N, B, T, H]` bf16 → **1008 MiB** at
 peak fwd_out (the 7th is consumed as input to block 8).
 
-### §3.10 Model weights (the "(no-frames)" 2.452 GiB bucket)
+### §3.10 Model weights (the "(no-frames)" 2.452 GiB bucket) — opt-5/2 era
+
+> **2026-07-10:** This section describes the opt-5/2 BF16-only state.
+> See §10 for the NVFP4 mode-3 baseline.
 
 Allocated before `torch.cuda.memory._record_memory_history` was
 enabled, hence no frames. Walked via
@@ -529,18 +542,27 @@ cleaned by per-chunk `empty_cache`. The earlier FLCE chunking attempt
 (`project_flce_dw_chunking.md`) confirmed `HWM unchanged` because
 the saved-tensors budget dominates and the cache is recycled.
 
-### §5.7 NVFP4 is OFF in production (since opt-5/2, 2026-07-06)
+### §5.7 NVFP4 state (re-audited 2026-07-10)
 
-`ffn_nvfp4: false` in `configs/base.yml`. The NVFP4 `packed_weight`
-and `scales` buffers are NO longer allocated on GPU; only the BF16
-master remains (1.13 GiB total). Earlier VRAM reports showing 1.45
-GiB NVFP4 buffers (master + packed + scales) are stale — opt-5/2
-shipped. See `project_opt5_bf16_only_ffn.md` for the perf data.
+**Current production state (NVFP4 mode-3, ON):**
+- `configs/base.yml` has `ffn_nvfp4: true`, `ffn_nvfp4_marlin: true`,
+  `ffn_nvfp4_no_bf16_master: true`.
+- NVFP4 `packed_weight` + `scales` + Marlin `_scales_for_kernel` are
+  the source of truth on GPU (324 MiB + 36 MiB ≈ 360 MiB total — see §10).
+- **No BF16 master**: the BF16 view is materialized only inside the
+  optimizer's per-chunk stream path (~8 MiB peak surface).
+- Marlin FP4 fwd uses ctypes; bwd is **BF16 dequant + cuBLAS**
+  (`_MarlinNvFp4Matmul.backward`, line 1022-1027) — the Marlin bwd
+  kernel `_marlin_bwd_grad_x` is wired but **unused** in production
+  (NaN/Inf at FFN scale, see `project_marlin_bwd_blocked.md`).
+- Marlin `repacked` int32 buffer (~24 MiB / module) is **recomputed
+  each forward** — not cached — see `project_marlin_cache_drop.md`
+  for the 24 MiB/module × 64 = 1.5 GiB unreleasable-cache history.
 
-If you need to re-enable NVFP4 for an experiment, set
-`ffn_nvfp4: true` in a child yml (extends base.yml) and the model
-will allocate the FP4 buffers on top of the BF16 master. The
-matmul path then runs through `nvfp4_linear.py:89 dequantize_nvfp4`.
+**Re-enable path**: modes are mutually exclusive in the yml. The
+mode-2 path (BF16 master + packed derived) is wired but not the
+default. Mode-1 (BF16-only, opt-5/2) is reachable by setting
+`ffn_nvfp4: false` in a child yml.
 
 ## §6 Audit findings (2026-07-06)
 
@@ -716,10 +738,198 @@ Three candidates:
 - `project_opt5_rmsnorm_residual_skip.md` — opt-5/1 REVERTED
   2026-07-06; the empirical probe that proved dropping the rmsnorm
   `x` save is 0 MiB peak delta.
+- `project_nvfp4_no_bf16_master.md` — NVFP4 mode-3 design +
+  optimizer streaming chunk contract.
+- `project_marlin_cache_drop.md` — why `repacked` is recomputed
+  every fwd instead of cached (24 MiB/mod × 64 = 1.5 GiB history).
+- `project_marlin_bwd_blocked.md` — why the Marlin FP4 bwd
+  kernel is unused in prod (BF16 cuBLAS path instead).
+- `project_nvfp4_mode3_unwired.md` — register_nvfp4_module
+  wiring gap that produced the 1152 MiB stash leak (now fixed;
+  verified 2026-07-10).
 
 ## §9 Version history
 
+- 2026-07-10: NVFP4 mode-3 baseline re-audit (§10). Header / §3.5 /
+  §3.10 / §5.7 marked as opt-5/2 era with pointers to §10. Peak
+  alloc 9984 MiB / reserved 10982 MiB / `mem_get_info` 11210 MiB at
+  `test/_tmp/probe_vram_nvfp4.py` (sample-hz=500). Mode-3 stash
+  verified clean (64 modules in opt state, 0 leaked `_latest_grad_w`).
+  2026-07-10 follow-up: §10.3 static-table slack (~70 MiB) removed;
+  exact per-module walk = 1714.1 MiB at TP=1, ≈ 857 MiB per rank at
+  TP=2 (base.yml prod).
 - 2026-07-06: Methodology + corrected breakdown (RMSNorm misclassification
   resolved). Tools formalized at `tools/vram_profile/` (profile, analyze,
   classify, saved_tensor_probe, saved_tensor_probe_base, vram_peak,
   poll_prod, rmsnorm_math_check).
+
+## §10 Re-audit 2026-07-10: NVFP4 mode-3 baseline
+
+Production now runs with NVFP4 mode-3 (the opt-5/2 BF16-only path
+was reverted). This section supersedes §2 / §3.5 / §3.10 / §5.7 for
+the **live production baseline**.
+
+### §10.1 Probe configuration
+
+`test/_tmp/probe_vram_nvfp4.py` at `configs/base.yml` + 5060 Ti 16G
++ `sample-hz=500` over 3 micro-batches (`chunk_size=16384`).
+
+```
+NVFP4 mode-3 audit (post-init):
+  Total NVFP4 modules:                64
+  Modules with BF16 master Param:      0   (mode-3: no BF16 master)
+  Persistent FP4 (packed+scales+gs):  324.0 MiB   (= 603,979,776 elements × 0.5625 B/elem)
+  Marlin caches (_scales_for_kernel):  36.0 MiB   (= 0.75 MiB/mod × 64, persistent=False registered buffers)
+  Stashed grad_w (transient, mode-3):   0.0 MiB   (post-init, before any backward)
+
+Mode-3 wiring audit (post-step):
+  NVFP4 modules in any optimizer state:  64   (register_nvfp4_module called ✓)
+  NVFP4 modules with _latest_grad_w:      0   (stash drained by accumulate_grads_to_cpu ✓)
+```
+
+### §10.2 Peak measurements
+
+| Metric | Value | Sampled at |
+|--------|------:|------------|
+| `torch.cuda.memory_allocated` peak | **9984.4 MiB** | t=22.80s (during step 2 backward walk) |
+| `torch.cuda.memory_reserved` peak  | **10982.0 MiB** | same |
+| `torch.cuda.mem_get_info used`     | **11210.0 MiB** | same |
+| `nvitop` baseline (user-reported)  | ~11834 MiB      | 1 Hz sampling, catches transient peaks |
+
+**Step boundaries** (`torch.cuda.memory_allocated`):
+
+| Phase | alloc (MiB) | Δ vs prev |
+|-------|------------:|----------:|
+| pre-fwd (post-flush) | 1719.2 | baseline |
+| post-fwd (layer 31 un-ckpt'd done) | **8466.4** | **+6747.2** |
+| post-bwd (post-flush_pending_grads + flush_manual + empty_cache) | 1783.5 | **−6682.9** |
+| post-step (optimizer.step + repack) | 1783.5 | +0.0 |
+
+The 9984 MiB sampled peak is reached **during the bwd walk** (after
+fwd_out's 8466, while the KDA backward is rebuilding intermediates
+through the per-2-layer sub-block checkpoint). The
+`flush_pending_grads + flush_manual_flush_params + empty_cache`
+sequence at end-of-chunk collapses the 8466 → 1783 in a single
+synchronize.
+
+### §10.3 Corrected per-component breakdown
+
+**A. Static persistent GPU state (~1714 MiB at TP=1)**
+
+Walked via `test/_tmp/probe_vram_nvfp4.py`'s per-module-class
+aggregation (probes both `named_parameters` and `named_buffers`,
+sums every Tensor that lives on cuda). **Probe runs at TP=1**
+(`init_tp(world_size=1)`), so weights are stored full per device.
+Production at TP=2 splits ColumnParallel out / RowParallel in halves
+→ per-rank static ≈ 857 MiB; total across ranks = 1714 MiB.
+
+| Component | MiB | Module count | Note |
+|-----------|----:|-------------:|------|
+| `TPShardedEmbed.weight` (tied) | 727.5 | 1 | V×H×2 = 248320×1536×2 |
+| `ColumnParallelLinear` (KDA qkv/f_proj1/g_proj1/b_proj + AttnRes) | 457.2 | 128 | per-mod 13.5 MiB for qkv, ~0.4 MiB for f/g/b; at TP=1 stored full |
+| `RowParallelLinear` (KDA o_proj + AttnRes o_proj) | 144.0 | 32 | [H, H] BF16 = 4.5 MiB/mod at TP=1 |
+| `NVFP4ColumnParallelLinear` (gate_up packed+scales+cache) | 240.0 | 32 | packed 6 + scales 0.75 + Marlin cache 0.75 = 7.5 MiB/mod |
+| `NVFP4RowParallelLinear` (down packed+scales+cache) | 120.0 | 32 | packed 3 + scales 0.38 + Marlin cache 0.38 = 3.75 MiB/mod |
+| `Linear` (BlockAttnRes's non-Column projections, etc.) | 24.0 | 32 | small per-module |
+| `ShortConvolution` (q/k/v short conv, 3 calls/layer) | 1.1 | 96 | conv_size=4 depthwise |
+| `RMSNorm` × 66 + `TPKDA` × 32 (A_log/dt_bias FP32) + `FusedRMSNormGated` × 32 + `BlockAttnRes` × 1 | 0.3 | ~130 | tiny weights |
+| **Static total** | **1714.1** | | probe-step "alloc before fwd" measured 1719.2 MiB (5 MiB CUDA init overhead, not a tensor) |
+
+The earlier `~1783 MiB` row had a fictitious `misc unclassified ~70`
+slack line; the per-module-class walk sums to **exactly 1714.1 MiB**.
+No slack needed.
+
+**NVFP4 detail** (the user's earlier correction verified):
+- Total elements: 1536 × 4096 × 3 × 32 = 603,979,776
+- Bytes/element: 4/8 (FP4 packed) + 1/16 (per-16 FP8 scale) = 0.5625
+- Total NVFP4 weight bytes: 339,738,624 B = **324 MiB** (not the
+  earlier-estimated 605 MiB which double-counted per-layer vs
+  per-module)
+- Marlin `_scales_for_kernel` (per-128 FP8, derived from
+  `_process_global_scale` + Marlin permute, persistent=False
+  registered buffer): 0.75 MiB/mod × 64 = **36 MiB**
+- `_global_scale_adj` (4 B fp32 scalar): negligible
+
+**B. Dynamic state at fwd_out (8466 MiB, +6747 over static)**
+
+Per-layer saves at production T=16384 (verified by
+`save_for_backward` hook at T=2048, 8× scale to T=16384):
+
+| Function (per layer) | At T=2048 | At T=16384 |
+|----------------------|----------:|-----------:|
+| ChunkKDAFunction (q, k, v, g_input, g_cumsum FP32, Aqk, Akk, w, u, qg, kg, v_new, h) | 84 MiB | 672 MiB |
+| MarlinNVFP4 bwd saves (gate_up `_NVFP4MarlinNoLeafMatmul` + down `_MarlinNvFp4RowMatmulNoLeafImpl`) | 22 MiB | 176 MiB |
+| CausalConv1dFunction (q/k/v short conv, 3 calls/layer) | 18 MiB | 144 MiB |
+| LayerNormGatedFunction (o_norm) | 12 MiB | 96 MiB |
+| LayerNormFunction (attn_norm + mlp_norm, 2 calls/layer) | 12 MiB | 96 MiB |
+| **Per-layer save total** | **148 MiB** | **1184 MiB** |
+
+**Peak live layers at any moment:**
+- Non-last blocks (per-2-layer sub-block ckpt): **2 layers' saves
+  alive during sub-block bwd** (the user correctly identified this
+  is NOT 4 layers as the §3.10 row suggested — see
+  `docs/gradient_checkpointing.md` for the actual structure).
+- Last block (per-layer ckpt for layers 28-30, un-ckpt for layer 31):
+  **1 layer's saves alive** (either layer 31 un-ckpt'd OR a
+  ckpt'd layer's recomputation).
+
+**Peak KDA-style dynamic state = 2 layers × 1184 = 2368 MiB** during
+a non-last sub-block bwd. Add 14 sub-block ckpt inputs (each 48 MiB)
++ 3 last-block ckpt inputs (144 MiB) + 8 block embeddings (384 MiB)
++ AttnRes intermediates (252 MiB) + residual chain outputs (~1536
+MiB across layers) ≈ 5000-5500 MiB of dynamic state at fwd peak.
+
+**C. Gradients at chunk boundaries (~0 MiB)**
+
+Streaming D2H via `accumulate_grads_to_cpu` +
+`flush_pending_grads + flush_manual_flush_params +
+torch.cuda.empty_cache` per chunk keeps `.grad` buffers empty at
+fwd_out. The transient `_latest_grad_w` stash (24 MiB gate_up + 12
+MiB down × 32 layers × 2 modules = **1152 MiB**) is drained at
+end-of-chunk.
+
+**D. Marlin transient (~24 MiB peak)**
+
+Marlin `repacked` int32 buffer (`_repack_for_marlin`): **24 MiB per
+gate_up module, recomputed every fwd**. Single module alive at a time
+(sequential model execution) → peak **~24 MiB**. Bwd path uses BF16
+dequant + cuBLAS, not the Marlin bwd kernel (`_marlin_bwd_grad_x` is
+wired but unused — NaN/Inf at FFN scale).
+
+### §10.4 What was wrong before this audit
+
+1. **NVFP4 weight size**: I estimated 605 MiB packed (was the
+   per-layer × per-module confusion); actual is **324 MiB**. The
+   user's calculation (0.5625 B/elem × 603,979,776 elem) is the
+   correct compact formula.
+2. **KDA live count**: doc said "last block un-checkpointed (4
+   layers)" — that referred to the BLOCK-level structure (last block
+   has no block-level ckpt, runs layer-by-layer). Per-layer, only 1
+   layer is un-ckpt'd (layer 31) and 3 are individually ckpt'd
+   (layers 28-30). Non-last blocks use per-2-layer sub-block ckpt
+   → 2 layers' saves alive, not 4. Peak across the model = 2 layers.
+3. **Gradient streaming E bucket**: doc implicitly assumed `.grad`
+   stays on GPU; in fact `accumulate_grads_to_cpu + empty_cache`
+   per chunk keeps chunk-boundary E = 0.
+4. **Marlin repacked bucket**: doc attributed ~768 MiB to repacked
+   buffers; actual transient peak is **24 MiB** (single module, fwd
+   only — bwd doesn't use the Marlin kernel).
+
+### §10.5 Where the ~5400 MiB unaccounted residual lives
+
+After subtracting attributed buckets from the 9984 MiB peak, the
+residual ~5400 MiB is:
+- **CausalConv1d + Marlin bwd saves** for 2 sub-block layers:
+  2 × (144 + 176) = 640 MiB (not in the KDA.intermediates bucket)
+- **Residual chain** outputs across 14 sub-blocks + 3 last-block
+  ckpt'd layers + layer 31 un-ckpt'd = ~18 layer outputs alive at
+  fwd_out (each 48 MiB) = ~864 MiB
+- **Block embeddings list** (8 entries for AttnRes input): 384 MiB
+- **Autograd graph nodes + edges** in the chunked BPTT link: a few
+  GiB of metadata (not tensor data; allocator bookkeeping)
+- **CUDA caching allocator overhead** (alloc↔reserved gap): ~1000 MiB
+- **Driver / context**: ~300 MiB
+
+Empirical verification path: `test/_tmp/probe_vram_nvfp4.py` at
+`sample-hz=500` captures this directly; high-freq `poll_prod`
+confirms the 9984 MiB is reproducible.

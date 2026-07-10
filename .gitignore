@@ -75,3 +75,12 @@ htmlcov/
 # step). Rebuild per machine via scripts/build_marlin.py.
 !src/models/ops/cuda/lib/
 !src/models/ops/cuda/lib/**
+
+# --- Vendored build caches --------------------------------------------
+# The Marlin FP4 source tree under src/models/ops/cuda/marlin_build/ uses
+# ninja; per-arch intermediates (kernel_only.cuda.o, repack.cuda.o) are
+# emitted into a ``.build/<sm>`` subtree and rebuilt on every script
+# invocation. These are NOT the shipped .so artifacts — those live under
+# src/models/ops/cuda/lib/. The vendored sources themselves (cuda, core,
+# libtorch_stable, marlin/) ARE tracked; only the build cache is local.
+src/models/ops/cuda/marlin_build/sources/.build/

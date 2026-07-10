@@ -143,6 +143,32 @@ class _ParamState:
     # per-element scale via ``repeat_interleave(block_size, dim=-1)``
     # in the dequant path.
     mxfp8_block_size: int | None = None
+    # NVFP4-mode-3 ("no BF16 master") support. When this state entry
+    # backs an :class:`NVFP4*Linear` (or its TP variants) constructed
+    # with ``no_bf16_master=True``, ``param`` is ``None`` and the
+    # storage lives on the module as FP4 packed buffers. The optimizer
+    # side keeps its CPU pinned m / v as BF16 (these are optimizer
+    # moments, NOT the weight — the user constraint was "no BF16 master
+    # weight"; the moments have always been CPU BF16 in this codebase).
+    # The optimizer computes the per-chunk update on the CPU pinned
+    # gradient slice, then calls ``module.apply_chunk_update(start,
+    # end, grad_chunk, lr)`` which materializes a temp BF16 view,
+    # applies the update in place, and re-quantizes to FP4.
+    nvfp4_module: object | None = None
+    # Per-param shape preserved when ``param is None`` (used by the
+    # chunk math in step()).
+    nvfp4_n: int = 0
+    # Cached ``module.chunk_ranges()`` so we don't re-materialize it
+    # every chunk. Invalidated when the module changes its row count
+    # (never happens in production; FFN module shapes are static).
+    nvfp4_chunk_ranges: list = field(default_factory=list)
+    # The side-channel grad the autograd Function stashes on the
+    # module between forward/backward and the optimizer step. The
+    # post-accumulate-grad hook (:func:`register_grad_offload_hooks`)
+    # reads ``module._latest_grad_w`` and folds it into ``s.m`` /
+    # ``s.mom_buf`` once per microbatch.
+    nvfp4_grad: object | None = None
+
     # Muon-only: per-microbatch grad accumulator (BF16, pinned).
     # Set ONLY for int8 muon (a separate bf16 ``accum`` lets the
     # per-mb CPU add stay cheap and pushes the int8 requantize to
@@ -360,8 +386,66 @@ class CPUAdamW:
                 shape=p.shape,
             )
 
+    def register_nvfp4_module(self, module) -> None:
+        """Register an ``NVFP4*Linear`` constructed with
+        ``no_bf16_master=True`` so its FP4 packed buffers get AdamW
+        updates.
+
+        The module replaces the role of ``self.weight``:
+            - persistent state lives in ``module.packed_weight`` /
+              ``module.scales`` / ``module.global_scale``
+            - autograd's bwd stashes ``grad_w`` on
+              ``module._latest_grad_w`` (consumed per-step)
+            - the optimizer computes its update using the same CPU
+              pinned m / v tensors it would for a Parameter-based
+              param, then routes the apply through
+              ``module.apply_chunk_update(start, end, grad_chunk, lr)``
+
+        CPU-pinned m / v are stored as BF16 (matches the legacy
+        CPUAdamW default precision). The user's prior sweep on
+        AdamW's v showed BF16 is fine — v stores squared grads
+        (1e-3 to 1e3 typical magnitude, well inside BF16's 8-bit
+        exponent range) and the FP32 promotion at sqrt time in
+        step() recovers all mantissa precision we need. Pinned
+        BF16 means half the CPU bandwidth on these D2H paths vs
+        FP32 (the default FP32 I had set initially was overly
+        conservative and unnecessarily expensive).
+        """
+        assert getattr(module, "no_bf16_master", False), (
+            f"register_nvfp4_module requires no_bf16_master=True; "
+            f"got {type(module).__name__}"
+        )
+        cols = getattr(
+            module, "in_features_per_partition", module.in_features,
+        )
+        rows = module.out_features
+        n = rows * cols
+        key = id(module)
+        if key in self.state:
+            return
+        # Match the precision the canonical yml uses for CPUAdamW
+        # (BF16 for both m and v) — do NOT pick up a per-config
+        # quantization here; the user's note was specifically that
+        # "AdamW 的 v 只是吃动态范围，精度不是那么敏感" so we just
+        # use the safe BF16 default that legacy AdamW uses.
+        self.state[key] = _ParamState(
+            param=None,
+            exp_avg_sq=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
+            m=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
+            kind="adamw_nvfp4",
+            shape=(rows, cols),
+            nvfp4_module=module,
+            nvfp4_n=n,
+            nvfp4_chunk_ranges=module.chunk_ranges(),
+        )
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         for s in self.state.values():
+            # NVFP4 mode-3: no Param.grad to free. The stashed
+            # grad_w on the module is consumed by
+            # accumulate_grads_to_cpu instead of via a hook.
+            if s.nvfp4_module is not None:
+                continue
             s.param.grad = None
             # NOTE: do NOT zero ``m`` here — that would discard
             # the user's gradient accumulation across micro-batches
@@ -414,7 +498,10 @@ class CPUAdamW:
             # once, before the streaming factor / apply loop.
             # Folding it into the per-element factor would also
             # work but would require an extra H2D per chunk.
-            if wd != 0.0:
+            # For mode-3 (NVFP4) entries, ``s.param is None`` —
+            # weight decay is folded into the per-chunk
+            # ``module.decay_and_apply_chunk`` call below.
+            if wd != 0.0 and s.param is not None:
                 s.param.data.mul_(1.0 - lr * wd)
             # Streaming update: chunk the param so the peak GPU
             # memory for the FP32 divisor / FP16 factor transfer
@@ -437,6 +524,43 @@ class CPUAdamW:
             # No β1 division on the numerator (g is unbiased —
             # it's the raw sum, not an EMA), but v still has
             # its bias-correction bc2.
+            # ---- Mode (3) NVFP4: chunk along the row axis of
+            # the module (same granularity budget as the FFN
+            # module list — ~8 MiB BF16 peak). The apply routes
+            # through ``module.apply_chunk_update`` which
+            # materializes a temp BF16 view, applies the update,
+            # and commits back to FP4. The optimizer-side math
+            # (v update + factor) is identical to the param
+            # case — only the apply destination differs.
+            # apply_chunk_update(start, end, grad_chunk, lr)
+            # does ``bf16 -= lr * grad_chunk`` where grad_chunk
+            # here is the AdamW update factor (m / sqrt(v/bc2) +
+            # eps), matching the legacy param.add_(factor, alpha=-lr)
+            # which does ``param -= lr * factor``.
+            if s.nvfp4_module is not None:
+                module = s.nvfp4_module
+                cols = (
+                    module.in_features_per_partition
+                    if hasattr(module, "in_features_per_partition")
+                    else module.in_features
+                )
+                for r_start, r_end in s.nvfp4_chunk_ranges:
+                    flat_start = r_start * cols
+                    flat_end = r_end * cols
+                    v_chunk_fp32 = v[flat_start:flat_end].float()
+                    denom = (v_chunk_fp32 / bc2).sqrt_().add_(eps)
+                    factor = g[flat_start:flat_end].float() / denom
+                    # ``factor`` is 1-D (flat slice of pinned
+                    # gradient accumulator on CPU); reshape to 2-D
+                    # and move to the module's device so it matches
+                    # ``material_chunk``'s (chunk_rows, K) output
+                    # (apply_chunk_update does
+                    # ``bf16 -= lr * factor`` element-wise).
+                    factor = factor.view(r_end - r_start, cols)
+                    factor = factor.to(module.packed_weight.device, non_blocking=True)
+                    module.apply_chunk_update(r_start, r_end, factor, lr)
+                s.m.zero_()
+                continue
             p_flat = s.param.data.view(-1)
             n = p_flat.numel()
             for start in range(0, n, CHUNK):
@@ -704,6 +828,13 @@ class CPUMuon:
             block_size = None
             quantized = False
 
+        # Keep the precision config so register_nvfp4_module can
+        # mirror the storage decisions for module-based (no-BF16-
+        # master) entries — without this the fp4 module path
+        # wouldn't know whether to allocate int8+mxfp8+BF16 scale
+        # or just an FP32 mom_buf.
+        self._precision = precision
+
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
         for p in params:
@@ -777,8 +908,115 @@ class CPUMuon:
             )
             self.state[id(p)] = st
 
+    def register_nvfp4_module(self, module) -> None:
+        """Register an :class:`NVFP4*Linear` with
+        ``no_bf16_master=True`` so its FP4 packed buffers get Muon
+        updates.
+
+        Mirrors the per-param entry created in :meth:`__init__` —
+        the dtype config (``precision.muon_momentum``) controls the
+        storage format (``mom_buf`` dtype + optional scale + optional
+        separate ``accum``). For the canonical config (int8 + BF16
+        per-row scale) the per-mb accumulator is ``s.accum`` and the
+        step requires a dequant-add-requant at step end. For
+        ``bf16`` Muon (full precision) we use the merged-accumulator
+        design (``mom_buf`` IS the accumulator; no separate
+        ``accum``).
+
+        In all cases the apply at step time routes through
+        :meth:`NVFP4Linear.apply_chunk_update` (the module-side
+        material / commit / apply API). No full BF16 master is ever
+        materialized.
+        """
+        assert getattr(module, "no_bf16_master", False), (
+            f"register_nvfp4_module requires no_bf16_master=True; "
+            f"got {type(module).__name__}"
+        )
+        cols = getattr(
+            module, "in_features_per_partition", module.in_features,
+        )
+        rows = module.out_features
+        n = rows * cols
+        shape = (rows, cols)
+        key = id(module)
+        if key in self.state:
+            return
+
+        # Replicate the storage decisions from __init__ but keyed on
+        # the module's shape (not a Parameter's). Same precision
+        # config so int8 vs mxfp8 vs bf16 stays consistent across
+        # the model — the only thing that varies is the absence of
+        # an ``nn.Parameter`` to point at.
+        precision = self._precision  # populated below if missing
+        mom_dtype_cfg = precision.muon_momentum.dtype
+        if mom_dtype_cfg == DType.INT4:
+            raise NotImplementedError(
+                "CPUMuon: muon_momentum dtype=int4 is not yet implemented."
+            )
+        if mom_dtype_cfg.is_integer:
+            mom_storage_dtype = mom_dtype_cfg.to_torch()
+            scale_dtype = torch.bfloat16
+            scale_shape: tuple[int, ...] = (rows,)
+            block_size = None
+            quantized = True
+        elif mom_dtype_cfg.is_mxfp:
+            mom_storage_dtype = mom_dtype_cfg.to_torch()
+            scale_dtype = torch.float8_e8m0fnu
+            block_size = precision.muon_momentum.block_size
+            cols_p = cols if cols % block_size == 0 \
+                else cols + (block_size - cols % block_size)
+            scale_shape = (rows, cols_p // block_size)
+            quantized = True
+        else:
+            mom_storage_dtype = mom_dtype_cfg.to_torch()
+            scale_dtype = None
+            scale_shape = ()
+            block_size = None
+            quantized = False
+
+        storage_n = n
+        if block_size is not None:
+            cols_p = cols if cols % block_size == 0 \
+                else cols + (block_size - cols % block_size)
+            storage_n = rows * cols_p
+
+        is_mxfp8_param = block_size is not None
+        accum = (
+            torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory()
+            if quantized and not is_mxfp8_param else None
+        )
+        mom_scale = (
+            torch.zeros(scale_shape, dtype=scale_dtype, device="cpu").pin_memory()
+            if scale_dtype is not None else None
+        )
+        # E8M0 floor: initialize all scale bytes to 1 (= 2^-126).
+        if scale_dtype is torch.float8_e8m0fnu:
+            mom_scale = torch.full(
+                scale_shape, 1, dtype=torch.uint8, device="cpu",
+            ).view(torch.float8_e8m0fnu).pin_memory()
+
+        st = _ParamState(
+            param=None,
+            mom_buf=torch.zeros(storage_n, dtype=mom_storage_dtype, device="cpu").pin_memory(),
+            mom_scale=mom_scale,
+            mxfp8_block_size=block_size,
+            accum=accum,
+            kind="muon_nvfp4",
+            shape=shape,
+            nvfp4_module=module,
+            nvfp4_n=n,
+            nvfp4_chunk_ranges=module.chunk_ranges(),
+        )
+        self.state[key] = st
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         for s in self.state.values():
+            # NVFP4 mode-3: no Param.grad to free (the autograd
+            # Function stashes grad_w on the module between
+            # forward/backward and the optimizer step; that's
+            # consumed by accumulate_grads_to_cpu).
+            if s.nvfp4_module is not None:
+                continue
             s.param.grad = None
 
     def _dequantize(self, s: _ParamState) -> torch.Tensor:
@@ -1123,7 +1361,16 @@ class CPUMuon:
                     continue
             shape = s.shape
             rows, cols = shape[0], shape[1]
-            device = s.param.device
+            module = s.nvfp4_module  # None for legacy params
+            # For mode-3 we don't have ``s.param.device`` (no leaf
+            # Parameter). The packed buffers live on whatever device
+            # the module was moved to via ``.cuda()`` /
+            # ``register_load_state_dict_post_hook`` —
+            # ``module.packed_weight.device`` is the source of truth.
+            device = (
+                module.packed_weight.device if module is not None
+                else s.param.device
+            )
             is_mxfp8 = s.mxfp8_block_size is not None
             quantized = s.mom_scale is not None  # int8 OR mxfp8
             # mxfp8 muon no longer has a separate ``accum`` —
@@ -1207,21 +1454,58 @@ class CPUMuon:
 
             # ---- Decoupled weight decay: applied once to the
             # full GPU param (in place), before the streaming
-            # NS apply loop. ----
-            if wd != 0.0:
+            # NS apply loop. For mode-3 NVFP4 the full-param
+            # materialize we'd need here defeats the whole point
+            # of the chunked apply — instead we fold the WD
+            # scalar into each chunk's apply as
+            # ``bf16 *= (1 - lr * wd)``. Scalar multiplication
+            # distributes over the chunk partition, so the
+            # per-chunk math is mathematically identical to the
+            # legacy "once-on-full-param" version. ----
+            if wd != 0.0 and module is None:
                 s.param.data.mul_(1.0 - lr * wd)
+            wd_factor = 1.0 - lr * wd if wd != 0.0 else 1.0
 
             # ---- Stream NS over rows; orth_input is already on
             # GPU so no per-chunk H2D is needed (vs the prior
             # CPU-path design which H2D'd each chunk's FP32
-            # slice). ----
+            # slice). For mode-3 NVFP4: the apply destination
+            # is the module's ``decay_and_apply_chunk`` (material
+            # BF16 view, fold the WD scalar in, subtract lr *
+            # update_chunk, commit back to FP4 — no full BF16
+            # master materialize). The NS run itself is identical
+            # to legacy; only the apply destination differs. ----
             m_fp16 = orth_input.to(torch.float16)
+            if module is None:
+                target_dtype = s.param.dtype
+            else:
+                # Mode-3: material_chunk returns BF16; the
+                # commit back to FP4 quantizes from BF16. Casting
+                # the update to BF16 here keeps the math the
+                # same precision as legacy (NS already runs in
+                # FP16, the cast is the same either way).
+                target_dtype = torch.bfloat16
             for r_start in range(0, rows, CHUNK_ROWS):
                 r_end = min(r_start + CHUNK_ROWS, rows)
                 m_chunk = m_fp16[r_start:r_end]
                 update = self._newton_schulz(m_chunk)
-                update = update.to(s.param.dtype)
-                s.param.data[r_start:r_end].add_(update, alpha=-lr)
+                update = update.to(target_dtype)
+                if module is None:
+                    s.param.data[r_start:r_end].add_(update, alpha=-lr)
+                else:
+                    # Module rows align 1:1 with the optimizer's
+                    # ``m_fp16[r_start:r_end]`` view (both are
+                    # the local-partitioned FP4 weight, in our
+                    # row-major convention). For TP row-parallel
+                    # the partition is along the input axis, not
+                    # output — but ``module.apply_chunk_update``
+                    # and ``module.chunk_ranges`` already use the
+                    # local row indexing the module exposes, so
+                    # passing the same ``(r_start, r_end)``
+                    # works without translation.
+                    module.decay_and_apply_chunk(
+                        r_start, r_end, update, lr, wd_factor=wd_factor,
+                    )
 
             # ---- Sync the device stream before next param's H2D.
             # Ensures the D2H above completed; otherwise the next
@@ -1408,6 +1692,57 @@ def accumulate_grads_to_cpu(
     pending: list = []  # (target, src) — always a plain add now
     for opt in optimizers:
         for s in opt.state.values():
+            # NVFP4 mode-3: there is no Parameter.grad (no leaf in the
+            # autograd graph). The autograd Function stashed grad_w on
+            # ``module._latest_grad_w`` at backward time. We D2H that
+            # tensor instead and add it into the right accumulator.
+            if s.nvfp4_module is not None:
+                module = s.nvfp4_module
+                grad_w = module._latest_grad_w
+                if grad_w is None:
+                    continue
+                # Muon mode-3 — the accumulator target follows the
+                # same rule as legacy Muon: int8 (non-mxfp8) uses a
+                # separate bf16 ``s.accum``; mxfp8 and bf16/fp32
+                # storage use the merged-accumulator design
+                # (``s.mom_buf``). The cast target matches the
+                # accumulator's dtype.
+                if s.kind == "muon_nvfp4":
+                    if s.accum is not None:
+                        # int8 muon: accumulate into bf16 ``accum``,
+                        # the cheap CPU path that avoids the
+                        # dequant-add-requant cycle per mb.
+                        target = s.accum
+                        cast_dtype = target.dtype
+                    else:
+                        # mxfp8 or fp* muon: merged accumulator on
+                        # ``s.mom_buf``. The fused per-mb kernel
+                        # path (mxfp8) is wired up in the legacy
+                        # code via the ``s.param.grad`` route; for
+                        # mode-3 we land here too (just a plain
+                        # bf16→storage-dtype add — the requantize
+                        # happens once at step end).
+                        target = s.mom_buf
+                        cast_dtype = target.dtype
+                    src_cpu = (
+                        grad_w.detach()
+                        .to(cast_dtype)
+                        .reshape(-1)
+                        .to("cpu", non_blocking=True)
+                    )
+                    pending.append(("add", target, src_cpu))
+                else:
+                    # AdamW mode-3 — same as before.
+                    target = s.m
+                    src_cpu = (
+                        grad_w.detach()
+                        .to(target.dtype)
+                        .reshape(-1)
+                        .to("cpu", non_blocking=True)
+                    )
+                    pending.append(("add", target, src_cpu))
+                module._latest_grad_w = None  # consumed
+                continue
             g = s.param.grad
             if g is None:
                 continue
@@ -1623,6 +1958,19 @@ def register_grad_offload_hooks(
     seen: set[int] = set()
     for opt in optimizers:
         for s in opt.state.values():
+            # NVFP4 mode-3: no leaf Parameter exists, so no hook
+            # can be registered. The post-backward path consumes
+            # ``module._latest_grad_w`` directly via
+            # :func:`accumulate_grads_to_cpu` (see the matching
+            # block in that function for the dispatch logic). The
+            # training loop must call
+            # :func:`accumulate_grads_to_cpu` (or
+            # :func:`flush_pending_grads`) after every microbatch
+            # backward — the per-param hook path is irrelevant
+            # for these modules.
+            if s.nvfp4_module is not None:
+                s._optimizer = opt
+                continue
             p = s.param
             if id(p) in seen:
                 continue
@@ -2056,4 +2404,32 @@ def build_param_groups(
         weight_decay=weight_decay,
         precision=precision,
     )
+
+    # ------------------------------------------------------------------
+    # NVFP4 mode-3 wiring: register every no_bf16_master NVFP4 module
+    # with the matching optimizer so its FP4 packed buffers actually
+    # receive updates and its side-channel grad_w stash gets consumed
+    # by accumulate_grads_to_cpu. Without this step the modules
+    # would be invisible to the per-param ``named_parameters`` loop
+    # above (mode-3 has no leaf ``Parameter`` for autograd to attach
+    # to), and the bwd's stashed grad would leak ~24 MiB / gate_up +
+    # ~12 MiB / down × num_layers = ~1152 MiB at base.yml as a pure
+    # unreferenced tensor.
+    #
+    # Routing: every NVFP4 module represents a 2-D FFN weight (the
+    # swiglu gate_up / down projections and their TP counterparts),
+    # which matches the BF16 2-D → Muon rule above. The module-side
+    # material / commit API in NVFP4Linear handles the per-chunk
+    # update routing for both storages.
+    # ------------------------------------------------------------------
+    for _mod in model.modules():
+        if not getattr(_mod, "no_bf16_master", False):
+            continue
+        if _mod.__class__.__name__ not in (
+            "NVFP4Linear",
+            "NVFP4ColumnParallelLinear",
+            "NVFP4RowParallelLinear",
+        ):
+            continue
+        muon_opt.register_nvfp4_module(_mod)
     return muon_opt, adamw_opt

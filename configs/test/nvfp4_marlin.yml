@@ -24,6 +24,7 @@ extends: ../base.yml
 #     loop completes without NaN/Inf and the loss decreases.
 ffn_nvfp4: true
 ffn_nvfp4_marlin: true
+ffn_nvfp4_no_bf16_master: true
 
 tp_size: 1
 
