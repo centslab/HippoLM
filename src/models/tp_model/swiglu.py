@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.tp_layers import ColumnParallelLinear, RowParallelLinear
+from ._primitives import ColumnParallelLinear, RowParallelLinear
 from src.models.ops.nvfp4_tp import NVFP4ColumnParallelLinear, NVFP4RowParallelLinear
 
 

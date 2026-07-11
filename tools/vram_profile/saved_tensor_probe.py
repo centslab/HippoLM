@@ -27,7 +27,7 @@ torch.autograd.function.FunctionCtx.save_for_backward = _wrapped_save
 
 
 def main():
-    from src.models.tp_layers import init_tp
+    from src.models.tp_model._primitives import init_tp
     from src.models.tp_model.model import TPHippoModel
 
     init_tp(world_size=1, devices=[0] if torch.cuda.is_available() else ["cpu"], backend="gloo")

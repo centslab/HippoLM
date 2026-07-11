@@ -292,7 +292,7 @@ def test_real_pack_step_loss_matches_token_weighted_mean():
     import math
     import torch
     from src.models import HippoConfig
-    from src.models.tp_layers import init_tp
+    from src.models.tp_model._primitives import init_tp
     from src.models.tp_model import TPHippoModel
     from src.training.data.collate import pack_chunk_aligned
     from src.training.loop import _slice_cu_seqlens

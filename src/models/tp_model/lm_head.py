@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.tp_layers import get_tp_rank, get_tp_world_size, get_tp_group
+from ._primitives import get_tp_rank, get_tp_world_size, get_tp_group
 from src.models.ops._vendored.fla.modules.fused_linear_cross_entropy import (
     fused_linear_cross_entropy_backward,
     fused_linear_cross_entropy_forward,

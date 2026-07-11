@@ -60,7 +60,7 @@ def main():
     # Build production runner.
     # Replicate the runner build from profile_vram.main() but only the setup.
     from src.models import HippoConfig
-    from src.models.tp_layers import init_tp
+    from src.models.tp_model._primitives import init_tp
     from src.models.tp_model import TPHippoModel
     from src.training.data import dummy_dataloader
     from src.training.param_offload import (

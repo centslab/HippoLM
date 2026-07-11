@@ -17,7 +17,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from src.models.tp_layers import get_tp_rank, get_tp_world_size, tp_all_reduce_sum
+from ._primitives import get_tp_rank, get_tp_world_size, tp_all_reduce_sum
 
 
 class _ShardedEmbedLookup(torch.autograd.Function):

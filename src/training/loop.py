@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from src.models import HippoConfig
-from src.models.tp_layers import init_tp
+from src.models.tp_model._primitives import init_tp
 from src.models.tp_model import TPHippoModel
 from src.training import save_checkpoint
 from src.training.data import (

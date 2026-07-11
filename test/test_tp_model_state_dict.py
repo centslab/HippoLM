@@ -35,7 +35,7 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 
 from src.models import HippoConfig  # noqa: E402
-from src.models.tp_layers import init_tp, shutdown_tp  # noqa: E402
+from src.models.tp_model._primitives import init_tp, shutdown_tp  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

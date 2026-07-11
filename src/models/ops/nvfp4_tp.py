@@ -55,7 +55,7 @@ from src.models.ops.nvfp4_linear import (
     _NVFP4NoLeafMatmul,
     _nvfp4_post_load_repack_hook,
 )
-from src.models.tp_layers import _TP_WORLD_SIZE, _TP_RANK, tp_all_reduce
+from src.models.tp_model._primitives import _TP_WORLD_SIZE, _TP_RANK, tp_all_reduce
 
 
 class _NVFP4RowMatmul(torch.autograd.Function):

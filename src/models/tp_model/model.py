@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from src.models.norms import RMSNorm
 from src.models.ops.attn_res import BlockAttnRes
-from src.models.tp_layers import get_tp_world_size
+from ._primitives import get_tp_world_size
 
 from .embed import TPShardedEmbed
 from .layer import TPHippoLayer

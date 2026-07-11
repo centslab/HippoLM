@@ -16,7 +16,7 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO))
 
 from src.models import HippoConfig
-from src.models.tp_layers import init_tp
+from src.models.tp_model._primitives import init_tp
 from src.models.tp_model import TPHippoModel
 from src.training.data import dummy_dataloader
 from src.training.param_offload import (

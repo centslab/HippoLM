@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.tp_layers import ColumnParallelLinear, RowParallelLinear, get_tp_rank, get_tp_world_size
+from ._primitives import ColumnParallelLinear, RowParallelLinear, get_tp_rank, get_tp_world_size
 
 
 class TPKDA(nn.Module):

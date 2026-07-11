@@ -27,7 +27,7 @@ sys.path.insert(0, "/hy-tmp/HippoLM")
 
 import torch
 
-from src.models.tp_layers import init_tp
+from src.models.tp_model._primitives import init_tp
 from src.models.tp_model.model import TPHippoModel
 from src.models.config import HippoConfig
 

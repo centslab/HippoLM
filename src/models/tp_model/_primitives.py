@@ -1,14 +1,26 @@
-"""Megatron-style Tensor Parallel layers for HippoLM.
+"""Tensor-parallel primitives for the :mod:`src.models.tp_model` package.
 
-Implements ColumnParallelLinear (split output dim, no comm) and
-RowParallelLinear (split input dim, all-reduce output). These are
-the building blocks of column-row parallel pairs (e.g. SwiGLU FFN
-and KDA Q/K/V/O projections) and of the column-parallel lm_head.
+This module is the canonical home for the Megatron-style TP building
+blocks that used to live in :mod:`src.models.tp_layers` before the
+June 2026 split (when the 1398-line ``tp_model.py`` monolith was
+broken up into the :mod:`src.models.tp_model` package):
+
+  * :class:`ColumnParallelLinear` (split output dim, no comm)
+  * :class:`RowParallelLinear`    (split input dim, all-reduce output)
+  * TP process-group lifecycle: :func:`init_tp`, :func:`shutdown_tp`,
+    :func:`get_tp_world_size`, :func:`get_tp_rank`, :func:`get_tp_group`
+  * TP collectives as autograd :class:`torch.autograd.Function`s:
+    :func:`tp_all_reduce`, :func:`tp_all_reduce_sum`,
+    :func:`tp_all_reduce_max`
+  * Sharding helpers: :func:`_slice`, :func:`partition_slice`
+
+These are the building blocks of column-row parallel pairs (SwiGLU
+FFN and KDA Q/K/V/O projections) and of the column-parallel lm_head.
 
 TP is implemented as a single process managing N CUDA devices. The
 NCCL process group is initialized once at startup and reused for
 all communication. World size is fixed at init time; the layers
-read it via ``get_tp_world_size()``.
+read it via :func:`get_tp_world_size`.
 """
 from __future__ import annotations
 

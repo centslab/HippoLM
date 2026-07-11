@@ -35,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.norms import RMSNorm
-from src.models.tp_layers import _TP_GROUP, get_tp_rank, get_tp_world_size
+from src.models.tp_model._primitives import _TP_GROUP, get_tp_rank, get_tp_world_size
 
 
 class _AllGatherAlongHeadDim(torch.autograd.Function):
