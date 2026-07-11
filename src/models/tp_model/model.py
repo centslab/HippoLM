@@ -23,6 +23,193 @@ from .layer import TPHippoLayer
 from .lm_head import TPFusedLceLoss, TPLmHead
 
 
+class _BlockManualCkptFunction(torch.autograd.Function):
+    """Block-level gradient checkpoint with **manual per-layer re-fwd
+    in the backward phase**.
+
+    Why this exists (rev 4 vs rev 2 / rev 3)
+    ----------------------------------------
+    ``torch.utils.checkpoint.checkpoint(use_reentrant=True)`` keeps
+    ALL inner Function ``save_for_backward`` tensors alive across
+    the entire re-fwd region:
+
+      - **rev 2** (1 ckpt per block, 4 layers): re-fwd pops all 4
+        layers' saves simultaneously → peak 4 × 1184 MiB = 4736 MiB
+        at T=16384.
+      - **rev 3** (2 sub-blocks of 2 each): each re-fwd pops 2
+        layers' saves → peak 2 × 1184 = 2368 MiB (polling avg ~1.3
+        layers).
+      - **rev 1** (per-layer, 4 ckpts per block): peak 1 × 1184
+        MiB but each ckpt input is held at fwd_out (+672 MiB × 4
+        ckpts × 7 non-last blocks = ~+18.8 GiB total → wrong).
+
+    This custom Function (``rev 4``) achieves the **per-layer peak
+    (1 layer alive)** while keeping the **block-level fwd_out cost
+    (1 ckpt boundary per block)**:
+
+      - Forward: save only the per-layer INPUT tensors
+        (5 × [B,T,D] = 120 MiB for a 4-layer block — negligible)
+        and the detached KDA final states. Run the forward under
+        ``torch.no_grad()`` so NO inner Function saves are
+        retained.
+      - Backward: walk the layers in REVERSE. For each layer K
+        from N-1 down to 0: re-fwd layer K with grad enabled,
+        backward through layer K's outputs, release its inner
+        Function saves, then move to layer K-1. Peak inner
+        Function saves alive at any time = 1 layer.
+
+    See ``docs/gradient_checkpointing.md`` §"Block-level ckpt with
+    manual per-layer re-fwd (rev 4)" for the per-bucket VRAM
+    breakdown.
+    """
+
+    @staticmethod
+    def forward(ctx, block_layers, x, cu_seqlens,
+                layer_kda_states, return_states):
+        # Persist non-tensor / non-grad args. ``block_layers`` is
+        # held as a Python list of ``nn.Module`` references; the
+        # Python objects are stable across the forward/backward
+        # boundary, so we can safely index into them in bwd.
+        ctx.block_layers = list(block_layers)
+        ctx.cu_seqlens = cu_seqlens
+        ctx.layer_kda_states = (
+            list(layer_kda_states)
+            if layer_kda_states is not None else None
+        )
+        ctx.return_states = return_states
+
+        seeds = (
+            list(layer_kda_states)
+            if layer_kda_states is not None
+            else [None] * len(block_layers)
+        )
+
+        # Run the block under no_grad. Cache per-layer INPUTS in
+        # ``layer_inputs`` so the bwd walk can re-seed each layer's
+        # re-fwd without rebuilding earlier layers.
+        #   layer_inputs[i]   = input to layer i
+        #                      = block input if i == 0
+        #                      = output of layer i-1 if i > 0
+        #   layer_inputs[n]   = block output (= layer N-1's output)
+        # These are all [B,T,D] (D=1536) = 24 MiB at T=16384; 5
+        # entries for a 4-layer block = 120 MiB. The savings come
+        # from NOT caching the inner Function saves (those are
+        # 1184 MiB/layer — we want them released between layers).
+        with torch.no_grad():
+            layer_inputs = [x]
+            collected_states = []
+            cur = x
+            for layer, init in zip(block_layers, seeds):
+                cur, s = layer(
+                    cur, cu_seqlens=cu_seqlens, initial_state=init,
+                )
+                layer_inputs.append(cur)
+                collected_states.append(s)
+
+        ctx.save_for_backward(*layer_inputs)
+        # Collected states are detached — they are side outputs
+        # used as the next chunk's initial states, not in the
+        # autograd graph. Storing as a tuple because
+        # ``autograd.Function`` requires Tensor-or-tuple-of-Tensor
+        # outputs.
+        ctx.collected_states = tuple(
+            s.detach() for s in collected_states
+        )
+
+        block_out = layer_inputs[-1]
+        if return_states:
+            return block_out, ctx.collected_states
+        return block_out
+
+    @staticmethod
+    def backward(ctx, *grads):
+        grad_block_out = grads[0]
+        # When ``return_states=True``, ``grads[1:]`` are grads for
+        # the collected states. Those are detached Tensors with no
+        # upstream gradient (the next-chunk caller treats them as
+        # constants), so we ignore them by returning ``None`` for
+        # the ``layer_kda_states`` slot below.
+
+        block_layers = ctx.block_layers
+        cu_seqlens = ctx.cu_seqlens
+        seeds = ctx.layer_kda_states
+        if seeds is None:
+            seeds = [None] * len(block_layers)
+        saved = list(ctx.saved_tensors)  # length n+1
+        n = len(block_layers)
+
+        # Manual bwd: walk layers in reverse, re-fwd one at a time
+        # so only the current layer's inner Function saves are
+        # alive. After each layer's bwd, drop the local references
+        # so the next layer's re-fwd starts from a clean slate.
+        grad_out = grad_block_out
+        for K in range(n - 1, -1, -1):
+            x_in = saved[K]  # input to layer K (no-grad, small)
+            x_in_g = x_in.detach().requires_grad_(True)
+            with torch.enable_grad():
+                layer = block_layers[K]
+                init = seeds[K]
+                cur_out, _s = layer(
+                    x_in_g, cu_seqlens=cu_seqlens,
+                    initial_state=init,
+                )
+
+            # Backward through this layer alone. Autograd will use
+            # the inner Function saves (populated by the re-fwd
+            # above), propagate ``grad_out`` through the entire
+            # chain from ``cur_out`` back to ``x_in_g``, and the
+            # inner saves are released as soon as their backward
+            # hooks fire.
+            if grad_out is not None:
+                cur_out.backward(grad_out)
+
+            # ``x_in_g.grad`` is the gradient w.r.t. the input of
+            # layer K = the gradient that flows back from layer K
+            # to layer K-1 (= ``grad_out`` for the next iteration,
+            # or the final block-input gradient when K == 0).
+            grad_out = x_in_g.grad
+
+            # Drop local references so the inner Function saves can
+            # be GC'd BEFORE the next layer's re-fwd pops its own
+            # set of saves. This is the critical step: without the
+            # ``del``, the re-fwd'd layer K+1's saves (still bound
+            # via ``cur_out`` and ``x_in_g``) would keep peak
+            # memory constant at 2 layers' worth.
+            del x_in_g, layer, init, cur_out, _s
+
+        # Backward return shape must match forward's args (minus
+        # ctx). Only ``x`` is a Tensor we backprop into; the rest
+        # are non-Tensor (``block_layers``, ``layer_kda_states``,
+        # ``return_states``) or Tensor-with-no-grad
+        # (``cu_seqlens``).
+        return None, grad_out, None, None, None
+
+
+def _block_manual_ckpt(block_layers, x, cu_seqlens,
+                       layer_kda_states, return_states):
+    """Public wrapper around ``_BlockManualCkptFunction.apply``.
+
+    Mirrors the call signature of
+    ``torch.utils.checkpoint.checkpoint(_block_forward, ...)`` so
+    the model code can swap implementations cleanly.
+
+    Returns
+    -------
+    If ``return_states=True``:
+        ``(block_out, list_of_per_layer_states)`` — ``list`` to
+        match the legacy ``_block_forward`` helper output type so
+        callers can ``final_kda_states.extend(sub_final)``.
+    Otherwise:
+        ``block_out``
+    """
+    out = _BlockManualCkptFunction.apply(
+        block_layers, x, cu_seqlens, layer_kda_states, return_states,
+    )
+    if return_states:
+        return out[0], list(out[1])
+    return out
+
+
 class TPHippoModel(nn.Module):
     """Megatron-style TP version of HippoModel.
 
@@ -41,11 +228,6 @@ class TPHippoModel(nn.Module):
         self.config = config
         self.devices = list(devices)
         self.world = len(self.devices)
-        # Gradient-checkpoint sub-block size for the non-last block
-        # forward (see docs/gradient_checkpointing.md). 2 is the
-        # sweet spot at the base config; sweep harness overrides
-        # this per-build.
-        self.sub_block_size = 2
         assert self.world == get_tp_world_size(), (
             f"TP world size mismatch: devices={self.world} vs group={get_tp_world_size()}"
         )
@@ -398,64 +580,72 @@ class TPHippoModel(nn.Module):
         # (the per-sub-block loop below returns local indices).
         layer_offset = 0
 
-        # Block-level checkpointing + KDA cache in the last block
+        # Two-tier ckpt structure (block + sub-block, rev 3, current prod)
         # --------------------------------------------------------
-        # The model has ``num_blocks`` blocks of ``block_size``
-        # layers each. For every block except the last, we wrap
-        # the entire 4-layer forward in a single
-        # ``torch.utils.checkpoint.checkpoint`` call so that
-        # backward recomputes the per-layer activations from the
-        # block output b_n. Only the per-block output is held in
-        # memory, which is roughly ``block_size``× cheaper than
-        # the per-layer checkpointing we used to do. Inside the
-        # checkpoint wrapper the KDA Triton kernels' intermediate
-        # state (g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h) is
-        # *not* retained — backward re-runs the chunked KDA
-        # forward inside the checkpoint.
+        # Non-last blocks (block 0..num_blocks-2): each 4-layer block
+        # is split into **2 sub-blocks of 2 layers each**, each sub-
+        # block wrapped in its own
+        # ``torch.utils.checkpoint.checkpoint(use_reentrant=True)``
+        # call. **2 rounds of recomputation per block during bwd**:
+        #   - Round 1: re-fwd sub-block 0 (layers 0..1) → 2 layers'
+        #     saved_tensors alive simultaneously (peak ~2368 MiB
+        #     KDA-style dynamic state at T=16384 = 2 × 1184 MiB) →
+        #     bwd L0, L1 → release sub-block 0 saves.
+        #   - Round 2: re-fwd sub-block 1 (layers 2..3) → 2 layers'
+        #     saved_tensors alive → bwd L2, L3 → release.
         #
-        # The *last* block is intentionally NOT wrapped in
-        # ``torch.utils.checkpoint.checkpoint``. KDA's autograd
-        # graph benefits from not being checkpointed: the Triton
-        # kernels cache their forward intermediates and the KDA
-        # backward is strictly more expensive than re-doing the
-        # chunked forward would be. So the last block pays the
-        # activation memory (per-layer inputs to the residual)
-        # in exchange for a fast backward — the KDA cache is
-        # retained.
+        # Why this and not rev 4 (block-level + manual per-layer
+        # re-fwd): rev 4 was implemented and ABANDONED on 2026-07-11.
+        # Caching 5 per-layer inputs per block to enable the
+        # per-layer bwd walk costs +1008 MiB at fwd_out (5 × 48 MiB
+        # × 7 blocks), which exceeds the -621 MiB saved at peak
+        # delta. Net rev 4 peak = 10371 MiB (vs 9984 rev 3 baseline,
+        # +387 MiB WORSE). The rev 4 implementation is preserved at
+        # ``_BlockManualCkptFunction`` (model.py:26-210) as a
+        # reference but is NOT invoked by this loop. See
+        # ``docs/gradient_checkpointing.md`` §"rev 4 abandoned" and
+        # ``project_rev4_ckpt.md`` for full analysis.
+        #
+        # Why not block-level ckpt (rev 2, 1 ckpt per 4-layer block):
+        #   use_reentrant=True keeps ALL inner Functions' saves
+        #   alive during the re-fwd → 4 layers' saves alive at the
+        #   re-fwd peak (4736 MiB).
+        # Why not per-layer ckpt (rev 1, 1 ckpt per layer):
+        #   31 ckpts × +672 MiB each ≈ +18.8 GiB fwd_out penalty.
+        # 2 sub-blocks of 2 layers is the empirical sweet spot.
+        #
+        # Last block (block num_blocks-1): **per-layer ckpt** for
+        # layers 28..30 (3 ckpts); layer 31 un-ckpt'd (KDA internals
+        # feed lm_head + fused CE loss directly).
+        #
+        # Total ckpt() invocations per fwd: 7 × 2 (block split into
+        # 2 sub-blocks) + 3 (per-layer last block) = **17 ckpt calls**.
         #
         # AttnRes is invoked at every non-first block boundary,
-        # *outside* the checkpoint wrapper, so the per-block
-        # output ``b_n`` captures the boundary-attention input
-        # ``x``. ``blocks`` (the list of completed block reps) is
-        # held live across blocks but is small (one ``[B,T,D]``
-        # per block — same order as before).
-        # Optimization (new): per-2-layer checkpoint with
-        # use_reentrant=True. Splits each 4-layer non-last block
-        # into 2 sub-blocks of 2 layers each, checkpointing each
-        # sub-block. Trades block-level checkpoint (1 saved input
-        # per 4 layers, all 4 layers' KDA state alive during
-        # block bwd) for sub-block checkpoint (1 saved input per
-        # 2 layers, 2 layers' KDA state alive during sub-block
-        # bwd). Net: ~448 MB FWD increase (extra sub-block
-        # inputs), ~1.0 GB BWD decrease (fewer KDA intermediates
-        # in flight). Trade: 1 extra fwd per sub-block per bwd
-        # (~50ms × 2 layers × 7 blocks × 2 sub-blocks = 1.4s/step).
+        # *outside* the ckpt wrapper, so the per-block output ``b_n``
+        # captures the boundary-attention input ``x``. ``blocks`` (the
+        # list of completed block reps) is held live across blocks
+        # but is small (one ``[B,T,D]`` per block).
+        # Number of layers per sub-block (hardcoded; see comment for
+        # the trade-off rationale). Must divide ``block_size`` evenly.
+        _sub_block_layers = 2
         layers = self.layers_per_device[str(device)]
         block_size = self.config.block_size
         num_blocks = self.config.num_blocks
-        # 2 layers per sub-block (sweet spot for L=32 / block_size=4
-        # at the base config; sweep shows it dominates per-block and
-        # per-layer at this L — see docs/gradient_checkpointing.md).
-        # Exposed as an attribute so the sweep harness can vary it
-        # without editing the file.
-        sub_block_size = getattr(self, "sub_block_size", 2)
+        assert block_size % _sub_block_layers == 0, (
+            f"block_size ({block_size}) must be divisible by "
+            f"_sub_block_layers ({_sub_block_layers})"
+        )
         for block_idx in range(num_blocks - 1):
             if block_idx > 0:
                 x = attn_res(blocks)
             start = block_idx * block_size
             end = start + block_size
-            for sub_start in range(start, end, sub_block_size):
-                sub_end = min(sub_start + sub_block_size, end)
+            # 2 sub-blocks of 2 layers each; each sub-block is wrapped
+            # in its own ckpt so the bwd has 2 rounds of recomputation
+            # (peak 2 layers alive instead of 4).
+            for sub_start in range(start, end, _sub_block_layers):
+                sub_end = min(sub_start + _sub_block_layers, end)
                 sub_layers = layers[sub_start:sub_end]
                 # Slice the per-layer kda_states for this sub-block.
                 # ``None`` means "all zeros" — the sub-block helper

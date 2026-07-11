@@ -1,26 +1,127 @@
 # Gradient checkpointing policy
 
-This document captures the **per-2-layer sub-block checkpoint** policy
-in the model forward path (`src/models/tp_model.py`), and the trade
-space that led to choosing it over per-block or per-layer alternatives.
+This document captures the **two-tier ckpt structure** currently in
+production (rev 3, 2 sub-blocks of 2 layers per non-last block +
+per-layer last block, 17 ckpt() calls), the trade space that led to
+its selection, and the **rev 4 follow-up that was attempted and
+abandoned** because it regressed peak by +387 MiB instead of
+improving it.
 
-It is intended as the reference the next optimizer reads before touching
-`sub_block_size` or switching `use_reentrant` mode, and as the
-contract for the L-dependent tuning of `sub_block_size`.
+- **Tier 1 (non-last blocks)**: each 4-layer block is split into 2
+  sub-blocks of 2 layers each, each wrapped in its own
+  `torch.utils.checkpoint.checkpoint(use_reentrant=True)` ckpt
+  → 14 sub-block ckpt() calls per fwd.
+- **Tier 2 (last block)**: layers 28–30 each get per-layer ckpt,
+  layer 31 un-ckpt'd → 3 ckpt() calls per fwd.
+
+It is intended as the reference the next optimizer reads before
+touching the ckpt structure or switching `use_reentrant` mode.
+
+**2026-07-11 (3-tier nested ckpt — REJECTED by probe)**: probed
+whether `torch.utils.checkpoint.checkpoint` can release inner-layer
+saves layer-by-layer during bwd when nested (outer block ckpt
+wrapping inner per-layer ckpts) — i.e. extending the last-block
+"per-layer ckpt = only 1 layer's KDA/FFN intermediates alive"
+pattern to every block. Empirical result on a 4-layer Linear stack
+at `dim=1536, T=8192, BF16`:
+
+| Config                                | fwd_out (MiB) | peak (MiB) | delta (MiB) | layers alive |
+|---------------------------------------|--------------:|-----------:|------------:|-------------:|
+| plain (no ckpt)                       | 170.0         | 254.5      | 84.5        | 2.96         |
+| block_only (outer=True, no inner)     | 130.0         | 278.5      | 148.5       | 5.21         |
+| per_layer (flat, no outer)            | 202.0         | 278.5      | 76.5        | 2.68         |
+| **nested_TT (outer=True, inner=True)** | 130.0        | **302.5**  | **172.5**   | **6.05**     |
+| nested_TF                             | 130.0         | 278.5      | 148.5       | 5.21         |
+| nested_FT                             | 130.0         | 278.5      | 148.5       | 5.21         |
+| nested_FF                             | 130.0         | 254.5      | 124.5       | 4.37         |
+
+**Verdict: stock PyTorch nested ckpt CANNOT achieve "1 layer alive"
+peak delta**. All four `(use_reentrant_outer, use_reentrant_inner)`
+combinations are **equal to or worse than** the flat
+`block_only`/`per_layer` baselines — and `nested_TT` (the natural
+default) is the **worst** at 6.05 layers alive. Root cause: outer
+ckpt's re-fwd builds an autograd graph that retains references to
+all inner ckpt inputs for the entire outer bwd walk, so the peak
+becomes "all outer inputs + all inner inputs + 1 layer's inner
+saves", not the hoped-for "1 layer". No `use_reentrant` toggle
+fixes this; the only path to true "1 layer alive" remains
+custom `torch.autograd.Function` (rev 4 / rev-4-style), which is
+already abandoned for the +387 MiB regression.
+
+**Implication for the current strategy**: the production ckpt
+structure is **per-2-layer (non-last block) + per-layer (last
+block)** — i.e. only the last block achieves "1 layer KDA/FFN
+intermediate alive", and only via `torch.utils.checkpoint.checkpoint`
+flat (not nested). Extending that "1 layer alive" pattern to the
+non-last blocks via nested stock ckpts is what this probe
+disproved, so the last block remains the only region where the
+design intent ("only 1 layer KDA/FFN intermediate alive") holds.
+
+Consequence: a "3-tier ckpt" design (block ckpt wrapping per-layer
+ckpt, with only-last-block-per-layer as the proposed variant) is
+**not viable** without writing custom autograd.Function, and writing
+that custom function is the rev-4 attempt that already failed.
+Production stays on rev 3. Probe lives at
+`test/_tmp/probe_nested_ckpt.py` (per project rule, deleted before
+commit; recipe re-creatable from this table).
+
+**2026-07-11 (rev 4 abandoned, rev 3 holds production)**: rev 4
+attempted to switch to "1 block boundary per non-last block +
+manual per-layer re-fwd in bwd" (10 explicit ckpt calls, 31
+internal re-fwd calls). Implementation: `_BlockManualCkptFunction`
+at `src/models/tp_model/model.py:26-210`. Empirical peak at
+base.yml NVFP4 mode-3:
+
+| Metric                | rev 3   | rev 4   | Δ vs rev 3 |
+|-----------------------|--------:|--------:|-----------:|
+| fwd_out (MiB)         | 8466    | **9474** | **+1008** |
+| peak alloc (MiB)      | 9984    | **10371** | **+387** |
+| peak delta over fwd   | 1518    | 897     | -621      |
+| explicit ckpt calls   | 17      | 10      | -7        |
+
+Why rev 4 regressed even though it achieves "1 layer alive during
+bwd": caching **5 per-layer inputs per block** ([B, T, D] BF16 =
+48 MiB each × 5) adds `5 × 48 MiB × 7 blocks = +1680 MiB` of
+forward-only cached tensors. The savings from the 1-layer bwd
+(-621 MiB peak_delta polling avg) does NOT offset this fwd_out
+penalty. Net rev 4 = **+387 MiB worse than rev 3** at peak.
+
+Conclusion: sticking with rev 3 for production. rev 4 code is
+preserved as reference (see `model.py:26-210` for
+`_BlockManualCkptFunction`), but `model.py:583-657` continues to
+use the rev 3 2-sub-blocks-of-2 loop. To attempt another design,
+see "Why rev 4 failed and what could work" below.
+
+### Why rev 4 failed and what could work
+
+The fundamental constraint: to bwd layer K independently, we need
+layer K's input. Layer K's input = layer K-1's output. To either
+**cache** the activations (rev 4 design: 5 inputs/block → +1008 MiB
+fwd_out) OR **re-fwd** the chain under no_grad during bwd
+(untested option: 10 re-fwds per block → +~1500 ms/step bwd cost).
+Neither dominates rev 3.
+
+The last block (block num_blocks-1) is unchanged from rev 3: per-layer
+ckpt for layers 28..30 + un-ckpt'd layer 31 (its KDA internals feed
+the lm_head + fused CE loss directly). The last layer's per-layer
+ckpt stays as `torch.utils.checkpoint.checkpoint(use_reentrant=True)`
+to keep the existing logic simple; converting it to a manual ckpt
+boundary would save ~672 MiB more at fwd_out but complicates the
+return-state path (the final layer's saved tensors feed the loss
+directly, so a manual release is riskier).
 
 > **Config declaration (this doc is valid for):**
 >
 > All per-layer / per-component numbers in this doc were measured at
 > **`32 layers × 1024 hidden × 8 heads × head_dim=128 × 3072 FFN ×
 > seq_len=16384 × batch_size=1 × BF16 × TP=1`** (the base.yml config
-> at the time this doc was written).
->
-> If `configs/base.yml` is changed (e.g., 2026-06-26 bump to
-> `hidden_size=1536 / num_heads=12 / intermediate_size=4096`), the
-> absolute numbers here **do not apply**. The structure (ckpt
-> placement, use_reentrant=True, sub_block_size=2 sweet spot at
-> L=24..64, the FWD-tail-vs-BWD peak distinction, the empty_cache
-> trade-off) still holds; only the byte counts change.
+> at the time this doc was written). The current production config
+> is `hidden_size=1536 / num_heads=12 / intermediate_size=4096` /
+> `ffn_nvfp4_no_bf16_master=true`; the L-sweep table below still
+> characterizes the historical `sub_block_size` trade-off but the
+> absolute MB values do not apply. The current production peak at
+> L=32 is **9984 MiB** with the rev-3 structure (see
+> `vram_debugging.md §10`).
 >
 > Re-measure with the methodology at the end of this doc before
 > quoting any number from a "Per-component breakdown" table.
@@ -37,25 +138,85 @@ dA, dv` at T=16384) plus the saved fwd tensors (`q, k, v, g_cumsum,
 g_input, Aqk, Akk` ≈ 112 MB) per layer. With N layers in flight,
 peak is approximately proportional to N.
 
-## The three options at L=32 (base config)
+## The two-tier ckpt structure at L=32 (base config)
 
-Measured with the FLCE `dw` BF16 accumulator change already applied
-(sweep harness: `test/_tmp/sweep_ckpt.py`):
+**Current production structure** (hardcoded in `model.py`, no
+`sub_block_size` parameter):
 
-| Policy                                  | sub_block_size | Saved inputs / non-last block | Layers alive during bwd | Peak (GB) | Step (ms) |
-|-----------------------------------------|----------------|-------------------------------|--------------------------|-----------|-----------|
-| per-layer (`use_reentrant=True`)        | 1              | 4                             | 1                        | 6.76      | 3215      |
-| **per-2-layer (current, `use_reentrant=True`)** | **2** | **2**                     | **2**                    | **6.47**  | **3218**  |
-| per-block (legacy, `use_reentrant=False`)| 4              | 1                             | 4                        | 7.91      | 3217      |
+```
+Block 0..6 (7 non-last blocks): each split into 2 sub-blocks of 2 layers
+  - sub-block 0 (layers k*4+0, k*4+1): ckpt wraps 2 layers
+  - sub-block 1 (layers k*4+2, k*4+3): ckpt wraps 2 layers
+  → 14 sub-block ckpt() calls total (7 blocks × 2 sub-blocks)
+Block 7     (last block):
+  - Layer 28, 29, 30: per-layer ckpt (3 ckpt calls)
+  - Layer 31: un-ckpt'd (KDA cache feeds lm_head + FLCE loss directly)
+```
 
-Per-2-layer wins at the base config: -290 MB vs per-layer, -1.44 GB
-vs per-block, **same wall-clock** as per-block. Per-layer has a
-slightly higher fwd peak (more saved inputs) that over-takes its bwd
-savings; per-block has the lowest fwd peak but pays for it in bwd.
+Total ckpt() invocations per fwd: **17** (14 + 3).
+Peak across the model:
+- During a non-last block bwd: **2 layers alive at re-fwd peak**
+  (~2368 MiB KDA-style dynamic state at T=16384); polling average
+  ~1.3 layers due to inner-bwd 1-layer-alive phase (~1518 MiB)
+- During last-block per-layer bwd: **1 layer alive** (~1184 MiB)
 
-## L-sensitivity: which `sub_block_size` wins at each depth
+Measured at base hidden/heads/seq/TP=1 (B=1, seq_len=16384,
+NVFP4 mode-3, 5060 Ti 16G):
 
-The trade-off is between two opposing forces that both grow with L:
+| Structure                              | ckpt() calls | fwd_out (MiB) | peak (MiB) | peak delta from fwd_out |
+|----------------------------------------|--------------:|--------------:|-----------:|------------------------:|
+| **2 sub-blocks per block + per-layer last (rev 3, current)** | **17** | **8466** | **9984** | **1518** (≈ 1.3 layers) |
+| block-level + manual per-layer re-fwd (rev 4, **ABANDONED 2026-07-11**) | 10 | **9474** | **10371** | 897 (≈ 0.7 layers) |
+| block-level + per-layer last (rev 2, rejected)  | 10 | 8130 | 12927 | 4797 (≈ 4 layers) |
+| per-layer everywhere (rev 1, rejected) | 31 | 9170 | 10404 | 1234 (≈ 1 layer) |
+| block-level everywhere (theoretical sbs=4) | 8 | ~8497 | (not run; ~ expected) | 4776 (≈ 4 layers) |
+
+> **rev 4 ABANDONED 2026-07-11 — net +387 MiB vs rev 3** (peak
+> 10371 vs 9984). Why: caching 5 per-layer input tensors per
+> block to enable the per-layer bwd walk costs **+1008 MiB at
+> fwd_out** (5 × 48 MiB × 7 blocks). The peak_delta reduction
+> (1518 → 897 MiB, -621 MiB) does NOT offset the fwd_out increase.
+> Net: **+387 MiB WORSE**. See `project_rev4_ckpt.md` for full
+> analysis. Production stays on rev 3.
+
+**Why 2 sub-blocks per non-last block (not block-level, not per-layer)**:
+the user wanted a "2 rounds of recomputation per block" design —
+the bwd for one non-last block runs as **2 ckpt re-fwds + 2 bwd
+passes**, each operating on 2 layers. Block-level ckpt (1 ckpt per
+4-layer block) would mean 4 layers' saved_tensors alive at the
+re-fwd peak (rev 2 peak = 12927 MiB, +2943 MiB vs rev 3). Per-layer
+ckpt would mean 31 ckpt calls, +672 MiB at fwd_out, and ~+600 ms/step
+bwd cost. **2 sub-blocks of 2 layers** is the right balance: it
+honors the "2 rounds" design intent, keeps peak within budget, and
+has the same number of total re-fwd calls as the original sub_block=2
+sweep.
+
+**Why the last block uses per-layer ckpt (not sub-block)**: the
+last block's first 3 layers' intermediates don't feed the loss
+directly, but the 4th layer (layer 31) does. Wrapping all 4 last-block
+layers in one block-level ckpt would mean 4 layers' saved_tensors
+alive during the last-block bwd — same as non-last blocks. Per-layer
+ckpt for layers 28-30 + un-ckpt'd layer 31 keeps last-block bwd at
+1 layer alive, saving ~3 × 1184 ≈ 3.5 GB during that region.
+final layer's bwd flow all the way back through the function —
+the per-layer ckpt + un-ckpt'd final layer pattern stays because
+the manual ckpt function does NOT use `torch.no_grad()` during the
+final layer's bwd (the final layer is OUTSIDE the manual ckpt
+wrapper); the manual ckpt wrapper only contains layers 28..30.
+Per-layer ckpt for layers 28-30 + un-ckpt'd layer 31 keeps last-block
+bwd at 1 layer alive (~1184 MiB).
+
+## L-sensitivity: historical `sub_block_size` sweep (deprecated)
+
+> **2026-07-11 update**: this section is preserved as **historical
+> sweep history** but the `sub_block_size` parameter is no longer
+> part of the production code path. The current structure
+> (2 sub-blocks of 2 layers per non-last block + per-layer for last)
+> is described above; see the current peak table for the production
+> numbers.
+
+The historical sweep traded off two opposing forces that both grow
+with L:
 
 - **FWD peak term**: scales with `(L/block_size - 1) × block_size / sub_block_size × 32 MB`
   (number of saved sub-block inputs across all non-last blocks).
@@ -76,23 +237,24 @@ bf16 throughout, FLCE BF16 dw):
 | 64  | OOM (FWD peak 60 saved inputs) | 14.24 GB | 15.07 GB    | sbs=2    | 14.24 GB    |
 | 80  | OOM               | OOM                 | OOM               | (model exceeds 16 GB) | — |
 
-**Conclusions**:
+**Historical conclusions** (no longer applies — see "Current
+production structure" above):
 
-1. **Per-block is never optimal at any L in the 16–64 range.** Its
-   lower fwd peak never makes up for its bwd peak cost.
-2. **Per-2-layer is the sweet spot for L=24..64.** It is the unique
-   sbs that balances the two terms.
-3. **Per-layer wins only at L ≤ 16**, where the fwd term is small
-   enough (max 12 saved inputs × 32 MB = 384 MB) to be dominated by
-   the bwd savings. **But it costs 2× wall-clock at L=16** (4.0 s
-   vs 2.0 s) because every layer bwd triggers a re-forward. For
-   L=24+ the per-2-layer step time is similar to per-block, so
-   per-2-layer is the right answer on both memory and time axes.
-4. **L=80 OOMs regardless of sbs.** The 16 GB budget is the binding
-   constraint from L=80 upward, not the checkpoint policy. To scale
-   beyond L=64 on 16 GB the model itself must shrink (fewer heads,
-   smaller hidden, shorter seq), or the FLCE / last-block policy
-   must change.
+1. **Per-block was never optimal at any L in the 16–64 range.** Its
+   lower fwd peak never made up for its bwd peak cost.
+2. **Per-2-layer was the historical sweet spot for L=24..64 on peak
+   memory** (-290 MB vs per-layer at L=32). The empirical peak
+   delta was ~1.3 layers' worth of saves (not the documented "2
+   layers"), but this is the **polling average** between re-fwd
+   peak (2 layers alive, ~2368 MiB) and inner-bwd 1-layer-alive
+   phase (~1184 MiB). Not a code-logic bug.
+3. **Per-layer won on peak memory only at L ≤ 16**, where the fwd
+   term is small enough (max 12 saved inputs × 32 MB = 384 MB) to
+   be dominated by the bwd savings. **But it cost 2× wall-clock at
+   L=16** (4.0 s vs 2.0 s) because every layer bwd triggered a
+   re-forward.
+4. **L=80 OOMed regardless of sbs.** The 16 GB budget was the
+   binding constraint from L=80 upward, not the checkpoint policy.
 
 ## Why `use_reentrant=True` matters
 
@@ -110,26 +272,32 @@ count becomes `sub_block_size`, not `block_size`. This is the lever
 that unlocks the bwd peak reduction.
 
 Trade: one extra forward per checkpointed region per backward.
-For sbs=2 at L=32 this is ~1.4 s/step on the production config.
-For sbs=1 at L=16 it is ~3.0 s/step (the "per-layer wins" cell is
-~2× slower than the alternatives).
+For sbs=1 at L=32 (current default) this is ~1.4 s/step on the
+production config (was ~1.4 s/step for sbs=2 too — both pack the
+same total layers into reentrant subgraphs). For sbs=1 at L=16 it
+is ~3.0 s/step (the "per-layer wins" cell is ~2× slower than the
+alternatives).
 
-## How `sub_block_size` is selected
+## How the ckpt structure is selected
 
-`sub_block_size` is exposed as a `TPHippoModel` attribute (default
-2, set in `__init__`). The forward method reads it via
-`getattr(self, "sub_block_size", 2)`. To re-tune for a different
-L range, override it after construction:
-
-```python
-model = TPHippoModel(config, devices=[0], dtype=torch.bfloat16)
-model.sub_block_size = 1   # for L <= 16
-model.sub_block_size = 2   # for L in 24..64 (default)
-```
+**2026-07-11 update**: the ckpt structure is **hardcoded** in
+`model.py` (no parameter exposed). The two-tier structure
+(2 sub-blocks of 2 layers per non-last block + per-layer for last)
+is the only production setting. The historical `sub_block_size`
+attribute is removed.
 
 Block size is held at 4 (it is structural — see `HippoConfig.block_size`).
-`sub_block_size` must divide `block_size`, so the valid set is
-{1, 2, 4}.
+If you need to re-tune the structure (e.g., for a different L range
+or a different peak-memory budget), edit `model.py` directly:
+
+- `_sub_block_layers` constant: `model.py:439` (currently hardcoded
+  to 2; **must** divide `block_size` evenly)
+- Non-last block sub-block loop + ckpt() call: `model.py:447-474`
+  (one `torch.utils.checkpoint.checkpoint` per sub-block)
+- Last block per-layer ckpt: `model.py:499-509` (loop over
+  `last_block_layers[:-1]`)
+- Un-ckpt'd last layer: `model.py:517-521` (direct call to
+  `last_block_layers[-1]`)
 
 ## Verification
 
@@ -137,10 +305,17 @@ Block size is held at 4 (it is structural — see `HippoConfig.block_size`).
   loss and a representative set of grad norms under the per-2-layer
   policy and compares against a per-block baseline within bf16
   tolerance. Loss and grad norms match exactly (relative diff 0).
+  The rev-3 ckpt structure IS the per-2-layer policy with hardcoded
+  `_sub_block_layers = 2` — same kernels, same math.
 - **L-sweep peak memory**: `test/_tmp/sweep_ckpt.py` builds a model
   at each (L, sub_block_size) and records `max_memory_allocated`.
-  Re-run with `--layers L1,L2,... --sub-sizes 1,2,4` to re-confirm
-  before changing the default.
+  The historical sweep is preserved for reference but the prod code
+  path no longer accepts `--sub-sizes`. Re-run only if you intend to
+  re-tune the structure.
+- **Production peak memory**: `test/_tmp/probe_vram_nvfp4.py` at
+  `configs/base.yml` + 5060 Ti 16G. The rev-3 result is **9984 MiB
+  alloc / 10982 reserved / 11210 driver**. See
+  `docs/vram_debugging.md §10` for the full breakdown.
 - **Single-config peak memory**: `test/_tmp/baseline_mem.py
   --label per2` produces a per-stage JSON of memory state.
 
@@ -162,12 +337,21 @@ reverted in isolation without breaking the other.
 
 ## What NOT to change without re-measuring
 
-- **`sub_block_size`**: do not change the default from 2 without
-  re-running `sweep_ckpt.py` at the production L. The sweet spot
-  is L-dependent; for L=24..64 it is 2, for L≤16 it is 1.
-- **`use_reentrant`**: keep `True` for sub-block ckpt. The original
-  `False` value is only correct when `sub_block_size == block_size`
-  (whole-block re-forward, all intermediates retained).
+- **The two-tier ckpt structure (2 sub-blocks per non-last block +
+  per-layer last block)**: do not collapse to per-layer everywhere
+  (peak would drop 0.4 GB but fwd_out would rise 0.7 GB and bwd cost
+  would rise ~600 ms/step — net loss for the production L=32
+  config). Do not collapse to 1 sub-block per non-last block
+  (block-level ckpt; peak would rise ~2.9 GB during non-last block
+  bwd — a real regression). If you need to re-tune for a different
+  L, edit the model.py sites listed in "How the ckpt structure is
+  selected" above and re-run `probe_vram_nvfp4.py` (or its
+  successor) to verify peak.
+- **`use_reentrant`**: keep `True` for all ckpt calls. The original
+  `False` value replays the autograd graph inside bwd; with the
+  current structure that would mean all 4 layers' inner
+  intermediates retained even during the per-layer last-block
+  ckpt (defeating the purpose of the sub-block ckpt).
 - **The last block's per-layer ckpt** (3 ckpt, 1 not): the final
   layer must be eager so its output feeds the loss directly. The
   per-layer ckpt of the first 3 last-block layers is independent of
@@ -177,19 +361,23 @@ reverted in isolation without breaking the other.
   require re-deriving the `sub_block_size` sweet spot and re-doing
   the numerical correctness check.
 
-## Production VRAM profile (TP=1, 32L × 1024H × 8H × 16384seq, cu_seqlens path)
+## Production VRAM profile
 
 > **Numbers below are for `32 layers × 1024 hidden × 8 heads × 3072
-> FFN × seq_len=16384` (base.yml as of the doc write date).
-> For the current `hidden_size=1536 / num_heads=12 / intermediate_size=4096`
-> base.yml, the absolute MB values shift; see the config declaration
-> at the top of this doc.**
-
-Measured with the real `scripts/train.py` contract: per-2-layer ckpt,
-FLCE `num_chunks=64` (BF16 `dw`), cu_seqlens via FFD packing, no
-pre-allocated `.grad` tensors (grads are D2H to CPU pinned per-mb by
-`flush_pending_grads` and freed on GPU before the next mb starts —
-production path, see `src/training/param_offload.py`).
+> FFN × seq_len=16384` (an older base.yml). They are kept as
+> historical methodology (per-phase table + caching-pool residue
+> analysis + reconciliation) but do NOT apply to the current
+> `hidden_size=1536 / num_heads=12 / intermediate_size=4096` /
+> NVFP4 mode-3 base.yml.**
+>
+> **The current production peak (rev 3 ckpt structure at the current
+> base.yml) is 9984 MiB alloc / 10982 MiB reserved / 11210 MiB
+> driver — see `docs/vram_debugging.md §10` and the per-component
+> breakdown in `memory/project_vram_baseline_2026_07_10.md`.**
+>
+> If you are working at the OLD config (H=1024, 8 heads, 3072 FFN)
+> and need a number from this section, re-measure with the methodology
+> at the end of this doc before quoting.
 
 ### Peak memory by phase (per-microbatch, 16-mb cycle)
 
@@ -581,19 +769,21 @@ high-water mark. The driver view (8.23 GB) and the reserved pool
 
 1. **KDA bwd saved tensors (~1.0 GB cumulative across the model)**
    — fundamental to `ChunkKDAFunction`. The per-sub-block peak is
-   ~64 MiB (2 layers × 32 MiB at production dims, sub_block_size=2);
-   the rest of the 1 GB is summed across all sub-blocks held at
-   different times during the bwd. The `Aqk + Akk` portion
-   (~32 MiB/layer, ~64 MiB/sub-block) can now be elided via
-   `--kda_skip_aqk_akk_saved true`; see the section above. The
-   remaining `q/k/v` (96 MiB/layer) and `g_cumsum` (32 MiB/layer)
-   are harder to elide (q/k/v are needed for l2norm bwd; g_cumsum
-   is recomputed in bwd from `g_input` for `use_gate_in_kernel=True`
-   and is therefore already freed in fwd). The bulk of the "KDA
-   saved" cost in the GC walk is actually the inner KDA autograd
-   subgraph for the current sub-block (one sub-block at a time
-   during bwd, but the subgraph holds onto q/k/v plus the
-   `l2norm` workspace and the conv1d state).
+   ~32 MiB (1 layer × 32 MiB at production dims, sub_block_size=1
+   since 2026-07-11; was 64 MiB at sub_block_size=2 with the
+   1.3-1.4 layer transient); the rest of the 1 GB is summed
+   across all sub-blocks held at different times during the bwd.
+   The `Aqk + Akk` portion (~32 MiB/layer, ~32 MiB/sub-block at
+   sbs=1) can now be elided via `--kda_skip_aqk_akk_saved true`;
+   see the section above. The remaining `q/k/v` (96 MiB/layer) and
+   `g_cumsum` (32 MiB/layer) are harder to elide (q/k/v are needed
+   for l2norm bwd; g_cumsum is recomputed in bwd from `g_input`
+   for `use_gate_in_kernel=True` and is therefore already freed in
+   fwd). The bulk of the "KDA saved" cost in the GC walk is
+   actually the inner KDA autograd subgraph for the current
+   sub-block (one sub-block at a time during bwd, but the subgraph
+   holds onto q/k/v plus the `l2norm` workspace and the conv1d
+   state).
 2. **FLCE `dw` accumulator (509 MB)** — sized by V×H; cannot shrink
    without changing the loss or the optimizer path.
 3. **Caching-allocator slack pool (5.36 GB)** — reserved-but-unused

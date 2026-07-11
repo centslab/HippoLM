@@ -19,6 +19,21 @@ master on CPU/GPU). See §10 "Re-audit 2026-07-10: NVFP4 mode-3 baseline"
 for the corrected breakdown. §2 / §3.5 / §3.10 / §5.7 retain the
 opt-5/2-era numbers; §10 is the live production baseline.
 
+**Re-audited 2026-07-11 (rev 3).** ckpt structure revised to honor
+the "2 rounds of recomputation per block" design intent. Each
+non-last block is split into **2 sub-blocks of 2 layers each**, each
+sub-block wrapped in its own `torch.utils.checkpoint.checkpoint`
+call. bwd walks: re-fwd sub-block 0 → bwd L0,L1 → release → re-fwd
+sub-block 1 → bwd L2,L3 → release. **Peak during non-last block
+bwd = 2 layers' saves alive** (2368 MiB KDA-style dynamic state at
+T=16384). Last block: per-layer ckpt for layers 28-30 + un-ckpt'd
+layer 31 (unchanged). Total: 17 ckpt() invocations per fwd (was 10
+at block-level rev 2, was 31 at sbs=1 rev 1). Peak: alloc 9984
+MiB / reserved 10982 MiB / driver 11210 MiB at base.yml on 5060
+Ti. The "sub_block" inner loop is reintroduced (with a hardcoded
+`_sub_block_layers = 2` constant); the `sub_block_size` attribute
+remains removed.
+
 ## When to reach for this
 
 Use these tools when:
@@ -369,13 +384,22 @@ residual save (the wrapped fn runs in `no_grad()`). For layer 31
 (un-ckpt'd), the per-layer input IS held. Peak residual.save =
 **96 MiB** (layer 31's input + 1 other held for the next sub-block).
 
-### §3.8 Sub-block checkpoint input (`src/models/tp_model/model.py`)
+### §3.8 Sub-block / per-layer ckpt input (`src/models/tp_model/model.py`)
 
-Sub-block forward (`model.py:468`):
+Non-last block sub-block forward (`model.py:466`, hardcoded
+`_sub_block_layers = 2`):
 ```python
 x, sub_final = torch.utils.checkpoint.checkpoint(
     self._block_forward, sub_layers, x, cu_seqlens,
-    sub_states, True,                              # return_states=True
+    sub_states, True,                             # return_states=True
+    use_reentrant=True, preserve_rng_state=False,
+)
+```
+
+Last block per-layer ckpt (`model.py:504`):
+```python
+x, final_state = torch.utils.checkpoint.checkpoint(
+    layer, x, cu_seqlens, init,
     use_reentrant=True, preserve_rng_state=False,
 )
 ```
@@ -385,15 +409,16 @@ With `use_reentrant=True`, the inner `_CheckpointFunction` saves the
 runs in `torch.no_grad()`, so its inner custom Functions
 (`LayerNormFunction`, `LayerNormGatedFunction`, `ChunkKDAFunction`,
 F.linear, silu, etc.) DO NOT call `save_for_backward` during the
-ckpt-wrapped fwd. Per sub-block ckpt input:
+ckpt-wrapped fwd. Per ckpt input:
 - `x` = `[B, T, H]` bf16 = 48 MiB (held by autograd)
 - `cu_seqlens` (small, a few KB)
-- `sub_states` = `sub_block_size × [1, hpp, K, V]` fp32 = 1.5 MiB
+- `sub_states` = `_sub_block_layers × [1, hpp, K, V]` fp32 = 3 MiB
+  (per sub-block); or 1.5 MiB per per-layer ckpt
 
-For 14 sub-blocks (blocks 0-6, sub_block_size=2): 14 × 48 MiB =
-**672 MiB** (the §2 entry). For 3 last-block per-layer ckpts
-(layers 28-30): 3 × 48 = 144 MiB. For layer 31 un-ckpt'd: 0 from
-this path.
+For 14 sub-block ckpts (blocks 0-6, 2 sub-blocks each, 2 layers
+per sub-block): 14 × 48 MiB = **672 MiB**. For 3 last-block
+per-layer ckpts (layers 28-30): 3 × 48 = 144 MiB. For layer 31
+un-ckpt'd: 0 from this path. Total ckpt input overhead = 816 MiB.
 
 ### §3.9 Block-boundary AttnRes saves
 
@@ -750,6 +775,31 @@ Three candidates:
 
 ## §9 Version history
 
+- 2026-07-11 (rev 3): ckpt structure revised again to honor the
+  user's **"2 rounds of recomputation per block"** design intent.
+  Each non-last block is split into **2 sub-blocks of 2 layers each**,
+  each sub-block wrapped in its own ckpt (so bwd has 2 rounds of
+  re-fwd + release per block). The rev-2 block-level design (1 ckpt
+  per block, 4 layers wrapped) was wrong because `use_reentrant=True`
+  keeps ALL inner Functions' saves alive during the re-fwd → peak
+  4 × 1184 = 4736 MiB. The rev-1 per-layer design (31 ckpts) was
+  also wrong: peak 1 layer but fwd_out +672 MiB and +~600 ms/step
+  bwd cost. §10.2 / §10.3.B / §10.4 / §10.5 / §3.8 updated. Peak:
+  9984 MiB alloc / 10982 reserved / 11210 driver (same as the
+  legacy `sub_block_size=2` baseline — this rev-3 IS sbs=2 with
+  hardcoded `_sub_block_layers = 2`). Total: 17 ckpt() invocations
+  per fwd (14 sub-block + 3 last-block per-layer). Peak delta from
+  fwd_out during bwd = 1518 MiB ≈ 1.3 layers alive (polling average
+  between 2-layer re-fwd peak and 1-layer inner-bwd phase).
+- 2026-07-11 (rev 2): block-level ckpt for non-last blocks +
+  per-layer ckpt for last block. WRONG design — `use_reentrant=True`
+  keeps 4 layers' saves alive during block bwd (peak delta 4797
+  MiB ≈ 4 layers). Reverted same day after the user clarified the
+  intent: "2 rounds of recomputation".
+- 2026-07-11 (rev 1, reverted): per-layer ckpt everywhere
+  (`sub_block_size=1`, 31 ckpts). WRONG design — per-layer meant
+  +672 MiB at fwd_out and +~600 ms/step bwd cost for only a 1184
+  MiB peak reduction vs the 2-rounds design. Reverted same day.
 - 2026-07-10: NVFP4 mode-3 baseline re-audit (§10). Header / §3.5 /
   §3.10 / §5.7 marked as opt-5/2 era with pointers to §10. Peak
   alloc 9984 MiB / reserved 10982 MiB / `mem_get_info` 11210 MiB at
@@ -789,27 +839,33 @@ Mode-3 wiring audit (post-step):
 
 ### §10.2 Peak measurements
 
-| Metric | Value | Sampled at |
-|--------|------:|------------|
-| `torch.cuda.memory_allocated` peak | **9984.4 MiB** | t=22.80s (during step 2 backward walk) |
-| `torch.cuda.memory_reserved` peak  | **10982.0 MiB** | same |
-| `torch.cuda.mem_get_info used`     | **11210.0 MiB** | same |
-| `nvitop` baseline (user-reported)  | ~11834 MiB      | 1 Hz sampling, catches transient peaks |
+| Metric | Value | Sampled at | Δ from rev 2 (block-level) | Δ from rev 1 (sbs=1) | Δ from sbs=2 (legacy) |
+|--------|------:|------------|---------------------------:|---------------------:|----------------------:|
+| `torch.cuda.memory_allocated` peak | **9984.4 MiB** | during step 1 backward walk | −2943 MiB | −420 MiB | 0 MiB |
+| `torch.cuda.memory_reserved` peak  | **10982.0 MiB** | same | −2384 MiB | −672 MiB | 0 MiB |
+| `torch.cuda.mem_get_info used`     | **11210.0 MiB** | same | −2384 MiB | −672 MiB | 0 MiB |
+| `nvitop` baseline (user-reported)  | ~11834 MiB      | 1 Hz sampling, catches transient peaks | −2266 MiB | −466 MiB | 0 MiB |
 
 **Step boundaries** (`torch.cuda.memory_allocated`):
 
-| Phase | alloc (MiB) | Δ vs prev |
-|-------|------------:|----------:|
-| pre-fwd (post-flush) | 1719.2 | baseline |
-| post-fwd (layer 31 un-ckpt'd done) | **8466.4** | **+6747.2** |
-| post-bwd (post-flush_pending_grads + flush_manual + empty_cache) | 1783.5 | **−6682.9** |
-| post-step (optimizer.step + repack) | 1783.5 | +0.0 |
+| Phase | alloc (MiB) | (was @ rev 2) | (was @ sbs=1) | (was @ sbs=2) |
+|-------|------------:|--------------:|--------------:|--------------:|
+| pre-fwd (post-flush) | 1783.5 | 1783.5 | 1783.5 | 1719.2 |
+| post-fwd (layer 31 un-ckpt'd done) | **8466.4** | 8130.4 | 9170.4 | 8466.4 |
+| post-bwd (post-flush_pending_grads + flush_manual + empty_cache) | 1783.5 | 1783.5 | 1783.5 | 1783.5 |
+| post-step (optimizer.step + repack) | 1783.5 | 1783.5 | 1783.5 | 1783.5 |
 
-The 9984 MiB sampled peak is reached **during the bwd walk** (after
-fwd_out's 8466, while the KDA backward is rebuilding intermediates
-through the per-2-layer sub-block checkpoint). The
+The 9984 MiB sampled peak is reached **during the bwd walk** while
+KDA backward rebuilds intermediates through a non-last block's
+sub-block ckpt (2 layers wrapped). Peak delta from fwd_out during
+bwd = **9984 - 8466 = 1518 MiB ≈ 1.3 layers** (1184 MiB / layer
+at T=16384) — the polling average over re-fwd (2 layers alive
+transiently) + inner bwd (1 layer alive). Same value as the
+legacy `sub_block_size=2` baseline (this rev-3 design IS
+sub_block_size=2, just hardcoded with a `_sub_block_layers = 2`
+constant instead of a sweepable attribute). The
 `flush_pending_grads + flush_manual_flush_params + empty_cache`
-sequence at end-of-chunk collapses the 8466 → 1783 in a single
+sequence at end-of-chunk collapses 8466 → 1783 in a single
 synchronize.
 
 ### §10.3 Corrected per-component breakdown
@@ -865,19 +921,38 @@ Per-layer saves at production T=16384 (verified by
 | **Per-layer save total** | **148 MiB** | **1184 MiB** |
 
 **Peak live layers at any moment:**
-- Non-last blocks (per-2-layer sub-block ckpt): **2 layers' saves
-  alive during sub-block bwd** (the user correctly identified this
-  is NOT 4 layers as the §3.10 row suggested — see
-  `docs/gradient_checkpointing.md` for the actual structure).
+- Non-last blocks (sub-block ckpt, 2 layers per sub-block since
+  2026-07-11 rev 3): **2 layers' saves alive during sub-block bwd
+  (transient)**. Each sub-block is wrapped in its own
+  `torch.utils.checkpoint.checkpoint(use_reentrant=True)` call; the
+  re-fwd during bwd generates both layers' inner Functions'
+  saved_tensors simultaneously, then the inner bwd walks layer by
+  layer and releases each layer's saves as that layer's bwd
+  completes. Polling catches a peak delta from fwd_out of
+  **~1518 MiB** (between 1 and 2 layers' worth, the polling average
+  of re-fwd peak + inner-bwd peak). At the moment of re-fwd
+  completion, 2 × 1184 = 2368 MiB alive transiently; during inner
+  bwd, 1 layer at a time.
+  - 2026-07-11 rev 2 used block-level ckpt (1 ckpt per block, 4
+    layers wrapped) — peak delta 4797 MiB ≈ 4 layers. The user
+    identified this as wrong: their design intent was "2 rounds of
+    recomputation", meaning 2 ckpts per block (2 sub-blocks), not 1
+    ckpt per block.
+  - 2026-07-11 rev 1 used per-layer ckpt (`sub_block_size=1`) —
+    peak delta 1234 MiB ≈ 1 layer. The user also identified this
+    as wrong: per-layer everywhere meant 31 ckpts and a
+    +~600 ms/step bwd cost for only a 1184 MiB peak reduction vs
+    the 2-rounds design.
 - Last block (per-layer ckpt for layers 28-30, un-ckpt for layer 31):
   **1 layer's saves alive** (either layer 31 un-ckpt'd OR a
   ckpt'd layer's recomputation).
 
 **Peak KDA-style dynamic state = 2 layers × 1184 = 2368 MiB** during
-a non-last sub-block bwd. Add 14 sub-block ckpt inputs (each 48 MiB)
-+ 3 last-block ckpt inputs (144 MiB) + 8 block embeddings (384 MiB)
-+ AttnRes intermediates (252 MiB) + residual chain outputs (~1536
-MiB across layers) ≈ 5000-5500 MiB of dynamic state at fwd peak.
+a non-last sub-block bwd (transient). Add 14 sub-block ckpt inputs
+(each 48 MiB = 672 MiB) + 3 last-block ckpt inputs (144 MiB) + 8
+block embeddings (384 MiB) + AttnRes intermediates (252 MiB) +
+residual chain outputs (~768 MiB across layers) ≈ 4600-5100 MiB of
+dynamic state at fwd peak.
 
 **C. Gradients at chunk boundaries (~0 MiB)**
 
@@ -902,12 +977,24 @@ wired but unused — NaN/Inf at FFN scale).
    per-layer × per-module confusion); actual is **324 MiB**. The
    user's calculation (0.5625 B/elem × 603,979,776 elem) is the
    correct compact formula.
-2. **KDA live count**: doc said "last block un-checkpointed (4
-   layers)" — that referred to the BLOCK-level structure (last block
-   has no block-level ckpt, runs layer-by-layer). Per-layer, only 1
-   layer is un-ckpt'd (layer 31) and 3 are individually ckpt'd
-   (layers 28-30). Non-last blocks use per-2-layer sub-block ckpt
-   → 2 layers' saves alive, not 4. Peak across the model = 2 layers.
+2. **KDA live count** (re-audited 2026-07-11, three times): doc
+   said "last block un-checkpointed (4 layers)" — that referred to
+   the BLOCK-level structure (last block has no block-level ckpt,
+   runs layer-by-layer). Per-layer, only 1 layer is un-ckpt'd
+   (layer 31) and 3 are individually ckpt'd (layers 28-30). The
+   design intent is **2 rounds of recomputation per non-last
+   block**: each block is split into 2 sub-blocks (2 layers each),
+   each wrapped in its own ckpt, giving peak = 2 layers' saves
+   alive during sub-block bwd. rev-1 (per-layer everywhere,
+   `sub_block_size=1`, peak delta 1234 MiB) was wrong because
+   per-layer meant 31 ckpts and +~600 ms/step bwd cost for only a
+   1184 MiB peak reduction vs the 2-rounds design. rev-2
+   (block-level ckpt, 1 ckpt per block, peak delta 4797 MiB ≈ 4
+   layers) was also wrong because `use_reentrant=True` keeps all 4
+   layers' saves alive during re-fwd, not the intended 1 layer.
+   rev-3 (current) honors the design intent: 17 ckpt() calls per
+   fwd, peak delta 1518 MiB ≈ 2 layers alive during sub-block
+   bwd.
 3. **Gradient streaming E bucket**: doc implicitly assumed `.grad`
    stays on GPU; in fact `accumulate_grads_to_cpu + empty_cache`
    per chunk keeps chunk-boundary E = 0.
@@ -919,11 +1006,12 @@ wired but unused — NaN/Inf at FFN scale).
 
 After subtracting attributed buckets from the 9984 MiB peak, the
 residual ~5400 MiB is:
-- **CausalConv1d + Marlin bwd saves** for 2 sub-block layers:
-  2 × (144 + 176) = 640 MiB (not in the KDA.intermediates bucket)
-- **Residual chain** outputs across 14 sub-blocks + 3 last-block
-  ckpt'd layers + layer 31 un-ckpt'd = ~18 layer outputs alive at
-  fwd_out (each 48 MiB) = ~864 MiB
+- **CausalConv1d + Marlin bwd saves** for the 2 layers alive during
+  sub-block bwd: 2 × (144 + 176) = 640 MiB (not in the
+  KDA.intermediates bucket)
+- **Residual chain** outputs across 14 sub-block ckpt inputs + 3
+  last-block ckpt inputs + layer 31 un-ckpt'd = ~18 layer outputs
+  alive at fwd_out (each 48 MiB) = ~864 MiB
 - **Block embeddings list** (8 entries for AttnRes input): 384 MiB
 - **Autograd graph nodes + edges** in the chunked BPTT link: a few
   GiB of metadata (not tensor data; allocator bookkeeping)
