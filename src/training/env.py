@@ -152,6 +152,73 @@ def pin_socket_default_timeout(seconds: float = 60.0) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Vendor cache routing                                                         #
+# --------------------------------------------------------------------------- #
+def _repo_root() -> Path:
+    """Repo root for this checkout: ``<repo>/.cache`` is the anchor
+    for every local cache this project writes or routes through.
+
+    ``Path(__file__)`` is ``<repo>/src/training/env.py``;
+    ``parents[2]`` is the repo root. Kept in sync with
+    :data:`src.training.data.cache._PROJECT_CACHE_ROOT` (which
+    uses ``parents[3]`` of its own file = same path).
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def pin_cache_directories() -> None:
+    """Pin SDK-level cache directories (ModelScope, HuggingFace
+    datasets) to project-relative locations by default.
+
+    Why: ``modelscope`` writes to ``~/.cache/modelscope`` and
+    ``datasets`` writes to ``~/.cache/huggingface`` by default —
+    those home-relative paths vary across cloud providers
+    (different RAID mount naming, ``$HOME`` quota) and have caused
+    silent cache drift between dev boxes. The HIPPOLM-side parquet
+    shard cache is already pinned to ``<repo>/.cache/hippolm/datasets``
+    (see :mod:`src.training.data.cache`); this function pins the
+    two SDK-side caches to sibling directories so the whole cache
+    tree lives under one root the user controls via the repo
+    checkout location.
+
+    Layout::
+
+        <repo>/.cache/
+        ├── hippolm/datasets/      # HIPPOLM-side parquet shards
+        ├── modelscope/            # MODELSCOPE_CACHE
+        └── huggingface/datasets/  # HF_HOME + HF_DATASETS_CACHE
+
+    Resolution: ``os.environ.setdefault`` semantics — explicit
+    ``MODELSCOPE_CACHE`` / ``HF_HOME`` exports in the caller's
+    shell or ``.env`` file still win (explicit beats implicit).
+
+    Must run BEFORE any ``import modelscope`` / ``import datasets``:
+    ``datasets`` snapshots ``HF_DATASETS_CACHE`` into a module
+    constant at import time and ignores later ``os.environ``
+    changes. :func:`configure_runtime_environment` calls this
+    before :func:`pin_datasets_retry_config` (which imports
+    ``datasets``) to preserve the binding.
+
+    Note: ``--cache_dir`` on the CLI controls only the HIPPOLM-side
+    parquet cache (via ``HIPPOLM_CACHE_DIR``); it does NOT move
+    these SDK caches. To relocate the SDK caches as well, export
+    ``MODELSCOPE_CACHE`` / ``HF_HOME`` in the env (or the repo's
+    ``.env`` file) before invoking.
+    """
+    repo_cache = _repo_root() / ".cache"
+    os.environ.setdefault(
+        "MODELSCOPE_CACHE", str(repo_cache / "modelscope"),
+    )
+    os.environ.setdefault(
+        "HF_HOME", str(repo_cache / "huggingface"),
+    )
+    os.environ.setdefault(
+        "HF_DATASETS_CACHE",
+        str(repo_cache / "huggingface" / "datasets"),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Public entry point                                                          #
 # --------------------------------------------------------------------------- #
 def configure_runtime_environment() -> None:
@@ -166,5 +233,9 @@ def configure_runtime_environment() -> None:
     apply_env_from_dotenv()
     pin_hf_endpoint()
     pin_nccl_environment()
+    # Pin cache dirs BEFORE pin_datasets_retry_config: the latter
+    # imports datasets, which snapshots HF_DATASETS_CACHE into a
+    # module constant at import time and ignores later env changes.
+    pin_cache_directories()
     pin_datasets_retry_config()
     pin_socket_default_timeout()

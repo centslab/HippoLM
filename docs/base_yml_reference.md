@@ -209,6 +209,15 @@ Newton-Schulz orthogonalization.
 - `use_dummy_data` — skip streaming + tokenize; use random
   tokens. Cheap smoke test for the model + optimizer + TP code
   path.
+- `cache_dir` — local cache directory for the HIPPOLM-side streamed
+  parquet shards (the files our `RotatingParquetIterable` downloads).
+  Wires through to `HIPPOLM_CACHE_DIR`; see `docs/cache_routing.md`
+  for the three-way layout (HIPPOLM / ModelScope SDK / HF datasets
+  SDK). `null` = repo-relative `.cache/hippolm/datasets/`. Override
+  on the CLI via `--cache_dir /path` (the CLI flag takes precedence
+  over the yml value). Note: SDK-side caches are NOT affected by this
+  key — set `MODELSCOPE_CACHE` / `HF_HOME` in the env (or the repo's
+  `.env`) to relocate them.
 
 ## Output
 

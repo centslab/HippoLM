@@ -199,6 +199,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text_field", type=str, default="content")
     p.add_argument("--tokenizer_path", type=str,
                    default="src/tokenizer")
+    p.add_argument(
+        "--cache_dir", type=str, default=None,
+        help="Local cache directory for streamed parquet shards. "
+             "Wired through to the HIPPOLM_CACHE_DIR env var (the "
+             "resolution path that get_cache_dir() honors). "
+             "Default (null) = repo-relative .cache/hippolm/datasets. "
+             "Point this at a larger disk when the default location "
+             "is short on space.",
+    )
     p.add_argument("--use_dummy_data", action="store_true", default=False,
                    help="Skip the streaming/tokenize path and use a "
                         "random dummy DataLoader. Fastest smoke test.")

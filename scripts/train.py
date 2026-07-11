@@ -49,6 +49,7 @@ the cheapest smoke run.
 # imported, because HfApi reads the env vars at construction time. Set them
 # at the very top, before any other imports, so that any chain import of
 # huggingface_hub (e.g. via `datasets` or `transformers`) picks them up.
+import os
 import sys
 from pathlib import Path
 
@@ -56,19 +57,32 @@ from pathlib import Path
 # set before any ``from src.training.env import ...`` line.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Parse CLI + YAML EARLY (before configure_runtime_environment) so we
+# can set HIPPOLM_CACHE_DIR before any ``import datasets`` /
+# ``import modelscope`` runs. ``scripts.cli`` is import-light
+# (argparse + yaml only — verified), so this is safe at module scope.
+# ``parse_args`` re-runs in :func:`main` for clarity; the result is
+# the same.
+from scripts.cli import parse_args as _full_parse_args
+_early_args = _full_parse_args(sys.argv[1:])
+if getattr(_early_args, "cache_dir", None):
+    os.environ["HIPPOLM_CACHE_DIR"] = str(
+        Path(_early_args.cache_dir).expanduser().resolve()
+    )
+
 # All env-var shimming (HF_ENDPOINT, NCCL transport, datasets retry
-# config, socket timeout) is delegated to src.training.env. Must be
+# config, socket timeout, cache dirs) is delegated to src.training.env. Must be
 # called BEFORE any heavy import — torch.distributed reads its env
 # at init time, and huggingface_hub reads HF_TOKEN at HfApi()
-# construction.
+# construction. ``pin_cache_directories`` (called inside) pins
+# MODELSCOPE_CACHE / HF_HOME / HF_DATASETS_CACHE to
+# ``<repo>/.cache/<vendor>/`` (see :func:`src.training.env.pin_cache_directories`).
 from src.training.env import configure_runtime_environment
 
 configure_runtime_environment()
 
 import logging
-import os
 import time
-from pathlib import Path
 
 import torch
 
@@ -126,6 +140,14 @@ def train(args):
     N children all bound to the same physical device.
     """
     run_dir = create_output_dir(args.output_dir)
+
+    # ``--cache_dir`` was exported as ``HIPPOLM_CACHE_DIR`` at module
+    # top (before any heavy import), and is inherited by TP children
+    # via ``mp.spawn``. If the user set it, log where it landed so
+    # disk-space issues are debuggable from the first log line.
+    if getattr(args, "cache_dir", None):
+        log.warning("data cache dir (from --cache_dir): %s",
+                    os.environ.get("HIPPOLM_CACHE_DIR"))
 
     gpus = select_tp_gpus(min_memory_mb=args.min_gpu_memory_mb)
     if not gpus and args.tp_sim:

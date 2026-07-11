@@ -80,6 +80,19 @@ text_field: content
 tokenizer_path: src/tokenizer
 shuffle: false
 use_dummy_data: false
+# Local cache directory for the HIPPOLM-side streamed parquet shards
+# (the actual files our RotatingParquetIterable downloads). Wires
+# through to the HIPPOLM_CACHE_DIR env var that
+# src/training/data/cache.py:get_cache_dir() honors. null =
+# repo-relative .cache/hippolm/datasets. Override (CLI flag or
+# this key) when the default location is short on disk space.
+#
+# SDK-side caches (ModelScope + HF datasets) are pinned to
+# <repo>/.cache/modelscope/ and <repo>/.cache/huggingface/datasets/
+# automatically by src/training/env.py:pin_cache_directories() —
+# set MODELSCOPE_CACHE / HF_HOME in the env (or the repo's .env)
+# to relocate them.
+cache_dir: null
 
 # Output
 output_dir: output
