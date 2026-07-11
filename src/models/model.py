@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from .norms import RMSNorm
-from .kda import KDA
+from .ops.kda import KDA
 from .ops.attn_res import BlockAttnRes
 from .activation import SwiGLU
 
