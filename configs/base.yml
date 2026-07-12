@@ -109,7 +109,16 @@ tp_size: 2
 
 # Misc
 mb_timing: 0
-empty_cache_between_mb: true
+# Disable ``torch.cuda.empty_cache()`` between micro-batches. The
+# caching allocator already reuses freed blocks for the next chunk;
+# forcing the blocks back to CUDA only forces a fresh ``cudaMalloc``
+# on the next allocation. 5060 Ti 16G benchmark (test/_tmp/bench_step.py,
+# seq=4096, 8 layers, 4 chunks/step, 10 steps): 1958 ms → 1870 ms
+# (-4.5%); HWM unchanged at 223 MiB (``empty_cache`` returns blocks
+# to the driver, but PyTorch's ``max_memory_allocated`` tracks the
+# peak of CUDA-side allocations, which doesn't drop with empty_cache
+# — see ``docs/empty_cache_off.md``).
+empty_cache_between_mb: false
 kda_skip_aqk_akk_saved: false
 
 # FFN NVFP4 path

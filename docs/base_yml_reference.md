@@ -237,10 +237,15 @@ applies; there is no separate `s.accum` / `s.mom_scale` /
   `scripts/cli.py`). `0` disables. When `> 0`, logs
   `data_ms` / `h2d_ms` / `fwd_ms` / `bwd_ms` / `sync_ms` for
   the first N microbatches of every step.
-- `empty_cache_between_mb` — release the caching-allocator
-  slack pool back to the driver after each microbatch. Frees
-  ~4 GB of pool on the 16 GB production config at the cost of
-  ~24 ms/mb (+0.7% wall-clock).
+- `empty_cache_between_mb` — when `True`, call
+  `torch.cuda.empty_cache()` after each microbatch to return
+  cached blocks to the CUDA driver. **`False` (production
+  default since 2026-07-12)** — the caching allocator reuses
+  blocks for the next chunk anyway, so `empty_cache()` only
+  forces a fresh `cudaMalloc` on the next allocation. Measured
+  −4.5% step time at no HWM cost (see `docs/empty_cache_off.md`
+  for the benchmark + the HWM probe caveat: `max_memory_allocated`
+  does NOT drop with `empty_cache`).
 - `kda_skip_aqk_akk_saved` — skip saving the KDA per-chunk
   attention statistics `Aqk` + `Akk` in the forward pass;
   recompute them in the backward pass via
