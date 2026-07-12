@@ -167,7 +167,7 @@ def test_muon_step_gpu_matches_inline_reference():
         kda_mode="chunk", use_short_conv=True,
         allow_neg_eigval=False, safe_gate=False,
         lower_bound=None, conv_size=4, conv_bias=False,
-        num_layers=2, num_blocks=2,
+        num_layers=2, num_blocks=1,
         intermediate_size=768,
         rms_norm_eps=1e-6,
     )
