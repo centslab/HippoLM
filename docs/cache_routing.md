@@ -1,3 +1,5 @@
+> **Skill**: [`run-smoke-test`](../.claude/skills/run-smoke-test/SKILL.md) — data path 改动 commit 前必过。
+
 # Local cache routing
 
 Every local cache the training stack writes or reads is routed through

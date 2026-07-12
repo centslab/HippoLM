@@ -1,3 +1,5 @@
+> **Skill**: [`run-smoke-test`](../.claude/skills/run-smoke-test/SKILL.md) — 任何 optimizer layout 改动 commit 前必过。
+
 # Optimizer layout: which params go to AdamW, which to Muon
 
 The per-param optimizer split lives in

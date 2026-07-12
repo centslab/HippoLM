@@ -1,3 +1,5 @@
+> **Rules**: [`saved-tensors-not-hwm`](../.claude/rules/saved-tensors-not-hwm.md) · [`dont-target-v100`](../.claude/rules/dont-target-v100.md) — NVFP4 FFN 走 sm_80+ BF16 MMA；VRAM 改动以 `max_memory_allocated()` 而非 `saved_tensors` 为准。
+
 # W4A16 NVFP4 FFN — design notes
 
 ## What it is

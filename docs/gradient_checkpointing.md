@@ -1,3 +1,5 @@
+> **Skill**: [`run-smoke-test`](../.claude/skills/run-smoke-test/SKILL.md) · **Rule**: [`saved-tensors-not-hwm`](../.claude/rules/saved-tensors-not-hwm.md)
+
 # Gradient checkpointing policy
 
 This document captures the **two-tier ckpt structure** currently in

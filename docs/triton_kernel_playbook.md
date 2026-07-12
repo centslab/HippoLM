@@ -1,3 +1,5 @@
+> **Skill**: [`kda-correctness-sweep`](../.claude/skills/kda-correctness-sweep/SKILL.md) · **Rule**: [`dont-target-v100`](../.claude/rules/dont-target-v100.md)
+
 # Triton kernel playbook
 
 The patterns below are the ones that worked (or didn't) when

@@ -1,3 +1,5 @@
+> **Skill**: [`kda-correctness-sweep`](../.claude/skills/kda-correctness-sweep/SKILL.md) · **Rule**: [`dont-target-v100`](../.claude/rules/dont-target-v100.md)
+
 # Fast KDA — Bottleneck Analysis vs Theoretical Limit
 
 **Date:** 2026-06-29 (Round-6 update + bwd analysis)

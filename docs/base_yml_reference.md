@@ -1,3 +1,5 @@
+> **Rule**: [`dont-target-v100`](../.claude/rules/dont-target-v100.md) — sm_70 已 drop；改 `base.yml` 不要引入 V100 兼容路径。
+
 # `configs/base.yml` parameter reference
 
 Every non-obvious knob in `configs/base.yml` is documented here.

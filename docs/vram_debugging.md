@@ -1,3 +1,5 @@
+> **Skill**: [`run-smoke-test`](../.claude/skills/run-smoke-test/SKILL.md) · **Rule**: [`saved-tensors-not-hwm`](../.claude/rules/saved-tensors-not-hwm.md) — VRAM 改动以 `max_memory_allocated()` 为准。
+
 # VRAM Debugging Methodology
 
 This document captures the methodology, tools, and per-component

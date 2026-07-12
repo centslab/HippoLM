@@ -1,3 +1,5 @@
+> **Rule**: [`dont-target-v100`](../.claude/rules/dont-target-v100.md) — Marlin FP4 已锁 torch 2.12 / CUDA 13.0，新 arch 用 `scripts/build_marlin.py --arch <X>`。
+
 # Marlin FP4 build pipeline
 
 How the W4A16 NVFP4 FFN path's fused-dequant matmul is built, why
