@@ -57,16 +57,11 @@ def _populate(model, adamw, muon, seed: int) -> None:
         p.grad = torch.randn(p.shape, generator=g, dtype=p.dtype) * 1e-3
     for s in adamw.state.values():
         s.m.add_(s.param.grad.detach().to("cpu").reshape(-1))
+    # Muon: merged-accumulator design (int8 / mxfp8 storage
+    # removed 2026-07-12). ``s.mom_buf`` doubles as the
+    # accumulator.
     for s in muon.state.values():
-        if s.accum is not None:
-            # Quantized muon: per-mb hot path adds bf16 grad
-            # into the separate ``s.accum`` buffer.
-            s.accum.add_(
-                s.param.grad.detach().to(torch.bfloat16).reshape(-1).to("cpu"),
-            )
-        else:
-            # fp* muon: merged accumulator.
-            s.mom_buf.add_(
+        s.mom_buf.add_(
                 s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1)
             )
 

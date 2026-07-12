@@ -84,27 +84,15 @@ def _populate_state(model, adamw, muon, seed: int = 1) -> None:
     for s in adamw.state.values():
         s.m.add_(s.param.grad.detach().to("cpu").reshape(-1))
         s.step = 3
+    # Muon (merged-accumulator design — quantized storage
+    # removed 2026-07-12): ``s.mom_buf`` doubles as the
+    # accumulator. There is no separate ``s.accum`` /
+    # ``s.mom_scale``; the per-mb grad is added directly
+    # to ``mom_buf`` in its storage dtype.
     for s in muon.state.values():
-        if s.accum is not None:
-            # Quantized muon (int8 / mxfp8): the per-mb hot
-            # path now adds the bf16 grad into the separate
-            # ``s.accum`` buffer (cheap CPU bf16 add). The
-            # old dequant-add-requant cycle moved to step()
-            # time and is exercised by the optimizer step
-            # itself; populating state directly here mirrors
-            # what the per-mb hook would do.
-            s.accum.add_(
-                s.param.grad.detach()
-                .to(torch.bfloat16)
-                .reshape(-1)
-                .to("cpu"),
-            )
-        else:
-            # fp* muon: merged-accumulator design, ``mom_buf``
-            # is the accumulator.
-            s.mom_buf.add_(
-                s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1)
-            )
+        s.mom_buf.add_(
+            s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1)
+        )
         s.step = 7
 
 
@@ -192,27 +180,9 @@ def test_muon_state_dict_contains_hyperparams_and_per_param_state(tiny_model):
         assert entry["kind"] == "muon"
 
 
-def test_muon_int8_state_dict_roundtrip_is_byte_equal(tiny_model, muon_opt):
-    """Canonical config: int8 momentum + BF16 per-row scale."""
-    _populate_state(tiny_model, adamw_opt_for(tiny_model), muon_opt, seed=2)
-    # int8 path is the default; verify the scale is present
-    for s in muon_opt.state.values():
-        assert s.mom_scale is not None
-        assert s.mom_buf.dtype == torch.int8
-    sd = muon_opt.state_dict()
-
-    fresh = muon_opt_for(tiny_model)
-    fresh.load_state_dict(sd)
-
-    assert fresh.lr == muon_opt.lr
-    for s_new, s_old in zip(fresh.state.values(), muon_opt.state.values()):
-        assert torch.equal(s_new.mom_buf, s_old.mom_buf)
-        assert torch.equal(s_new.mom_scale, s_old.mom_scale)
-        assert s_new.step == s_old.step
-
-
-def test_muon_floating_state_dict_roundtrip_is_byte_equal(tiny_model):
-    """Full-precision momentum: mom_scale must be None."""
+def test_muon_state_dict_roundtrip_is_byte_equal(tiny_model):
+    """Full-precision momentum (the only supported storage since
+    2026-07-12 — int8 / mxfp8 quantization removed)."""
     from src.training.param_offload import CPUMuon
     from src.training.precision_config import PrecisionConfig
     precision = PrecisionConfig.from_dict({
@@ -224,14 +194,10 @@ def test_muon_floating_state_dict_roundtrip_is_byte_equal(tiny_model):
         precision=precision,
     )
     for s in opt.state.values():
-        assert s.mom_scale is None
         assert s.mom_buf.dtype == torch.bfloat16
 
     _populate_state(tiny_model, adamw_opt_for(tiny_model), opt, seed=3)
     sd = opt.state_dict()
-    # mom_scale field present in the dict, but value is None
-    for entry in sd["state"]:
-        assert entry["mom_scale"] is None
 
     fresh = CPUMuon(
         [p for p in tiny_model.parameters() if p.ndim >= 2],
@@ -315,5 +281,3 @@ def test_load_checkpoint_restores_step_loss_and_optimizer_state(
         assert torch.equal(s_new.exp_avg_sq, s_old.exp_avg_sq)
     for s_new, s_old in zip(muon2.state.values(), muon.state.values()):
         assert torch.equal(s_new.mom_buf, s_old.mom_buf)
-        if s_new.mom_scale is not None:
-            assert torch.equal(s_new.mom_scale, s_old.mom_scale)

@@ -54,13 +54,19 @@ Step time wins (245M test scale, 5060 Ti 16G):
 
 Out of scope:
 
-  - mxfp8 muon (needs a fused C++ add kernel into E4M3 + E8M0
-    pair; the GPU ``add_`` on E4M3 silently breaks). mxfp8
-    params are skipped by ``setup_per_layer_gpu_accum`` and
-    left to the manual flush path.
   - NVFP4 mode-3 (no leaf param; the FP4 packed buffers live on
-    the module, not as a Parameter). NVFP4 entries are also
+    the module, not as a Parameter). NVFP4 entries are
     skipped and fall through to ``flush_manual_flush_params``.
+
+History
+-------
+The pre-2026-07-12 design had a ``_is_mxfp8_param_state``
+skip rule (mxfp8 storage needed a fused C++ add kernel —
+the GPU ``add_`` on E4M3 silently breaks). After mxfp8
+storage was removed (2026-07-12; long-training
+instability), the skip rule is gone: every per-param hook
+now does the same GPU ``add_()`` and CPU pin transfer.
+The code lives on the ``archive/int8-mxfp8-muon`` branch.
 """
 from __future__ import annotations
 
@@ -272,11 +278,6 @@ def setup_per_layer_gpu_accum(model, optimizers) -> None:
     # Lazy import to avoid a top-level cycle.
     from ._state import _accumulator_target
 
-    def _is_mxfp8_param_state(s) -> bool:
-        """Mirror v1's mxfp8 skip rule."""
-        _, _, is_mxfp8 = _accumulator_target(s)
-        return is_mxfp8
-
     # Walk layers and build per-layer info.
     _LAYER_INFO.clear()
     max_layer_size = 0
@@ -294,13 +295,11 @@ def setup_per_layer_gpu_accum(model, optimizers) -> None:
                 s = state_by_pid.get(id(p))
                 if s is None:
                     continue
-                # Skip NVFP4 mode-3 (no leaf param) and mxfp8
-                # (needs fused C++ kernel).
+                # Skip NVFP4 mode-3 (no leaf param). Other
+                # params get the per-layer accumulator.
                 if getattr(s, "nvfp4_module", None) is not None:
                     continue
-                if _is_mxfp8_param_state(s):
-                    continue
-                target, cast_dtype, _ = _accumulator_target(s)
+                target, cast_dtype = _accumulator_target(s)
                 n = p.numel()
                 # Each per-param target has shape ``(p.numel(),)``.
                 # We pack all params in a layer contiguously into
@@ -346,8 +345,6 @@ def setup_per_layer_gpu_accum(model, optimizers) -> None:
                 continue
             if getattr(s, "nvfp4_module", None) is not None:
                 continue
-            if _is_mxfp8_param_state(s):
-                continue
             mf_state_by_pid[id(p)] = s
     if mf_state_by_pid:
         max_mf_size = max(s.param.numel() for s in mf_state_by_pid.values())
@@ -357,7 +354,7 @@ def setup_per_layer_gpu_accum(model, optimizers) -> None:
         for s in mf_state_by_pid.values():
             p = s.param
             n = p.numel()
-            target, _, _ = _accumulator_target(s)
+            target, _ = _accumulator_target(s)
             cpu_slot = torch.empty(n, dtype=torch.bfloat16).pin_memory()
             _MF_INFO[id(p)] = {
                 "target": target.view(-1),

@@ -44,15 +44,6 @@ def amax_cpu(t: Optional[torch.Tensor]) -> float:
     """
     if t is None:
         return 0.0
-    # FP8 dtypes (mxfp8 Muon: E4M3 ``mom_buf`` / E8M0
-    # ``mom_scale``) have no CPU reduction kernels in PyTorch
-    # 2.9.1 (``NotImplementedError: max_all not implemented for
-    # 'Float8_e4m3fn'``). Cast to BF16 first — the round-trip is
-    # free on CPU and the abs/max reduction is the same cost as
-    # in the original dtype.
-    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
-                    torch.float8_e8m0fnu):
-        t = t.to(torch.bfloat16)
     return t.detach().abs().max().item()
 
 
@@ -97,35 +88,24 @@ def log_pre_step_diag(
     """Emit the pre-optimizer-step diagnostic.
 
     For each optimizer we report the max abs of the cycle's
-    grad accumulator (``m`` for AdamW; ``accum`` when set for
-    quantized muon — int8/mxfp8 — and ``mom_buf`` for fp*
-    muon in the merged-accumulator design), the max abs of the
+    grad accumulator (``m`` for AdamW; ``mom_buf`` for Muon —
+    merged-accumulator design, the only supported layout since
+    int8/mxfp8 removal on 2026-07-12), the max abs of the
     remaining optimizer-internal state (only ``exp_avg_sq`` for
     AdamW; Muon has no separate internal state at this point
-    — ``mom_buf`` / ``mom_scale`` are populated at step end,
-    not read here), and the max abs of the param. Combined
-    with ``total_norm`` this is enough to localize the source
-    of an explosion to a specific optimizer (muon vs adamw)
-    and stage (grad vs state vs param).
-
-    For quantized muon the diagnostic reads ``s.accum`` (the
-    bf16 cycle sum) rather than ``s.mom_buf`` (which is the
-    int8/mxfp8 representation that hasn't been populated yet
-    for this cycle — it was reset to zero at the end of the
-    previous cycle's step). Reading ``mom_buf`` here would
-    report the stale prior cycle's quantized momentum and
-    miss any current-cycle divergence.
+    — ``mom_buf`` is populated at step end, not read here),
+    and the max abs of the param. Combined with ``total_norm``
+    this is enough to localize the source of an explosion to a
+    specific optimizer (muon vs adamw) and stage (grad vs
+    state vs param).
     """
-    # Resolve which tensor to read for each muon param: the
-    # separate ``accum`` (quantized) when set, else ``mom_buf``
-    # (fp* muon merged design).
+    # For Muon the accumulator is ``s.mom_buf`` (merged
+    # design — no separate ``accum`` since the int8/mxfp8
+    # paths were removed 2026-07-12).
     def muon_accum_max(state: Dict[int, OptimizerState]) -> float:
         if not state:
             return 0.0
-        vals = []
-        for s in state.values():
-            t = s.accum if s.accum is not None else s.mom_buf
-            vals.append(amax_cpu(t))
+        vals = [amax_cpu(s.mom_buf) for s in state.values()]
         return max(vals)
 
     logger.info(

@@ -25,8 +25,8 @@ Two paths are supported:
 
 The module-level state for the streaming queue lives here:
 
-  * :data:`_pending_grads` — list of ``(op, target, src, s)``
-    tuples awaiting flush.
+  * :data:`_pending_grads` — list of ``(target, src)`` tuples
+    awaiting flush.
   * :data:`_manual_flush_param_ids` — set of ``id(p)`` for params
     that the manual-flush path must handle separately (typically
     tied embeddings whose grad arrives via a custom autograd
@@ -47,6 +47,17 @@ Three entry points are exposed to the training loop:
 :param_offload.zero_cpu_grad_accum` resets the per-param
     accumulators at cycle start (defensive; the optimizers
     reset their own accumulators inside ``step()``).
+
+History
+-------
+The pre-2026-07-12 design had two queue op tags —
+``("add", target, src)`` and ``("mxfp8_accum", mom_buf, src)``
+— with the latter routed through a fused C++ kernel for the
+mxfp8 storage format. After mxfp8 storage was removed
+(2026-07-12; long-training instability), the queue reverts to
+plain ``.add_()`` entries: every per-mb grad is folded into
+its accumulator with a CPU tensor add. The pre-removal code
+lives on the ``archive/int8-mxfp8-muon`` branch.
 """
 from __future__ import annotations
 
@@ -59,17 +70,10 @@ from ._state import _ParamState, _accumulator_target
 
 
 # Module-level queue for in-flight D2H transfers issued by the
-# hooks. Each entry is ``("add", target_tensor, src_cpu)`` —
-# ``src_cpu`` is added in place into ``target_tensor``
-# (``s.m`` for AdamW, ``s.accum`` for quantized muon, or
-# ``s.mom_buf`` for fp* muon). The previous dequant-add-
-# requant cycles for int8 / mxfp8 muon ran on every microbatch
-# (the per-mb CPU bottleneck at 8+ seconds per mb); they have
-# moved to :meth:`CPUMuon.step` (one requantize per param per
-# step, amortized over the accumulation cycle). See
-# :attr:`_ParamState.accum` for the full design rationale.
-# :func:`flush_pending_grads` syncs CUDA and applies the
-# accumulated operations.
+# hooks. Each entry is ``(target_tensor, src_cpu)`` — ``src_cpu``
+# is added in place into ``target_tensor`` (``s.m`` for AdamW
+# or ``s.mom_buf`` for Muon; both are floating dtypes, so a
+# plain ``.add_()`` is the right op).
 _pending_grads: list = []
 
 # Module-level set of param ``id(p)`` for params that need a
@@ -120,9 +124,8 @@ def register_grad_offload_hooks(
     clear is the source of truth.
 
     The cast target follows the accumulator's storage dtype
-    (``s.m.dtype`` for AdamW, ``s.mom_buf.dtype`` for fp* Muon,
-    BF16 for int8 Muon). See :func:`_accumulator_target` for the
-    resolution rules.
+    (``s.m.dtype`` for AdamW, ``s.mom_buf.dtype`` for Muon).
+    See :func:`_accumulator_target` for the resolution rules.
 
     ``manual_flush_params`` (optional): list of params whose
     grad arrives via a custom autograd Function that fires
@@ -155,7 +158,6 @@ def register_grad_offload_hooks(
             # backward — the per-param hook path is irrelevant
             # for these modules.
             if s.nvfp4_module is not None:
-                s._optimizer = opt
                 continue
             p = s.param
             if id(p) in seen:
@@ -165,10 +167,6 @@ def register_grad_offload_hooks(
                 # Skip the per-param hook; flush_pending_grads
                 # handles this param via the manual path.
                 continue
-            # Attach the optimizer to the state object so the
-            # mxfp8 flush dispatch can reach the helper without
-            # a separate id→state map.
-            s._optimizer = opt
             p.register_post_accumulate_grad_hook(_make_offload_hook(s))
     # Defensive: clear any stale entries (e.g. from a previous
     # run sharing the module-level queue).
@@ -189,20 +187,9 @@ def _make_offload_hook(s: _ParamState):
     file) silently streamed the param values to CPU every
     microbatch — the root cause of a multi-day "loss not
     decreasing" incident. Always read ``p.grad`` here.
-
-    For int8 muon the target is the bf16 ``s.accum`` buffer; the
-    per-mb work is a cheap CPU bf16 add (no dequant-add-requant
-    cycle). The expensive quantization happens once per optimizer
-    step inside :meth:`CPUMuon.step`.
-
-    For mxfp8 muon the target is ``s.mom_buf`` (the cycle-sum is
-    the mxfp8 storage itself), but the flush calls the fused C++
-    :func:`_mxfp8_apply_grad` instead of a plain ``.add_()`` —
-    that op is what saves the 2 bytes/elt of an extra accum
-    buffer and is the entire point of the mxfp8 storage format.
     """
     p = s.param
-    target, target_dtype, is_mxfp8 = _accumulator_target(s)
+    target, target_dtype = _accumulator_target(s)
 
     def hook(g: torch.Tensor | None) -> None:
         # ``g`` is the leaf param per the PyTorch API contract.
@@ -225,8 +212,7 @@ def _make_offload_hook(s: _ParamState):
             .reshape(-1)
             .to("cpu", non_blocking=True)
         )
-        op = "mxfp8_accum" if is_mxfp8 else "add"
-        _pending_grads.append((op, target, src, s))
+        _pending_grads.append((target, src))
         # Free the GPU grad right now so the memory is available
         # for the next param's backward. The hook return value
         # replaces .grad per PyTorch's contract; returning None
@@ -274,40 +260,20 @@ def flush_manual_flush_params(optimizers: List) -> None:
             g = p.grad
             if g is None:
                 continue
-            target, cast_dtype, is_mxfp8 = _accumulator_target(s)
+            target, cast_dtype = _accumulator_target(s)
             src_cpu = (
                 g.detach()
                 .to(cast_dtype)
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
             )
-            op = "mxfp8_accum" if is_mxfp8 else "add"
-            pending.append((op, target, src_cpu, s))
+            pending.append((target, src_cpu))
             p.grad = None
     if not pending:
         return
     torch.cuda.synchronize()
-    # Dispatch by op tag. mxfp8 entries go through the fused
-    # kernel via ``CPUMuon._mxfp8_apply_grad`` (saves the 2
-    # bytes/elt of a separate bf16 ``accum``). int8 / fp* /
-    # AdamW are plain ``.add_()``.
-    mxfp8_pending = []
-    plain_adds = []
-    for entry in pending:
-        if entry[0] == "mxfp8_accum":
-            mxfp8_pending.append(entry)
-        else:
-            plain_adds.append((entry[1], entry[2]))
-    for target, src in plain_adds:
+    for target, src in pending:
         target.add_(src)
-    if mxfp8_pending:
-        for opt in optimizers:
-            for s in opt.state.values():
-                s._optimizer = opt
-                for entry in mxfp8_pending:
-                    if entry[1] is s.mom_buf:
-                        opt._mxfp8_apply_grad(s, entry[2])
-                        break
 
 
 def flush_pending_grads(sync_device: int | None = None) -> None:
@@ -342,44 +308,11 @@ def flush_pending_grads(sync_device: int | None = None) -> None:
         torch.cuda.synchronize(sync_device)
     else:
         torch.cuda.synchronize()
-    # Entries come in two flavors:
-    #   - ``("add", target, src, s)`` for AdamW / fp* Muon /
-    #     int8 Muon (the cheap ``.add_()``).
-    #   - ``("mxfp8_accum", mom_buf, src_bf16, s)`` for mxfp8
-    #     Muon (dispatched through the fused C++ kernel via
-    #     ``CPUMuon._mxfp8_apply_grad``; this op is the raison
-    #     d'être of the mxfp8 storage format — saves the 2
-    #     bytes/elt of a separate bf16 ``accum`` buffer).
-    # Dispatch by the op tag; fall through to ``.add_()`` for
-    # the plain add case.
-    plain_adds = []
-    mxfp8_apps = []
-    for entry in _pending_grads:
-        op = entry[0]
-        if op == "mxfp8_accum":
-            mxfp8_apps.append(entry)
-        else:
-            _, target, src, _ = entry
-            plain_adds.append((target, src))
-    for target, src in plain_adds:
+    # All entries are now plain ``.add_()`` (the
+    # mxfp8-fused-kernel path was removed with mxfp8 storage
+    # in 2026-07-12).
+    for target, src in _pending_grads:
         target.add_(src)
-    if mxfp8_apps:
-        for entry in mxfp8_apps:
-            _, _, src, s = entry
-            opt = getattr(s, "_optimizer", None)
-            if opt is None:
-                # Defensive: no optimizer attached (e.g. test
-                # path that bypassed register_grad_offload_hooks).
-                # Fall back to plain bf16 add; the next step
-                # will dequant+requant the (wrong) bf16 storage
-                # as int8 instead of mxfp8. Logged once via the
-                # assertion.
-                raise RuntimeError(
-                    "mxfp8 flush: param's _ParamState has no "
-                    "_optimizer attached; was register_grad_offload_hooks "
-                    "called?"
-                )
-            opt._mxfp8_apply_grad(s, src)
     _pending_grads.clear()
 
 
@@ -396,14 +329,9 @@ def accumulate_grads_to_cpu(
     hooks via :func:`register_grad_offload_hooks`). The training
     loop uses the streaming path.
 
-    The accumulator is ``s.m`` (AdamW), ``s.accum`` (quantized
-    muon: int8 / mxfp8), or ``s.mom_buf`` (fp* muon). The cast
-    target follows the accumulator's dtype — see
-    :func:`_accumulator_target`. For quantized muon the cast
-    target is BF16 and the per-mb path is a cheap CPU bf16 add
-    into ``s.accum`` (no dequant-add-requant per mb; the
-    requantize happens once per optimizer step inside
-    :meth:`CPUMuon.step`).
+    The accumulator is ``s.m`` (AdamW) or ``s.mom_buf`` (Muon).
+    The cast target follows the accumulator's dtype — see
+    :func:`_accumulator_target`.
 
     The async ``.to("cpu")`` is issued first (with a flattened
     view of the grad, so the resulting ``src_cpu`` matches the
@@ -415,7 +343,7 @@ def accumulate_grads_to_cpu(
     The cast happens BEFORE the DMA so the transfer itself
     matches the cast dtype.
     """
-    pending: list = []  # (target, src) — always a plain add now
+    pending: list = []
     for opt in optimizers:
         for s in opt.state.values():
             # NVFP4 mode-3: there is no Parameter.grad (no leaf in the
@@ -427,52 +355,30 @@ def accumulate_grads_to_cpu(
                 grad_w = module._latest_grad_w
                 if grad_w is None:
                     continue
-                # Muon mode-3 — the accumulator target follows the
-                # same rule as legacy Muon: int8 (non-mxfp8) uses a
-                # separate bf16 ``s.accum``; mxfp8 and bf16/fp32
-                # storage use the merged-accumulator design
-                # (``s.mom_buf``). The cast target matches the
-                # accumulator's dtype.
+                # The merged-accumulator design (post-2026-07-12)
+                # applies to both mode-3 and mode-0: a single
+                # ``.add_()`` folds the microbatch grad into
+                # either ``s.m`` (AdamW) or ``s.mom_buf`` (Muon).
                 if s.kind == "muon_nvfp4":
-                    if s.accum is not None:
-                        # int8 muon: accumulate into bf16 ``accum``,
-                        # the cheap CPU path that avoids the
-                        # dequant-add-requant cycle per mb.
-                        target = s.accum
-                        cast_dtype = target.dtype
-                    else:
-                        # mxfp8 or fp* muon: merged accumulator on
-                        # ``s.mom_buf``. The fused per-mb kernel
-                        # path (mxfp8) is wired up in the legacy
-                        # code via the ``s.param.grad`` route; for
-                        # mode-3 we land here too (just a plain
-                        # bf16→storage-dtype add — the requantize
-                        # happens once at step end).
-                        target = s.mom_buf
-                        cast_dtype = target.dtype
-                    src_cpu = (
-                        grad_w.detach()
-                        .to(cast_dtype)
-                        .reshape(-1)
-                        .to("cpu", non_blocking=True)
-                    )
-                    pending.append(("add", target, src_cpu))
+                    target = s.mom_buf
+                    cast_dtype = target.dtype
                 else:
-                    # AdamW mode-3 — same as before.
+                    # adamw_nvfp4
                     target = s.m
-                    src_cpu = (
-                        grad_w.detach()
-                        .to(target.dtype)
-                        .reshape(-1)
-                        .to("cpu", non_blocking=True)
-                    )
-                    pending.append(("add", target, src_cpu))
+                    cast_dtype = target.dtype
+                src_cpu = (
+                    grad_w.detach()
+                    .to(cast_dtype)
+                    .reshape(-1)
+                    .to("cpu", non_blocking=True)
+                )
+                pending.append((target, src_cpu))
                 module._latest_grad_w = None  # consumed
                 continue
             g = s.param.grad
             if g is None:
                 continue
-            target, cast_dtype, is_mxfp8 = _accumulator_target(s)
+            target, cast_dtype = _accumulator_target(s)
             # Cast on the GPU first (so DMA carries the cast
             # dtype), flatten to match the 1-D accumulator, then
             # issue the async D2H.
@@ -482,11 +388,7 @@ def accumulate_grads_to_cpu(
                 .reshape(-1)
                 .to("cpu", non_blocking=True)
             )
-            # Mark the queue entry with the op kind so the flush
-            # can dispatch mxfp8 entries through the fused kernel
-            # instead of a plain ``.add_()``.
-            op = "mxfp8_accum" if is_mxfp8 else "add"
-            pending.append((op, target, src_cpu))
+            pending.append((target, src_cpu))
             # Free GPU grad immediately so the GPU memory is
             # available for the next micro-batch's forward.
             s.param.grad = None
@@ -498,26 +400,8 @@ def accumulate_grads_to_cpu(
 
     if not pending:
         return
-    # Group entries by op kind; needs the optimizer to dispatch
-    # mxfp8 through ``CPUMuon._mxfp8_apply_grad``.
-    mxfp8_pending = []
-    add_pending = []
-    for entry in pending:
-        op = entry[0]
-        if op == "mxfp8_accum":
-            mxfp8_pending.append(entry)
-        else:
-            add_pending.append((entry[1], entry[2]))
-    for target, src in add_pending:
+    for target, src in pending:
         target.add_(src)
-    if mxfp8_pending:
-        for opt in optimizers:
-            for s in opt.state.values():
-                s._optimizer = opt  # belt-and-suspenders for the manual path
-                for entry in mxfp8_pending:
-                    if entry[1] is s.mom_buf:
-                        opt._mxfp8_apply_grad(s, entry[2])
-                        break
 
 
 def zero_cpu_grad_accum(optimizers: List) -> None:
@@ -525,35 +409,18 @@ def zero_cpu_grad_accum(optimizers: List) -> None:
     next accumulation cycle).
 
     For AdamW, zero ``s.m`` (the merged accumulator + first
-    moment). For Muon, zero ``s.accum`` when set (int8 muon
-    only; mxfp8 muon no longer has a separate accum), or zero
-    ``s.mom_buf`` for the merged-accumulator design (fp* muon
-    AND mxfp8 muon). The optimizer's own ``step()`` already
-    zeros the accumulator it consumes; this function is a
-    defensive zero for the case where ``found_inf`` is detected
-    and the optimizers are NOT stepped — we still want to clear
-    the accumulated grads before the next cycle.
+    moment). For Muon, zero ``s.mom_buf`` (the merged
+    accumulator). The optimizer's own ``step()`` already zeros
+    the accumulator it consumes; this function is a defensive
+    zero for the case where ``found_inf`` is detected and the
+    optimizers are NOT stepped — we still want to clear the
+    accumulated grads before the next cycle.
     """
     for opt in optimizers:
         for s in opt.state.values():
             if s.kind == "adamw":
                 s.m.zero_()
-            elif s.accum is not None:
-                # int8 muon: zero the separate bf16 accumulator.
-                # ``mom_buf`` is irrelevant for next-cycle
-                # accumulation (it gets requantized from
-                # ``accum`` at step end of the next cycle), so
-                # we leave it alone.
-                s.accum.zero_()
             else:
-                # fp* muon AND mxfp8 muon: zero ``mom_buf``
-                # (merged accumulator). For mxfp8, the kernel
-                # writes both mom_buf and mom_scale every mb,
-                # so leaving mom_scale from the prior cycle is
-                # harmless (the kernel overwrites it).
-                # int8 zeros the int8 storage without touching
-                # the scale; the scale was last set by the
-                # requant on the most recent cycle's step,
-                # which is the right starting point for the
-                # next cycle's accumulation.
+                # Muon (and nvfp4 variants): merged-accumulator
+                # design — zero ``mom_buf`` for the next cycle.
                 s.mom_buf.zero_()

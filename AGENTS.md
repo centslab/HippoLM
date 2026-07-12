@@ -49,7 +49,8 @@ counts, block sizes, and precision flags.
   `project_hardware.md`. (See also `.claude/rules/dont-target-v100.md`.)
 - Training is data-parallel-style across the TP group: forward
   and backward on GPU, optimizer state on CPU pinned memory
-  (BF16 for AdamW, int8-quantized momentum for Muon).
+  (BF16 for both AdamW and Muon; int8/mxfp8 Muon storage was
+  removed on 2026-07-12).
 - Streaming data path: ModelScope (Aliyun CDN) preferred, with a
   local parquet cache and a HF mirror fallback. The fallback
   activates only on real network errors. See

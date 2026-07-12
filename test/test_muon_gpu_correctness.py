@@ -6,17 +6,23 @@ Historical context
 ``e513852 feat(offload): CPUMuon GPU step + bf16/fp16/fp32 momentum
 storage`` moved the muon step's dequant / SGD / requant cycle from CPU
 DRAM to GPU HBM. The optimization had to be **bit-equivalent** to the
-original CPU path within FP16 / int8 quantization noise — losing even
-a few percent on this test would mean the production optimizer was
+original CPU path within FP16 quantization noise — losing even a
+few percent on this test would mean the production optimizer was
 silently producing different (and unverified) updates.
 
 The test pins that contract by running the production step() on one
 copy of a model and an inlined, hand-written GPU reference on a
-second copy, then comparing mom_buf, mom_scale, and the post-step
-param. The reference is reconstructed from the algorithm
-description (dequant → requant → NS → apply), so a future change to
-the production step() that changes the math will trip the test
-even if the change is locally consistent.
+second copy, then comparing ``mom_buf`` and the post-step param.
+The reference is reconstructed from the algorithm description
+(NS → apply → recast to storage), so a future change to the
+production step() that changes the math will trip the test even
+if the change is locally consistent.
+
+Quantized storage (int8 + per-row scale, mxfp8 + per-block E8M0)
+was removed on 2026-07-12 — long-training runs showed
+quantization-error accumulation destabilizing optimization. The
+merged-accumulator design (mom_buf doubles as the accumulator) is
+the only supported muon storage path now.
 
 Test layout
 -----------
@@ -25,11 +31,11 @@ Test layout
 - Copy the pre-step state from A to B so they start identical.
 - Run production ``CPUMuon.step()`` on A.
 - Run the inline GPU reference on B.
-- Assert the three outputs agree within tight thresholds
-  (mom_buf ≤ 5/255, mom_scale ≤ 1e-3, param ≤ 5e-3).
+- Assert the outputs agree within tight thresholds
+  (mom_buf ≤ 5/255 in storage units, param ≤ 5e-3).
 
-The thresholds match the original (pre-conversion) values; tightening
-any of them would catch a real divergence.
+The thresholds match the original (pre-quantization-removal) values;
+tightening any of them would catch a real divergence.
 """
 from __future__ import annotations
 
@@ -57,42 +63,33 @@ from src.training.precision_config import PrecisionConfig
 def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
     """Independent GPU reference implementation of the muon step.
 
-    Mirrors the algorithm (dequant → NS → apply → requant) but inlined
-    with explicit per-tensor operations. The production ``CPUMuon.step()``
-    went through a sequence of optimizations after this test was
-    written; the inlined version is the "what the math should do"
-    reference that the test compares against.
+    Mirrors the algorithm (NS → apply → recast-to-storage) but inlined
+    with explicit per-tensor operations. The production
+    ``CPUMuon.step()`` is the optimized version of the same math; the
+    inlined version is the "what the math should do" reference that
+    the test compares against.
 
-    Storage design (production default = int8 + separate bf16 accum):
-    the per-cycle grad sum lives in ``s.accum`` (bf16, no scale), NOT
-    ``s.mom_buf`` (which is zero at step start). The step reads
-    ``s.accum``, casts to FP32, orthogonalizes, applies the update,
-    then requantizes ``s.accum`` into ``s.mom_buf`` / ``s.mom_scale``
-    (per-row int8) — mirroring ``_quantize_accum_to_mom_buf`` — and
-    zeros ``s.accum`` for the next cycle.
-
-    For fp* muon (``s.accum is None``) the merged-accumulator design
-    applies: ``s.mom_buf`` doubles as the accumulator, so the step
-    reads it directly, recasts to storage dtype, and zeros it.
+    Storage design (merged-accumulator, 2026-07-12):
+    the per-cycle grad sum lives directly in ``s.mom_buf`` (the
+    configured full-precision storage dtype: bf16 / fp16 / fp32).
+    The step reads ``s.mom_buf``, casts to FP32, orthogonalizes,
+    applies the update, then recasts ``s.mom_buf`` to its storage
+    dtype and zeros it for the next cycle.
     """
     lr = muon_opt.lr
     wd = muon_opt.weight_decay
     CHUNK_ROWS = CPUMuon._STREAM_CHUNK_ROWS
     for s in muon_opt.state.values():
-        # int8 muon: cycle grad is in ``s.accum``. fp* muon:
-        # ``s.mom_buf`` is the merged accumulator.
-        use_separate_accum = s.accum is not None
-        g_buf = s.accum if use_separate_accum else s.mom_buf
-        if g_buf.abs().sum().item() == 0:
+        # Merged-accumulator: ``s.mom_buf`` IS the accumulator.
+        if s.mom_buf.abs().sum().item() == 0:
             continue
         shape = s.shape
         rows, cols = shape[0], shape[1]
         device = s.param.device
 
-        # ---- Dequantize the cycle's accumulated grad to FP32. ----
-        # Both paths store the accumulator as a raw (unscaled) buffer:
-        # ``accum`` is bf16, fp* ``mom_buf`` is its storage dtype.
-        m_fp32_gpu = g_buf.to(device, non_blocking=True).float() \
+        # Cast to FP32 for the math (the storage dtype may be
+        # BF16 / FP16 / FP32 — FP32 is the compute precision).
+        m_fp32_gpu = s.mom_buf.to(device, non_blocking=True).float() \
                                     .view(rows, cols)
 
         # ---- Decoupled weight decay on the full param. ----
@@ -110,25 +107,14 @@ def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
 
         torch.cuda.current_stream(device).synchronize()
 
-        # ---- Step-end requantize + cycle reset. ----
-        if use_separate_accum:
-            # int8 per-row requant of accum into mom_buf / mom_scale
-            # (mirrors _quantize_accum_to_mom_buf), then zero accum.
-            row_max = m_fp32_gpu.abs().amax(dim=1).clamp(min=1e-8)
-            new_scale_fp32 = row_max / 127.0
-            new_scale_bf16 = new_scale_fp32.to(torch.bfloat16)
-            new_scale_2d = new_scale_bf16.float().unsqueeze(1)
-            q_int8_gpu = (m_fp32_gpu / new_scale_2d).round() \
-                            .clamp(-128, 127).to(torch.int8)
-            s.mom_buf.copy_(q_int8_gpu.view(-1), non_blocking=True)
-            s.mom_scale.copy_(new_scale_bf16, non_blocking=True)
-            s.accum.zero_()
-        else:
-            # fp* merged accumulator: recast to storage dtype, reset.
-            s.mom_buf.copy_(
-                m_fp32_gpu.to(s.mom_buf.dtype).view(-1), non_blocking=True
-            )
-            s.mom_buf.zero_()
+        # ---- Step-end: recast mom_buf to storage dtype, reset. ----
+        # The accumulator (in FP32 above) is the *post-NS* momentum;
+        # we recast it back to the storage dtype and zero for the
+        # next cycle, mirroring the production path.
+        s.mom_buf.copy_(
+            m_fp32_gpu.to(s.mom_buf.dtype).view(-1), non_blocking=True
+        )
+        s.mom_buf.zero_()
 
 
 def _build_matched_pair(
@@ -161,14 +147,12 @@ def _build_matched_pair(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_muon_step_gpu_matches_inline_reference():
     """Production ``CPUMuon.step()`` must match the inlined GPU
-    reference implementation on mom_buf, mom_scale, and post-step
-    param.
+    reference implementation on ``mom_buf`` and the post-step param.
 
     A divergence here means the production step changed its math
-    (likely a refactor of the dequant/requant boundary or the NS
-    chunking). Either is a real regression — the muon update must
-    stay bit-equivalent to the inline reference, or the W4A16
-    100-step sweep that validated the W4A16 path is invalidated.
+    (likely a refactor of the NS chunking or the storage-dtype
+    boundary). Either is a real regression — the muon update must
+    stay bit-equivalent to the inline reference.
     """
     torch.manual_seed(0)
     device = 0
@@ -210,16 +194,12 @@ def test_muon_step_gpu_matches_inline_reference():
             flush_pending_grads(sync_device=device)
 
     # Copy pre-step state from A to B so they start identical. Under
-    # the separate-accum design the cycle's grad lives in ``accum``
-    # (bf16) for int8 muon — ``mom_buf`` is zero at step start — so
-    # ``accum`` is the buffer that must match for the two steps to be
-    # comparable. Copy it too (when present) alongside mom_buf/scale.
+    # the merged-accumulator design the cycle's grad lives in
+    # ``mom_buf`` (the storage dtype), so that is the only buffer that
+    # needs to match for the two steps to be comparable.
     for s_a, s_b in zip(muon_a.state.values(), muon_b.state.values()):
         assert s_a.param is not s_b.param
         s_b.mom_buf.copy_(s_a.mom_buf)
-        s_b.mom_scale.copy_(s_a.mom_scale)
-        if s_a.accum is not None:
-            s_b.accum.copy_(s_a.accum)
         s_b.param.data.copy_(s_a.param.data)
         s_b.step = s_a.step
 
@@ -227,21 +207,26 @@ def test_muon_step_gpu_matches_inline_reference():
     muon_a.step()
     _muon_step_gpu_inline(muon_b)
 
-    # Compare the three post-step outputs.
+    # Compare the post-step outputs.
     failures = []
     for s_a, s_b in zip(muon_a.state.values(), muon_b.state.values()):
-        # mom_buf: int8, diff in [-255, 255]
-        d_q = (s_a.mom_buf.to(torch.int32) - s_b.mom_buf.to(torch.int32)).abs()
-        if int(d_q.max()) > 5:
-            failures.append(
-                f"mom_buf max diff {int(d_q.max())}/255 exceeds 5"
-            )
-        # mom_scale: BF16, compare in FP32
-        d_s = (s_a.mom_scale.float() - s_b.mom_scale.float()).abs()
-        if float(d_s.max()) > 1e-3:
-            failures.append(
-                f"mom_scale max diff {float(d_s.max()):.4e} exceeds 1e-3"
-            )
+        # mom_buf: storage dtype (BF16 / FP16 / FP32). For FP16/BF16
+        # compare in int16-equivalent units (cast through int16);
+        # for FP32 compare in FP32.
+        if s_a.mom_buf.dtype in (torch.bfloat16, torch.float16):
+            d_q = (
+                s_a.mom_buf.to(torch.int16) - s_b.mom_buf.to(torch.int16)
+            ).abs()
+            if int(d_q.max()) > 5:
+                failures.append(
+                    f"mom_buf max diff {int(d_q.max())}/32767 exceeds 5"
+                )
+        else:
+            d_q = (s_a.mom_buf.float() - s_b.mom_buf.float()).abs()
+            if float(d_q.max()) > 1e-5:
+                failures.append(
+                    f"mom_buf (fp32) max diff {float(d_q.max()):.4e} exceeds 1e-5"
+                )
         # param.data: FP16, compare in FP32
         d_p = (s_a.param.data.float() - s_b.param.data.float()).abs()
         if float(d_p.max()) > 5e-3:

@@ -32,23 +32,20 @@ Implements two optimizer variants used together via param groups:
     + reset to zero). Momentum storage is configurable via
     ``precision.muon_momentum``:
 
-      * ``int8`` + **BF16 per-row scale**: 1 byte/elt momentum
-        + a tiny ``rows``-sized BF16 scale tensor. Because the
-        per-row scale is data-dependent (the row's max-abs),
-        each microbatch's accumulate requires a
-        **dequant → add → requant** pass on the CPU (this is
-        the cost of preserving int8 precision without an
-        extra accumulator buffer). The NS iteration is the
-        only GPU step and is streamed over rows in 4096-row
-        chunks.
       * ``bf16`` / ``fp16`` / ``fp32``: full-precision
         momentum, no quantization. ``mom_buf`` is the
         accumulator directly; the add is just a tensor add
-        in the storage dtype (no requant). Halves the Muon
-        CPU RAM vs the prior design (which had a separate
-        ``accum`` BF16 buffer alongside ``mom_buf``). The NS
-        iteration is unaffected (it orthogonalizes the
-        raw momentum in FP32 on the GPU regardless).
+        in the storage dtype (no requant). The NS iteration
+        is unaffected (it orthogonalizes the raw momentum in
+        FP32 on the GPU regardless).
+
+      Quantized storage (``int8`` per-row BF16 scale,
+      ``mxfp8`` per-block E8M0 scale) was removed on
+      2026-07-12 after long-training runs showed
+      quantization-error accumulation destabilizing
+      optimization. Pre-removal code is preserved on the
+      ``archive/int8-mxfp8-muon`` branch.
+      See ``docs/optimizer_layout.md``.
 
 Both optimizers follow the same API surface as ``torch.optim.Optimizer``
 minimally — ``step()`` consumes whatever gradients are present on
@@ -70,23 +67,17 @@ Conventions
   So between micro-batches the GPU holds zero gradient memory.
 - Optimizer state on CPU pinned memory:
     AdamW: m (BF16, numel) + v (BF16, numel)
-    Muon:  mom_buf (cfg.dtype, numel)
-           + mom_scale (BF16, rows)  [int8 only; None for fp*]
-           + mom_scale (E8M0, rows × ceil(cols / bs))  [mxfp8 only]
-    For mxfp8 muon: no ``accum`` BF16 buffer. The per-mb
-    accumulation flows through the fused mxfp8 kernel
-    directly into ``mom_buf`` (a per-mb dequant + add +
-    requant in one C++ pass). This is the raison d'être of
-    the mxfp8 storage format — paying the per-mb requant
-    cost on the existing ``mom_buf`` and saving 2 bytes/elt
-    of CPU pinned memory that a separate ``accum`` would
-    have used.
+    Muon:  mom_buf (cfg.dtype, numel) — no scale, no
+           separate ``accum`` (merged-accumulator design).
 - For ~624 M params: AdamW ≈ 4 × 624 M = 2.5 GB CPU RAM
   (m BF16 + v BF16, both 2 bytes/elt).
-  Muon: 0.3 GB (int8, mom_buf only) / 0.6 GB (fp16/bf16) /
-  1.2 GB (fp32). vs. the prior design AdamW was 3.7 GB and
-  Muon was 0.6 / 1.2 / 2.5 GB respectively — the merged-
-  accumulator design saves 2 bytes/elt on every param.
+  Muon: 0.6 GB (fp16/bf16) / 1.2 GB (fp32). The previous
+  ``int8``-with-per-row-BF16-scale path used 0.3 GB but
+  was removed on 2026-07-12 (long-training quantization
+  error accumulation); pre-removal code lives on the
+  ``archive/int8-mxfp8-muon`` branch. The merged-accumulator
+  design saves 2 bytes/elt on every param vs the legacy
+  separate-accumulator design.
 
 Package layout
 --------------
@@ -96,10 +87,10 @@ boundaries are preserved):
   * :mod:`._state`  — :class:`_ParamState` dataclass,
     :class:`OptimizerState` :class:`typing.Protocol`, and the
     state-only helpers (:func:`_accumulator_target`,
-    :func:`_quantize_accum_to_mom_buf`, :func:`_scale_accum`).
+    :func:`_scale_accum`).
   * :mod:`.adamw`   — :class:`CPUAdamW`.
-  * :mod:`.muon`    — :class:`CPUMuon` and its int8 / mxfp8 /
-    fp* storage-format helpers.
+  * :mod:`.muon`    — :class:`CPUMuon` and its full-precision
+    bf16 / fp16 / fp32 storage-format helpers.
   * :mod:`.offload` — streaming / post-backward plumbing
     (post-accumulate-grad hooks, manual flush, accumulator
     reset, the module-level :data:`_pending_grads` /
@@ -122,7 +113,6 @@ from ._state import (
     OptimizerState,
     _ParamState,
     _accumulator_target,
-    _quantize_accum_to_mom_buf,
     _scale_accum,
 )
 from .adamw import CPUAdamW
@@ -170,10 +160,9 @@ __all__ = [
     "_manual_flush_param_ids",
     "_pending_grads",
     # Private (re-exported for tests + the optional state-only
-    # helpers used by the training loop / quant path)
+    # helpers used by the training loop)
     "_ParamState",
     "_accumulator_target",
     "_make_offload_hook",
-    "_quantize_accum_to_mom_buf",
     "_scale_accum",
 ]

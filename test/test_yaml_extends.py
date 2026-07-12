@@ -196,12 +196,10 @@ def test_real_test_yml_inherits_base():
     pulls in the precision block. This is the contract the test
     configs rely on.
 
-    Note: ``muon_momentum.dtype`` was reverted from mxfp8 → bf16
-    on 2026-07-03 after mxfp8 in production was found to diverge
-    over many gradient-accumulation steps (see
-    :mod:`docs.mxfp8_3_bugs` Bug 4). The mxfp8 path is still
-    exercised by ``configs/test/muon_mxfp8.yml`` which overrides
-    the dtype back to mxfp8.
+    Note: int8 / mxfp8 muon momentum storage was removed on
+    2026-07-12 (long-training instability). The base precision
+    is now BF16 throughout; ``configs/test/muon_mxfp8.yml`` was
+    deleted with the rest of the quantized muon path.
     """
     quick = _REPO / "configs" / "test" / "quick.yml"
     if not quick.exists():

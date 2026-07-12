@@ -396,14 +396,9 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     for sid, s in opt.state.items():
                         accum = (
                             s.m if s.kind == "adamw"
-                            else (s.accum if s.accum is not None else s.mom_buf)
+                            else s.mom_buf
                         )
-                        # Cast to BF16 before ``isfinite`` — FP8
-                        # storage (mxfp8 muon) has no direct
-                        # ``isfinite`` in PyTorch 2.9.1. The bf16
-                        # round-trip is lossless for the non-NaN/Inf
-                        # values we're trying to detect.
-                        n_nan = (~torch.isfinite(accum.to(torch.bfloat16))).sum().item()
+                        n_nan = (~torch.isfinite(accum)).sum().item()
                         n_nan_accum_total += n_nan
                         if n_nan > 0:
                             found_inf = True

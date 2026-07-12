@@ -13,16 +13,12 @@ Single public function :func:`_compute_and_clip_grad_norm`:
 The accumulator dispatch is:
 
   - AdamW: ``s.m`` (BF16, merged first moment + grad buffer).
-  - Quantized Muon (int8, mxfp8): ``s.accum`` (BF16, the
-    per-mb grad sum; the ``mom_buf`` storage is untouched at
-    clip time and requantized from ``accum`` at ``step()``).
-  - fp* Muon (merged-accumulator design): ``s.mom_buf``.
+  - Muon (merged-accumulator design): ``s.mom_buf`` (the
+    configured full-precision storage dtype: bf16 / fp16 /
+    fp32 — quantized storage removed 2026-07-12).
 
-The clip is always a plain ``.mul_(coef)`` because all three
-accumulators are floating-point (BF16 / FP16 / FP32); the
-previous FP8 ``mom_buf`` round-trip via
-``_scale_mxfp8_mom_buf`` is gone — the separate-accumulator
-redesign moved the FP8 storage away from the clip path.
+The clip is always a plain ``.mul_(coef)`` because both
+accumulators are floating-point (BF16 / FP16 / FP32).
 
 Distributed (``dist``) is imported lazily to keep this module
 importable from non-distributed unit tests (the all-reduce
@@ -40,17 +36,13 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
 
     For each param the accumulator is whichever tensor holds
     the sum-of-microbatch-grads for that param at this point:
-    ``s.m`` (AdamW), ``s.accum`` (quantized muon: int8 /
-    mxfp8), or ``s.mom_buf`` (fp* muon, merged design).
+    ``s.m`` (AdamW) or ``s.mom_buf`` (Muon, merged design).
     Scales the accumulator by ``clip_coef = max_norm /
     (total_norm + 1e-6)`` only when the norm exceeds the cap,
     so well-behaved steps are no-ops.
 
-    The clip is always a plain ``.mul_(coef)`` because all
-    three accumulators are floating-point (BF16 / FP16 / FP32);
-    the previous FP8 ``mom_buf`` round-trip via
-    ``_scale_mxfp8_mom_buf`` is gone — the separate-accumulator
-    redesign moved the FP8 storage away from the clip path.
+    The clip is always a plain ``.mul_(coef)`` because both
+    accumulators are floating-point (BF16 / FP16 / FP32).
     """
     import torch.distributed as dist
 
@@ -59,7 +51,7 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
         for s in opt.state.values():
             accum = (
                 s.m if s.kind == "adamw"
-                else (s.accum if s.accum is not None else s.mom_buf)
+                else s.mom_buf
             )
             local_sq += accum.detach().float().pow(2).sum()
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:

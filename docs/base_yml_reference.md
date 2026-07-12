@@ -138,44 +138,30 @@ disables clipping.
 ## Precision
 
 Each entry sets the storage dtype for a tensor class. Supported
-dtypes:
+dtypes (as of 2026-07-12):
 
 - `fp32`, `fp16`, `bf16` — floating point; no scaling needed.
-- `int8`, `int4` — integer; require a scale mode.
-- `mxfp8` — OCP Microscaling FP8: E4M3 elements + per-block
-  E8M0 scale. `block_size` defaults to 32 when not given; `scale`
-  is implicitly `'block'`. Currently only used for
-  `muon_momentum` — the per-block scale gives finer within-row
-  granularity than per-row int8 without a separate accumulator
-  buffer. See
-  `:class:src.training.precision_config.TensorPrecision` for
-  the validation rules and `:mod:docs.mxfp8_3_bugs` for the
-  three latent bugs caught while shipping this.
+- All other dtypes (`int8`, `int4`, `mxfp8`) were **removed**
+  on 2026-07-12 after long-training runs showed quantization
+  error compounding over many gradient-accumulation steps
+  and destabilizing optimization. The `TensorPrecision`
+  constructor rejects any other dtype at config-parse time.
+  The pre-removal code is preserved on the
+  `archive/int8-mxfp8-muon` branch.
 
-Scale modes (`int8`/`int4` only; ignored for `fp*` and `mxfp8`):
-
-- `no` — no scaling (raw integer values).
-- `tensor` — one scale per tensor.
-- `per-channel` — one scale per output channel (per-row for 2D
-  weights).
-- `block` — one scale per block of `block_size` consecutive
-  elements.
+Scale modes were likewise removed along with the integer
+storage formats.
 
 `activations` only accepts the floating dtypes
 (`fp32`/`fp16`/`bf16`). `fp16` / `bf16` enable
 `torch.amp.autocast` with that dtype; `fp32` disables autocast
 and runs a pure FP32 forward.
 
-`muon_momentum` storage. Default is `bf16`. The `mxfp8` (E4M3 +
-per-32 E8M0) and `int8` (BF16 per-row scale) code paths exist
-and are exercised by `configs/test/muon_mxfp8.yml` and
-`configs/test/muon_int8.yml` — they're selectable for
-memory-constrained experiments, but they are NOT production:
-the per-mb quant error compounds over many gradient-
-accumulation steps and training diverges (see
-`:mod:docs.mxfp8_3_bugs` for the analysis). For prod, `bf16`
-momentum gives the full-precision grad-sum feed to
-Newton-Schulz orthogonalization.
+`muon_momentum` storage. Default is `bf16`. Full-precision
+only — see the removal note above. The merged-accumulator
+design (`s.mom_buf` doubles as the per-mb grad accumulator)
+applies; there is no separate `s.accum` / `s.mom_scale` /
+`mxfp8_block_size`.
 
 `adamw_m` / `adamw_v` — AdamW state buffers. Both default to
 `bf16`; they follow the merged-accumulator design (see

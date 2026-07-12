@@ -185,7 +185,7 @@ def _grad_accum_coverage(muon_opt, adamw_opt) -> tuple[int, int, dict[int, str]]
                 continue
             accum = (
                 s.m if s.kind == "adamw"
-                else (s.accum if s.accum is not None else s.mom_buf)
+                else s.mom_buf
             )
             n_total += 1
             mag = accum.detach().abs().max().item()

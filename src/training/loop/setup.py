@@ -448,124 +448,41 @@ def _setup_worker(
         s.param.numel() if s.param is not None else s.nvfp4_n
         for s in adamw_opt.state.values()
     )
-    n_muon_rows = sum(s.shape[0] for s in muon_opt.state.values())
     # Per-param byte breakdown, kept in named variables so the log
     # line below (and any future debugger) can see the components
     # separately.
     #
     # Accumulator layout: AdamW uses ``s.m`` (BF16) as both the
     # grad accumulator and the first moment — no separate
-    # ``accum`` buffer. Muon uses the same merged design for fp*
-    # storage (``s.mom_buf`` doubles as the accumulator). For
-    # int8 muon, there is a separate bf16 ``s.accum`` buffer that
-    # holds the per-mb grad sum cheaply (the int8
-    # dequant-add-requant per-mb cycle was the CPU bottleneck at
-    # 8+ seconds per microbatch — see ``docs/optimizer_layout.md``
-    # for the design). For mxfp8 muon, there is NO separate
-    # ``accum`` buffer: the per-mb accumulation flows through a
-    # fused C++ kernel (:func:`fused_mxfp8_dequant_add_requant`)
-    # that does dequant + add + requant in one pass directly into
-    # ``s.mom_buf``. This is the mxfp8 design's whole point — to
-    # save the 2 bytes/elt that a separate accumulator would have
-    # cost (see test/test_mxfp8_no_accum.py for the regression).
-    # Per-mb CPU sync is slower for mxfp8 (~1s/mb at the smoke
-    # scale) than for int8 with bf16 accum (~50ms), but it's still
-    # inside the per-mb sync budget because the D2H DMA dominates
-    # the wall-clock anyway.
-    #
-    # Muon's momentum storage dtype is configurable
-    # (``precision.muon_momentum``): int8 with a BF16 per-row
-    # scale, mxfp8 with an E8M0 per-block scale (1 byte per
-    # ``block_size`` elements, default 32), or full-precision
-    # bf16/fp16/fp32 (no scale). We read the actual dtype off
-    # the first state entry rather than hardcoding, so the log
-    # message reflects whatever the user configured.
+    # ``accum`` buffer. Muon uses the merged-accumulator design
+    # for every supported storage dtype (``s.mom_buf`` doubles
+    # as the accumulator; no separate ``accum``, no scale
+    # tensor). Quantized storage formats (int8 per-row BF16
+    # scale, mxfp8 per-block E8M0 scale) were removed on
+    # 2026-07-12 after long-training runs showed
+    # quantization-error accumulation destabilizing
+    # optimization. See ``docs/optimizer_layout.md`` for the
+    # post-removal layout.
     muon_states = list(muon_opt.state.values())
     if muon_states:
         muon_mom_dtype = muon_states[0].mom_buf.dtype
         muon_mom_bytes_per_elt = muon_mom_dtype.itemsize
-        # Scale tensor exists for int8 AND mxfp8 (None for fp*).
-        muon_has_scale = muon_states[0].mom_scale is not None
-        # mxfp8: per-block E8M0 scale; total scale bytes is
-        # ``ceil(cols / block_size)`` per row, 1 byte per entry.
-        mxfp8_block_size = muon_states[0].mxfp8_block_size
-        # Separate ``accum`` buffer exists only for quantized
-        # muon (int8 / mxfp8) — fp* muon keeps the merged-
-        # accumulator design. Checked per-state (not just the
-        # first) so a heterogeneous model still computes
-        # correctly.
-        quantized_muon_params = sum(
-            (s.param.numel() if s.param is not None else s.nvfp4_n)
-            for s in muon_states if s.accum is not None
-        )
     else:
-        muon_mom_dtype = torch.int8
-        muon_mom_bytes_per_elt = 1
-        muon_has_scale = False
-        mxfp8_block_size = None
-        quantized_muon_params = 0
+        muon_mom_dtype = torch.bfloat16
+        muon_mom_bytes_per_elt = 2
     muon_mom = n_muon * muon_mom_bytes_per_elt
-    if muon_has_scale:
-        if mxfp8_block_size is not None:
-            # mxfp8: scale bytes = rows * ceil(cols / block_size)
-            # summed over all muon params. We approximate by
-            # summing per-state contributions; for the typical
-            # case (all params share the same block_size and
-            # similar cols) this is close to the true total.
-            n_muon_scale_entries = sum(
-                (s.shape[1] + mxfp8_block_size - 1) // mxfp8_block_size
-                for s in muon_states
-            )
-            muon_scale = n_muon_scale_entries * 1  # 1 byte / E8M0
-        else:
-            # int8: per-row BF16 scale.
-            muon_scale = n_muon_rows * 2
-    else:
-        muon_scale = 0
-    # Separate ``accum`` cost: 2 bytes/elt (BF16) for every
-    # quantized-muon param. Zero for fp* muon (no separate
-    # buffer) and for AdamW (its ``s.m`` is the merged
-    # accumulator).
-    muon_accum = quantized_muon_params * 2
     adamw_m = n_adamw * 2
     adamw_v = n_adamw * 2
-    muon_bytes = muon_mom + muon_scale + muon_accum
+    muon_bytes = muon_mom
     adamw_bytes = adamw_m + adamw_v
     muon_mom_label = (
         f"{str(muon_mom_dtype).replace('torch.', '')}_mom"
     )
-    if mxfp8_block_size is not None:
-        muon_scale_str = (
-            f" + e8m0_scale(bs={mxfp8_block_size})="
-            f"{muon_scale / 1024**3:.3f} GB"
-        )
-    elif muon_has_scale:
-        muon_scale_str = (
-            f" + bf16_scale={muon_scale / 1024**3:.3f} GB"
-        )
-    else:
-        muon_scale_str = ""
-    muon_accum_str = (
-        f" + bf16_accum={muon_accum / 1024**3:.3f} GB"
-        if muon_accum > 0 else ""
-    )
-    # Per-param log line describes the per-mb CPU sync cost:
-    # int8 uses a separate bf16 accum (~50ms/mb); mxfp8 uses
-    # the fused C++ kernel on mom_buf directly (~1s/mb at smoke
-    # scale). Branches on mom_buf.dtype so the message reflects
-    # the actual configured storage, not just "any quantized
-    # muon".
-    if muon_states and muon_mom_dtype == torch.float8_e4m3fn:
-        accum_note = "mxfp8: fused C++ kernel per-mb (~1s/mb at smoke scale)"
-    elif muon_accum > 0:
-        accum_note = "int8: cheap CPU bf16 add per mb (~50ms)"
-    else:
-        accum_note = "merged-accumulator (mom_buf doubles as accumulator)"
+    accum_note = "merged-accumulator (mom_buf doubles as accumulator)"
     logger.info(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
         f" ({muon_bytes / 1024**3:.2f} GB total:"
-        f" {muon_mom_label}={muon_mom / 1024**3:.3f} GB"
-        f"{muon_scale_str}{muon_accum_str}),"
+        f" {muon_mom_label}={muon_mom / 1024**3:.3f} GB),"
         f" AdamW params={n_adamw:,}"
         f" ({adamw_bytes / 1024**3:.2f} GB total:"
         f" bf16_m={adamw_m / 1024**3:.3f} GB"

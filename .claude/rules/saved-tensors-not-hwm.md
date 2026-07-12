@@ -22,8 +22,8 @@ backward**, which doesn't include:
 
 - Working buffers (matmul outputs reused later in the same pass).
 - `torch.empty()` scratch the kernel allocates but doesn't save.
-- Optimizer state (Muon int8-quant buffers, AdamW CPU-offload
-  shadow copies).
+- Optimizer state (Muon BF16 momentum buffers, AdamW CPU-offload
+  shadow copies — Muon int8-quant buffers removed 2026-07-12).
 - Cached reloads (e.g. Marlin FP4 `_cached_repack` output — see
   auto-memory `project_marlin_cache_drop.md`; cache was *deleted*
   because it wasn't on HWM anyway, just wasted time).

@@ -92,30 +92,6 @@ class CPUAdamW:
         # Resolve dtypes once (avoids per-param .to_torch() calls).
         m_dtype = precision.adamw_m.dtype.to_torch()
         v_dtype = precision.adamw_v.dtype.to_torch()
-        # Quantized m / v are not supported (AdamW's m and v are
-        # magnitudes / squared magnitudes; quantizing them loses
-        # the precision that the FP32 promotion in step() is
-        # supposed to recover). Fall back to FP32 storage and
-        # warn — explicit user override of an unsupported
-        # combination should not silently change the math.
-        if precision.adamw_m.dtype.is_integer:
-            m_dtype = torch.float32
-            import warnings
-            warnings.warn(
-                f"CPUAdamW: adamw_m dtype={precision.adamw_m.dtype.value}"
-                f" is integer-quantized; falling back to FP32 storage."
-                f" Quantizing m/v is not supported (the FP32"
-                f" promotion in step() assumes a floating source).",
-                stacklevel=2,
-            )
-        if precision.adamw_v.dtype.is_integer:
-            v_dtype = torch.float32
-            import warnings
-            warnings.warn(
-                f"CPUAdamW: adamw_v dtype={precision.adamw_v.dtype.value}"
-                f" is integer-quantized; falling back to FP32 storage.",
-                stacklevel=2,
-            )
 
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()

@@ -35,7 +35,8 @@ This test pins that contract end-to-end:
     - ``CPUAdamW.step()`` modifies ``module.packed_weight`` and
       leaves ``s.m`` reset to zero (cycle semantics)
     - CPUMuon.register_nvfp4_module adds the module to state
-      with the configured storage (BF16 / int8 / mxfp8); after a
+      with the configured storage (BF16 — int8 / mxfp8 muon
+      removed 2026-07-12); after a
       step the FP4 packed buffers must have changed (no NaN, finite)
 
 Run:
@@ -550,16 +551,17 @@ class TestOptimizerIntegration:
 
     def test_cpumuon_register_nvfp4_module_bf16(self):
         """CPUMuon with bf16 momentum storage (the simplest path)
-        registers the module with a BF16 pinned ``mom_buf``, no
-        scale, no separate ``accum`` (merged-accumulator design)."""
+        registers the module with a BF16 pinned ``mom_buf`` (no
+        separate ``accum``, no ``mom_scale`` — merged-accumulator
+        design; int8 / mxfp8 quantization removed 2026-07-12)."""
         from src.models.ops.nvfp4_linear import NVFP4Linear
-        from src.training.param_offload import CPUMuon, PrecisionConfig
+        from src.training.param_offload import CPUMuon
+        from src.training.precision_config import PrecisionConfig
         torch.manual_seed(0)
         linear = NVFP4Linear(64, 128, use_marlin=True, no_bf16_master=True).cuda()
         prec = PrecisionConfig()
         prec.muon_momentum = type("M", (), {
-            "dtype": type("D", (), {"value": "bf16", "is_integer": False,
-                                    "is_mxfp": False, "block_size": 32,
+            "dtype": type("D", (), {"value": "bf16",
                                     "to_torch": staticmethod(lambda: torch.bfloat16)})()
         })()
         opt = CPUMuon([], lr=0.01, weight_decay=0.01, precision=prec)
@@ -570,23 +572,26 @@ class TestOptimizerIntegration:
         assert state.nvfp4_module is linear
         assert state.kind == "muon_nvfp4"
         assert state.mom_buf.dtype == torch.bfloat16
-        assert state.mom_scale is None  # bf16 storage has no scale
-        assert state.accum is None     # merged-accumulator design
-        assert state.mxfp8_block_size is None
+        # Merged-accumulator design (int8 / mxfp8 removed
+        # 2026-07-12): the separate ``accum`` / ``mom_scale`` /
+        # ``mxfp8_block_size`` fields were deleted from
+        # ``_ParamState`` along with the quantized storage path;
+        # there's nothing to assert here (their absence is the
+        # contract).
 
     def test_cpumuon_step_updates_fp4_buffers(self):
         """A full CPUMuon step (with bf16 momentum storage) updates
         the module's FP4 packed buffers."""
         from src.models.ops.nvfp4_linear import NVFP4Linear
         from src.training.param_offload import (
-            CPUMuon, PrecisionConfig, accumulate_grads_to_cpu,
+            CPUMuon, accumulate_grads_to_cpu,
         )
+        from src.training.precision_config import PrecisionConfig
         torch.manual_seed(0)
         linear = NVFP4Linear(64, 128, use_marlin=True, no_bf16_master=True).cuda()
         prec = PrecisionConfig()
         prec.muon_momentum = type("M", (), {
-            "dtype": type("D", (), {"value": "bf16", "is_integer": False,
-                                    "is_mxfp": False, "block_size": 32,
+            "dtype": type("D", (), {"value": "bf16",
                                     "to_torch": staticmethod(lambda: torch.bfloat16)})()
         })()
         opt = CPUMuon([], lr=0.01, weight_decay=0.01, precision=prec)
