@@ -224,6 +224,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "the cost of ~24 ms/mb (+0.7%% wall-clock). Disable "
                         "only if benchmarking the raw allocator behavior.")
     p.add_argument(
+        "--offload_strategy", type=str, default="cpu_add",
+        choices=["cpu_add", "per_layer_gpu"],
+        help="Grad-offload strategy. ``cpu_add`` (default, prod-proven): "
+             "per-mb async D2H of every param's .grad + CPU bf16 add into "
+             "the per-param accumulator. ``per_layer_gpu`` (opt-in, A/B "
+             "wins 33-44%% step time at the test scale): accumulate grads "
+             "per-layer on a shared GPU buffer, then async D2H + worker-"
+             "thread CPU add — amortizes the D2H into the per-mb bwd tail. "
+             "Persistent VRAM cost is ~80 MiB (one shared gpu_buf + "
+             "small mf_buf); peak during bwd is +500 MiB at 245M scale "
+             "(scales linearly with model size — budget +700 MiB at "
+             "1.37B). See :mod:`src.training.param_offload.per_layer_gpu_accum` "
+             "for the full design.",
+    )
+    p.add_argument(
         "--shuffle", type=bool, default=True,
         help="Shuffle the streaming dataset. Disable (--shuffle false) for "
              "faster first-batch on slow mirrors — sequential order is fine "

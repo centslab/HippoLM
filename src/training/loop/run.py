@@ -36,6 +36,8 @@ from src.training.diagnostics import log_post_opt_diag, log_pre_step_diag
 from src.training.param_offload import (
     accumulate_grads_to_cpu,
     flush_manual_flush_params,
+    flush_per_layer_gpu_accum,
+    transfer_per_layer_gpu_accum_join,
     zero_cpu_grad_accum,
 )
 from .grad_norm import _compute_and_clip_grad_norm
@@ -78,6 +80,12 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
     decay_steps = getattr(args, "lr_decay_steps", 0)
     peak_muon_lr = args.muon_lr
     peak_adamw_lr = args.learning_rate
+    # Offload strategy resolved once per worker. The per-mb flush
+    # dispatch below and the per-step worker join both branch on
+    # this; ``cpu_add`` is the legacy prod path, ``per_layer_gpu``
+    # is the opt-in v4 alternative (see
+    # :mod:`src.training.param_offload.per_layer_gpu_accum`).
+    _offload_strategy = getattr(args, "offload_strategy", "cpu_add")
     # Activation precision comes from the precision config:
     # fp16 / bf16 → ``torch.amp.autocast`` with that dtype
     # (tensor-core matmul); fp32 → autocast disabled (pure FP32
@@ -286,10 +294,28 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     # skipped (idempotent: grad is already None after
                     # accumulate_grads_to_cpu drained it).
                     chunk_loss.backward()
-                    accumulate_grads_to_cpu(
-                        [muon_opt, adamw_opt], sync_device=gpus[rank],
-                    )
-                    flush_manual_flush_params([muon_opt, adamw_opt])
+                    if _offload_strategy == "per_layer_gpu":
+                        # v4: per-layer hooks already issued async
+                        # D2Hs and the worker drains them in parallel
+                        # with the main thread's continued bwd. The
+                        # per-mb flush is a no-op on the main thread;
+                        # we still call ``accumulate_grads_to_cpu`` to
+                        # drain NVFP4 mode-3 stashes (``module._latest_
+                        # grad_w`` — idempotent for BF16 params whose
+                        # ``.grad`` was already cleared by the v4
+                        # hooks). No ``flush_manual_flush_params``
+                        # needed: v4 installs its own per-param hook
+                        # for the manual-flush-style params (anything
+                        # not under any ``TPHippoLayer``).
+                        flush_per_layer_gpu_accum()
+                        accumulate_grads_to_cpu(
+                            [muon_opt, adamw_opt], sync_device=gpus[rank],
+                        )
+                    else:
+                        accumulate_grads_to_cpu(
+                            [muon_opt, adamw_opt], sync_device=gpus[rank],
+                        )
+                        flush_manual_flush_params([muon_opt, adamw_opt])
                     if getattr(args, "empty_cache_between_mb", True):
                         torch.cuda.empty_cache()
 
@@ -355,6 +381,14 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 accumulate_grads_to_cpu(
                     [muon_opt, adamw_opt], sync_device=gpus[rank],
                 )
+                # v4 step-end barrier: wait for the worker thread
+                # to drain the per-layer + per-mf D2H + CPU-add
+                # queue. Also calls ``torch.cuda.empty_cache()`` to
+                # release cached ``.grad`` blocks back to the OS so
+                # VRAM stays at "model + gpu_buf + mf_buf" between
+                # steps. No-op under the cpu_add strategy.
+                if _offload_strategy == "per_layer_gpu":
+                    transfer_per_layer_gpu_accum_join()
                 # Inf/nan check on the accumulated CPU grads.
                 found_inf = False
                 n_nan_accum_total = 0
