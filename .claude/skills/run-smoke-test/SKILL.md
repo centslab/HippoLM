@@ -30,13 +30,20 @@ A run **PASSES** iff **all three** of these hold:
 
 1. **No exceptions** during `setup` / `run` / `teardown` (run
    completes all 4 steps).
-2. **Checkpoint is non-empty** — the step log shows
-   `state_dict has N entries` for `N > 0`. A `state_dict = {}`
-   line (or an empty `meta` block in the saved file) is a FAIL
-   even if no exception fired; this catches state-dict-graph
-   regressions that produce silent zero-grad output (the
-   `TPHippoModel` `nn.ModuleDict` fix of 2026-06, see auto-memory
-   `project_tp_state_dict_bug.md`).
+2. **Checkpoint is non-empty** — load the saved file with
+   ``torch.load(path, map_location="cpu", weights_only=False)``
+   and check ``len(ckpt["model_state_dict"]) > 0``. The training
+   loop does NOT emit a "state_dict has N entries" log line;
+   you have to load the file yourself (e.g. via
+   ``pytest -s test/test_tp_model_state_dict.py``). An empty
+   ``model_state_dict`` is a FAIL even if no exception fired;
+   this catches state-dict-graph regressions that produce
+   silent zero-grad output (the `TPHippoModel` `nn.ModuleDict`
+   fix of 2026-06, see auto-memory `project_tp_state_dict_bug.md`).
+   The checkpoint top-level keys are
+   ``step / model_state_dict / optimizer_state_dict /
+   loss / scaler_state_dict`` — see
+   `src/training/checkpoint.py:72` for the schema.
 3. **Peak resident ≤ 16 GB** on the 5060 Ti — measured via
    `torch.cuda.max_memory_allocated()`. The 16 GB ceiling is the
    load-bearing constraint for any new GPU-state-adding change.
