@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from ..precision_config import PrecisionConfig
 from ._state import _ParamState
+from .cpu_fused import fused_zero_many
 
 
 class CPUMuon:
@@ -268,6 +269,13 @@ class CPUMuon:
         lr = self.lr
         wd = self.weight_decay
         CHUNK_ROWS = self._STREAM_CHUNK_ROWS
+        # Collect mom_buf tensors for the deferred fused zero at
+        # the end of step(). Only entries that actually did work
+        # (had non-zero accumulated grad) are included — the
+        # early-exit skip below means inactive params' mom_bufs
+        # are already zero, so re-zeroing them would be wasted
+        # bandwidth.
+        mom_bufs_to_zero: list = []
         for s in self.state.values():
             # Merged-accumulator design (all storage dtypes):
             # ``mom_buf`` is the cycle's accumulated grad.
@@ -376,9 +384,21 @@ class CPUMuon:
             # this DMA landed. ----
             torch.cuda.current_stream(device).synchronize()
 
-            # ---- Cycle-end housekeeping: zero ``mom_buf`` for
-            # the next accumulation cycle. ----
-            s.mom_buf.zero_()
+            # ---- Cycle-end housekeeping (deferred): queue
+            # ``mom_buf`` for the fused zero at the bottom of
+            # step(). Replacing the per-param ``s.mom_buf.zero_()``
+            # with one C++ ``memset``-style call across all
+            # entries eliminates the per-param Python+dispatch
+            # overhead (~50 us each) and unlocks cross-op CPU
+            # bandwidth via OpenMP. See
+            # :mod:`src.training.param_offload.cpu_fused`. ----
+            mom_bufs_to_zero.append(s.mom_buf)
+
+        # ---- End-of-step fused zero (all mom_bufs in one
+        # C++ call). Falls back to per-tensor ``.zero_()`` if the
+        # JIT extension failed to compile (no C++ toolchain at
+        # runtime). ----
+        fused_zero_many(mom_bufs_to_zero)
 
     # ------------------------------------------------------------------ #
     # Checkpoint save/load (resume).                                     #

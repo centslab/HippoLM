@@ -89,12 +89,13 @@ toolchain is available at runtime. A/B wins: see the
 """
 from __future__ import annotations
 
-import os
 import queue
 import threading
 from typing import Any, Dict, List, Optional
 
 import torch
+
+from . import cpu_fused
 
 
 # --------------------------------------------------------------------------- #
@@ -128,6 +129,10 @@ _WORKER: Optional[threading.Thread] = None
 # --------------------------------------------------------------------------- #
 # Fused OpenMP add kernel (DeepSpeed CPUAdam-style).                           #
 # --------------------------------------------------------------------------- #
+# The C++ source, JIT compile, and cache live in :mod:`.cpu_fused` (shared
+# with the Muon / offload zero path). This module just consumes the
+# extension handle for the per-layer worker.
+#
 # One C++ call does all per-param CPU adds in parallel via OpenMP, with
 # within-op parallelism for big ops. Replaces the per-param Python loop
 # (each ``tgt.add_(slice)`` has ~50 us Python+dispatch overhead → 17 calls
@@ -142,87 +147,6 @@ _WORKER: Optional[threading.Thread] = None
 #
 # Falls back to the Python-loop worker if JIT compile fails (no C++ toolchain
 # at runtime). The fallback keeps correctness — only the speedup is lost.
-_FUSED_EXT: Optional[Any] = None
-_FUSED_EXT_FAILED: bool = False
-_FUSED_CPP_SRC = r"""
-#include <torch/extension.h>
-#include <vector>
-#include <cstdint>
-#include <omp.h>
-
-static inline void _add_chunk(uint8_t* tgt, const uint8_t* src, int64_t n_bytes) {
-    int64_t i = 0;
-    int64_t n_aligned = n_bytes & ~31;
-    for (; i < n_aligned; i += 32) {
-        __m256i a = _mm256_loadu_si256((__m256i*)(tgt + i));
-        __m256i b = _mm256_loadu_si256((__m256i*)(src + i));
-        _mm256_storeu_si256((__m256i*)(tgt + i), _mm256_add_epi16(a, b));
-    }
-    for (; i < n_bytes; i += 2) {
-        uint16_t a = *(uint16_t*)(tgt + i);
-        uint16_t b = *(uint16_t*)(src + i);
-        *(uint16_t*)(tgt + i) = a + b;
-    }
-}
-
-void fused_add_into_many(std::vector<int64_t> tgt_ptrs,
-                         std::vector<int64_t> src_ptrs,
-                         std::vector<int64_t> sizes) {
-    int n = (int)tgt_ptrs.size();
-    #pragma omp parallel for schedule(dynamic, 1)
-    for (int i = 0; i < n; i++) {
-        uint8_t* tgt = reinterpret_cast<uint8_t*>(tgt_ptrs[i]);
-        const uint8_t* src = reinterpret_cast<const uint8_t*>(src_ptrs[i]);
-        int64_t nb = sizes[i];
-        int nthreads = omp_get_num_threads();
-        int64_t chunk = (nb + nthreads - 1) / nthreads;
-        chunk = (chunk + 31) & ~31;  // align to 32 bytes (AVX2 lane width)
-        #pragma omp parallel for schedule(static)
-        for (int64_t off = 0; off < nb; off += chunk) {
-            int64_t end = std::min(off + chunk, nb);
-            _add_chunk(tgt + off, src + off, end - off);
-        }
-    }
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fused_add_into_many", &fused_add_into_many,
-          "Fused multi-target BF16 add with OpenMP (within + across ops)");
-}
-"""
-
-
-def _try_load_fused_ext() -> Optional[Any]:
-    """JIT-compile the fused kernel once. Cached. Returns None on failure."""
-    global _FUSED_EXT, _FUSED_EXT_FAILED
-    if _FUSED_EXT is not None:
-        return _FUSED_EXT
-    if _FUSED_EXT_FAILED:
-        return None
-    try:
-        from torch.utils.cpp_extension import load_inline
-        # Honor env var to skip fused kernel (debug / toolchain issues).
-        if os.environ.get("HIPPO_V4_FORCE_PYLOOP"):
-            _FUSED_EXT_FAILED = True
-            return None
-        # Pin the build dir so re-imports don't recompile.
-        build_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "_fused_ext_build",
-        )
-        os.makedirs(build_dir, exist_ok=True)
-        _FUSED_EXT = load_inline(
-            name="hippo_v4_fused_add",
-            cpp_sources=[_FUSED_CPP_SRC],
-            extra_cflags=["-O3", "-mavx2", "-fopenmp"],
-            extra_ldflags=["-fopenmp"],
-            verbose=False,
-            build_directory=build_dir,
-        )
-        return _FUSED_EXT
-    except Exception as e:  # pragma: no cover — toolchain missing
-        _FUSED_EXT_FAILED = True
-        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -261,9 +185,10 @@ def _fused_worker_loop() -> None:
     CPU adds in parallel across cores.
 
     Falls back to the py-loop worker if the JIT extension failed to
-    compile (no C++ toolchain at runtime).
+    compile (no C++ toolchain at runtime, or
+    ``HIPPO_FUSED_FORCE_PYLOOP=1`` / ``HIPPO_V4_FORCE_PYLOOP=1``).
     """
-    ext = _try_load_fused_ext()
+    ext = cpu_fused._try_load_ext()
     if ext is None:
         _py_loop_worker_loop()
         return
@@ -296,12 +221,12 @@ def _fused_worker_loop() -> None:
         _QUEUE.task_done()
 
 
-# Default worker function; can be overridden via env var for A/B testing.
+# Default worker function; the fused worker falls back to the
+# py-loop worker itself when the JIT extension is unavailable
+# (no toolchain or HIPPO_FUSED_FORCE_PYLOOP / HIPPO_V4_FORCE_PYLOOP
+# is set), so this dispatcher is just a passthrough.
 def _worker_loop() -> None:
-    if os.environ.get("HIPPO_V4_FORCE_PYLOOP"):
-        _py_loop_worker_loop()
-    else:
-        _fused_worker_loop()
+    _fused_worker_loop()
 
 
 # --------------------------------------------------------------------------- #

@@ -67,6 +67,7 @@ import torch
 import torch.nn as nn
 
 from ._state import _ParamState, _accumulator_target
+from .cpu_fused import fused_zero_many
 
 
 # Module-level queue for in-flight D2H transfers issued by the
@@ -415,12 +416,20 @@ def zero_cpu_grad_accum(optimizers: List) -> None:
     zero for the case where ``found_inf`` is detected and the
     optimizers are NOT stepped — we still want to clear the
     accumulated grads before the next cycle.
+
+    All collected ``s.m`` / ``s.mom_buf`` tensors are zeroed in
+    ONE fused OpenMP call (DeepSpeed CPUAdam-style) instead of
+    N separate Python ``.zero_()`` calls — same win as
+    :mod:`.cpu_fused` brings to v4's per-layer worker and to
+    :meth:`CPUMuon.step`'s end-of-cycle housekeeping.
     """
+    bufs: list = []
     for opt in optimizers:
         for s in opt.state.values():
             if s.kind == "adamw":
-                s.m.zero_()
+                bufs.append(s.m)
             else:
                 # Muon (and nvfp4 variants): merged-accumulator
                 # design — zero ``mom_buf`` for the next cycle.
-                s.mom_buf.zero_()
+                bufs.append(s.mom_buf)
+    fused_zero_many(bufs)
