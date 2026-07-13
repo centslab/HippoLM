@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from ..precision_config import PrecisionConfig
 from ._state import _ParamState
+from .cpu_fused import fused_adam_step_bf16
 
 
 class CPUAdamW:
@@ -191,6 +192,10 @@ class CPUAdamW:
         eps = self.eps
         wd = self.weight_decay
         CHUNK = self._STREAM_CHUNK_NUMEL
+        # Pre-fetched for the fused-kernel path; both are
+        # module-level constants so attribute lookups don't
+        # bloat the inner loop.
+        _fused_step = fused_adam_step_bf16
         for s in self.state.values():
             g = s.m
             if g.abs().sum().item() == 0:
@@ -200,7 +205,6 @@ class CPUAdamW:
                 continue
             s.step += 1
             step = s.step
-            bc2 = 1.0 - beta2 ** step
             v = s.exp_avg_sq
             # ``g`` (= s.m) is the sum of microbatch grads.
             # No β1 EMA: in the merged-accumulator design, m IS
@@ -211,13 +215,38 @@ class CPUAdamW:
             # accumulator resets to zero at the end of every
             # step, so β1 smoothing has nothing to smooth.
             #
-            # ``addcmul_`` on BF16: BF16 has FP32 exponent range
-            # so ``g*g`` (for g ~ 1e-3) is ~1e-6, well above the
-            # BF16 smallest normal. The mantissa is 7 bits which
-            # is the precision bottleneck — but we recover
-            # precision in the per-element factor by promoting
-            # to FP32 below before the sqrt.
-            v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+            # v update + factor compute are now fused in C++
+            # (see :func:`fused_adam_step_bf16`): for each
+            # chunk the kernel does ``v ← β2·v + (1-β2)·m²``
+            # (BF16 in-place) AND writes the FP32 factor
+            # ``m / (sqrt(v/bc2) + eps)`` in one OMP+AVX pass.
+            # This eliminates the per-chunk Python chain of
+            # ``v.float() / sqrt() / add()`` calls (~1-2 ms per
+            # chunk at 4M elts on a Zen1 dev box) and replaces
+            # it with a single JIT C++ call per chunk.
+            #
+            # ``addcmul_`` semantics: BF16 has FP32 exponent
+            # range so ``g*g`` (for g ~ 1e-3) is ~1e-6, well
+            # above the BF16 smallest normal. The mantissa is
+            # 7 bits which is the precision bottleneck — but we
+            # recover precision in the per-element factor by
+            # promoting to FP32 inside the kernel before the
+            # sqrt.
+            #
+            # Numerics: do the divisor math in FP32 even though
+            # ``g`` and ``v`` are both BF16. Promoting
+            # v_chunk to FP32 inside the kernel before the
+            # sqrt recovers the 7-bit BF16 mantissa precision
+            # for the divisor, which is what ``1/sqrt(v/bc2)``
+            # is most sensitive to (a small relative error in
+            # v becomes a large relative error in 1/sqrt(v)).
+            # The factor is then cast to FP16 for the GPU
+            # apply — that final cast is the precision
+            # bottleneck, not the v promotion.
+            #
+            # No β1 division on the numerator (g is unbiased —
+            # it's the raw sum, not an EMA), but v still has
+            # its bias-correction bc2.
             # Decoupled weight decay: applied in place on the GPU
             # once, before the streaming factor / apply loop.
             # Folding it into the per-element factor would also
@@ -227,27 +256,32 @@ class CPUAdamW:
             # ``module.decay_and_apply_chunk`` call below.
             if wd != 0.0 and s.param is not None:
                 s.param.data.mul_(1.0 - lr * wd)
-            # Streaming update: chunk the param so the peak GPU
-            # memory for the FP32 divisor / FP16 factor transfer
-            # is bounded to ``CHUNK`` elements regardless of
-            # ``numel``. The chunked path is bit-identical to
-            # the un-chunked path because the operations are
-            # element-wise.
-            #
-            # Numerics: do the divisor math in FP32 even though
-            # ``g`` and ``v`` are both BF16. Promoting
-            # v_chunk to FP32 before the sqrt recovers the
-            # 7-bit BF16 mantissa precision for the divisor,
-            # which is what ``1/sqrt(v/bc2)`` is most sensitive
-            # to (a small relative error in v becomes a large
-            # relative error in 1/sqrt(v)). The factor is then
-            # cast back to FP16 for the GPU apply — that
-            # final cast is the precision bottleneck, not the
-            # v promotion.
-            #
-            # No β1 division on the numerator (g is unbiased —
-            # it's the raw sum, not an EMA), but v still has
-            # its bias-correction bc2.
+            # Lazy-allocate the per-state factor_chunk buffer
+            # (pinned FP32, reused across chunks + steps). Sized
+            # to ``max(CHUNK, max_nvfp4_chunk)`` — NVFP4 states
+            # can have chunks larger than ``CHUNK`` if the FFN
+            # row chunk is big. Only the first ``chunk_size``
+            # slots are read/written per iter.
+            factor_chunk = s.factor_chunk
+            if factor_chunk is None:
+                if s.nvfp4_module is not None:
+                    module = s.nvfp4_module
+                    cols = (
+                        module.in_features_per_partition
+                        if hasattr(module, "in_features_per_partition")
+                        else module.in_features
+                    )
+                    max_nvfp4_chunk = max(
+                        (r_end - r_start) * cols
+                        for r_start, r_end in s.nvfp4_chunk_ranges
+                    ) if s.nvfp4_chunk_ranges else 0
+                    factor_size = max(CHUNK, max_nvfp4_chunk)
+                else:
+                    factor_size = CHUNK
+                factor_chunk = torch.empty(
+                    factor_size, dtype=torch.float32, pin_memory=True,
+                )
+                s.factor_chunk = factor_chunk
             # ---- Mode (3) NVFP4: chunk along the row axis of
             # the module (same granularity budget as the FFN
             # module list — ~8 MiB BF16 peak). The apply routes
@@ -282,17 +316,25 @@ class CPUAdamW:
                 for ci, (r_start, r_end) in enumerate(s.nvfp4_chunk_ranges):
                     flat_start = r_start * cols
                     flat_end = r_end * cols
-                    v_chunk_fp32 = v[flat_start:flat_end].float()
-                    denom = (v_chunk_fp32 / bc2).sqrt_().add_(eps)
-                    factor = g[flat_start:flat_end].float() / denom
+                    chunk_size = flat_end - flat_start
+                    _fused_step(
+                        [g[flat_start:flat_end]],
+                        [v[flat_start:flat_end]],
+                        [factor_chunk[:chunk_size]],
+                        [step],
+                        beta2, eps,
+                    )
                     # ``factor`` is 1-D (flat slice of pinned
-                    # gradient accumulator on CPU); reshape to 2-D
+                    # FP32 factor_chunk on CPU); reshape to 2-D
                     # and move to the module's device so it matches
                     # ``material_chunk``'s (chunk_rows, K) output
                     # (apply_chunk_update does
                     # ``bf16 -= lr * factor`` element-wise).
-                    factor = factor.view(r_end - r_start, cols)
-                    factor = factor.to(module.packed_weight.device, non_blocking=True)
+                    factor = factor_chunk[:chunk_size].view(
+                        r_end - r_start, cols
+                    ).to(
+                        module.packed_weight.device, non_blocking=True,
+                    )
                     module.apply_chunk_update(
                         r_start, r_end, factor, lr,
                         rebuild_scales_cache=(ci == n_chunks - 1),
@@ -303,13 +345,18 @@ class CPUAdamW:
             n = p_flat.numel()
             for start in range(0, n, CHUNK):
                 end = min(start + CHUNK, n)
-                v_chunk_fp32 = v[start:end].float()
-                denom = (v_chunk_fp32 / bc2).sqrt_().add_(eps)  # FP32, chunk
-                factor = g[start:end].float() / denom           # FP32, chunk
+                chunk_size = end - start
+                _fused_step(
+                    [g[start:end]],
+                    [v[start:end]],
+                    [factor_chunk[:chunk_size]],
+                    [step],
+                    beta2, eps,
+                )
                 # Stream the FP32 factor to the GPU as the param
                 # dtype (FP16) and apply in place.
                 p_flat[start:end].add_(
-                    factor.to(
+                    factor_chunk[:chunk_size].to(
                         device=s.param.device, dtype=s.param.dtype,
                         non_blocking=True,
                     ),
@@ -318,7 +365,9 @@ class CPUAdamW:
             # Reset m to zero for the next accumulation cycle.
             # ``m`` doubles as the accumulator; this is the only
             # point in the cycle where the accumulation result
-            # is consumed.
+            # is consumed. End-of-cycle zero is batched across
+            # all states by :func:`zero_cpu_grad_accum` (see
+            # ``cpu_fused.fused_zero_many``).
             s.m.zero_()
 
     # ------------------------------------------------------------------ #

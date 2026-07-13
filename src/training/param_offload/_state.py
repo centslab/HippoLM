@@ -107,6 +107,13 @@ class _ParamState:
     step: int = 0
     # "adamw" or "muon" or "muon_nvfp4" or "adamw_nvfp4".
     kind: str = "adamw"
+    # Reusable FP32 pinned scratch buffer for the fused AdamW
+    # step kernel's factor output (one buffer per state,
+    # lazily allocated in :meth:`CPUAdamW.step`; size =
+    # ``_STREAM_CHUNK_NUMEL`` for param-backed states, sized to
+    # the largest NVFP4 chunk otherwise). Keeps the streaming
+    # factor + GPU apply loop from re-allocating per chunk.
+    factor_chunk: torch.Tensor | None = None
 
 
 # --------------------------------------------------------------------------- #
