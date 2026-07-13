@@ -84,3 +84,9 @@ htmlcov/
 # src/models/ops/cuda/lib/. The vendored sources themselves (cuda, core,
 # libtorch_stable, marlin/) ARE tracked; only the build cache is local.
 src/models/ops/cuda/marlin_build/sources/.build/
+
+# JIT-built fused-OpenMP extension for v4's worker
+# (src/training/param_offload/per_layer_gpu_accum.py). Built once on
+# first import via torch.utils.cpp_extension.load_inline; falls back
+# to the pure-Python worker if compile fails.
+src/training/param_offload/_fused_ext_build/

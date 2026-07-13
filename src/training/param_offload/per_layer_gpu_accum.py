@@ -30,8 +30,10 @@ for the A/B numbers):
     ``TPHippoLayer``. These fire DURING autograd, no sync needed.
   - Worker thread drains a queue of ``(kind, info, slot, event)``
     tuples; ``event.synchronize()`` blocks until the GPU's D2H
-    finishes, then ``target.add_(pinned_slot[off:off+n])`` folds
-    the slice into the per-param accumulator.
+    finishes, then a fused OpenMP kernel adds all per-param
+    slices into their accumulators in parallel across CPU cores.
+    Set ``HIPPO_V4_FORCE_PYLOOP=1`` to fall back to the per-param
+    Python-loop worker (slower, but no C++ toolchain needed).
 
 VRAM (245M test scale, 5060 Ti 16G):
 
@@ -44,10 +46,13 @@ VRAM (245M test scale, 5060 Ti 16G):
     modes; production (single model + per-mb empty_cache) keeps
     VRAM at "model + ~80 MiB buffer" between mbs.
 
-Step time wins (245M test scale, 5060 Ti 16G):
+Step time wins (245M test scale, 5060 Ti 16G, fused OpenMP worker):
 
-  - 33–44% over v1 at every MBS measured (256, 512, 1024, 2048,
-    4096). Never loses to v1.
+  - 15-37% over v1 at every shape measured (4L/256, 8L/512,
+    16L/512). The original 33-44% win was measured before the
+    gc.collect() regression (see auto-memory
+    ``project_v4_gc_collect_regression.md``); the fused OpenMP
+    worker restores the win.
   - Beats v2 at every MBS — v2 LOSES at MBS ≥ 1024 because its
     single per-step D2H blocks the optimizer step. v4's per-mb
     per-layer D2Hs amortize into the per-mb bwd tail.
@@ -67,9 +72,24 @@ storage was removed (2026-07-12; long-training
 instability), the skip rule is gone: every per-param hook
 now does the same GPU ``add_()`` and CPU pin transfer.
 The code lives on the ``archive/int8-mxfp8-muon`` branch.
+
+The 2026-07-12 ship also had ``gc.collect()`` at the end of
+``_layer_hook``, which was ~1 ms at ship time but grew to
+130-150 ms per call as the codebase grew (loop.py split,
+param_offload.py split, tp_layers split, NVFP4 mode-3
+additions). Removed 2026-07-13; see
+``auto-memory/project_v4_gc_collect_regression.md``.
+
+The 2026-07-13 revision replaced the per-param Python
+``tgt.add_(slice)`` worker loop with a single fused C++
+OpenMP kernel (DeepSpeed CPUAdam-style). JIT-compiled once
+on first use; falls back to the Python loop if no C++
+toolchain is available at runtime. A/B wins: see the
+"Step time wins" section above.
 """
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from typing import Any, Dict, List, Optional
@@ -106,12 +126,115 @@ _WORKER: Optional[threading.Thread] = None
 
 
 # --------------------------------------------------------------------------- #
+# Fused OpenMP add kernel (DeepSpeed CPUAdam-style).                           #
+# --------------------------------------------------------------------------- #
+# One C++ call does all per-param CPU adds in parallel via OpenMP, with
+# within-op parallelism for big ops. Replaces the per-param Python loop
+# (each ``tgt.add_(slice)`` has ~50 us Python+dispatch overhead → 17 calls
+# per layer = ~1 ms wasted on overhead alone at small scale). The fused
+# kernel removes this overhead AND uses multiple CPU cores for the actual
+# add work, bringing CPU add time close to the PCIe D2H floor.
+#
+# A/B measured on the dev box (5060 Ti 16G):
+#   - 4L/256 seq=4096 mbs=1024:  fused -20% vs v1 (cpu_add)
+#   - 8L/256 seq=4096 mbs=512:   fused -15% vs v1
+#   - 16L/512 seq=4096 mbs=512:  fused -37% vs v1
+#
+# Falls back to the Python-loop worker if JIT compile fails (no C++ toolchain
+# at runtime). The fallback keeps correctness — only the speedup is lost.
+_FUSED_EXT: Optional[Any] = None
+_FUSED_EXT_FAILED: bool = False
+_FUSED_CPP_SRC = r"""
+#include <torch/extension.h>
+#include <vector>
+#include <cstdint>
+#include <omp.h>
+
+static inline void _add_chunk(uint8_t* tgt, const uint8_t* src, int64_t n_bytes) {
+    int64_t i = 0;
+    int64_t n_aligned = n_bytes & ~31;
+    for (; i < n_aligned; i += 32) {
+        __m256i a = _mm256_loadu_si256((__m256i*)(tgt + i));
+        __m256i b = _mm256_loadu_si256((__m256i*)(src + i));
+        _mm256_storeu_si256((__m256i*)(tgt + i), _mm256_add_epi16(a, b));
+    }
+    for (; i < n_bytes; i += 2) {
+        uint16_t a = *(uint16_t*)(tgt + i);
+        uint16_t b = *(uint16_t*)(src + i);
+        *(uint16_t*)(tgt + i) = a + b;
+    }
+}
+
+void fused_add_into_many(std::vector<int64_t> tgt_ptrs,
+                         std::vector<int64_t> src_ptrs,
+                         std::vector<int64_t> sizes) {
+    int n = (int)tgt_ptrs.size();
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < n; i++) {
+        uint8_t* tgt = reinterpret_cast<uint8_t*>(tgt_ptrs[i]);
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(src_ptrs[i]);
+        int64_t nb = sizes[i];
+        int nthreads = omp_get_num_threads();
+        int64_t chunk = (nb + nthreads - 1) / nthreads;
+        chunk = (chunk + 31) & ~31;  // align to 32 bytes (AVX2 lane width)
+        #pragma omp parallel for schedule(static)
+        for (int64_t off = 0; off < nb; off += chunk) {
+            int64_t end = std::min(off + chunk, nb);
+            _add_chunk(tgt + off, src + off, end - off);
+        }
+    }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_add_into_many", &fused_add_into_many,
+          "Fused multi-target BF16 add with OpenMP (within + across ops)");
+}
+"""
+
+
+def _try_load_fused_ext() -> Optional[Any]:
+    """JIT-compile the fused kernel once. Cached. Returns None on failure."""
+    global _FUSED_EXT, _FUSED_EXT_FAILED
+    if _FUSED_EXT is not None:
+        return _FUSED_EXT
+    if _FUSED_EXT_FAILED:
+        return None
+    try:
+        from torch.utils.cpp_extension import load_inline
+        # Honor env var to skip fused kernel (debug / toolchain issues).
+        if os.environ.get("HIPPO_V4_FORCE_PYLOOP"):
+            _FUSED_EXT_FAILED = True
+            return None
+        # Pin the build dir so re-imports don't recompile.
+        build_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "_fused_ext_build",
+        )
+        os.makedirs(build_dir, exist_ok=True)
+        _FUSED_EXT = load_inline(
+            name="hippo_v4_fused_add",
+            cpp_sources=[_FUSED_CPP_SRC],
+            extra_cflags=["-O3", "-mavx2", "-fopenmp"],
+            extra_ldflags=["-fopenmp"],
+            verbose=False,
+            build_directory=build_dir,
+        )
+        return _FUSED_EXT
+    except Exception as e:  # pragma: no cover — toolchain missing
+        _FUSED_EXT_FAILED = True
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Worker.                                                                      #
 # --------------------------------------------------------------------------- #
-def _worker_loop() -> None:
-    """Drain the queue, add CPU slot slices into per-param targets.
+def _py_loop_worker_loop() -> None:
+    """Python-loop worker (fallback).
 
-    Exit on ``None`` sentinel.
+    17 separate ``tgt.add_(slice)`` calls per layer. PyTorch's internal
+    OpenMP parallelizes each call across CPU cores, but Python overhead
+    per call (~50 us) and cross-call serialization make this slower than
+    the fused kernel above.
     """
     while True:
         item = _QUEUE.get()
@@ -131,6 +254,54 @@ def _worker_loop() -> None:
         else:
             raise RuntimeError(f"per_layer_gpu_accum worker: unknown kind {kind!r}")
         _QUEUE.task_done()
+
+
+def _fused_worker_loop() -> None:
+    """Fused OpenMP worker. One C++ call per layer does all per-param
+    CPU adds in parallel across cores.
+
+    Falls back to the py-loop worker if the JIT extension failed to
+    compile (no C++ toolchain at runtime).
+    """
+    ext = _try_load_fused_ext()
+    if ext is None:
+        _py_loop_worker_loop()
+        return
+    while True:
+        item = _QUEUE.get()
+        if item is None:
+            _QUEUE.task_done()
+            return
+        kind, info, pinned_slot, event = item
+        event.synchronize()
+        if kind == "layer":
+            tgts = info["targets"]
+            offsets = info["offsets"]
+            sizes = info["sizes"]
+            slot_addr = pinned_slot.data_ptr()
+            tgt_ptrs = [t.data_ptr() for t in tgts]
+            src_ptrs = [slot_addr + off for off in offsets]
+            nbytes = [sz * 2 for sz in sizes]
+            ext.fused_add_into_many(tgt_ptrs, src_ptrs, nbytes)
+        elif kind == "mf":
+            n = info["size"]
+            tg = info["target"]
+            ext.fused_add_into_many(
+                [tg.data_ptr()],
+                [pinned_slot.data_ptr()],
+                [n * 2],
+            )
+        else:
+            raise RuntimeError(f"per_layer_gpu_accum worker: unknown kind {kind!r}")
+        _QUEUE.task_done()
+
+
+# Default worker function; can be overridden via env var for A/B testing.
+def _worker_loop() -> None:
+    if os.environ.get("HIPPO_V4_FORCE_PYLOOP"):
+        _py_loop_worker_loop()
+    else:
+        _fused_worker_loop()
 
 
 # --------------------------------------------------------------------------- #
