@@ -70,7 +70,6 @@ The code lives on the ``archive/int8-mxfp8-muon`` branch.
 """
 from __future__ import annotations
 
-import gc
 import queue
 import threading
 from typing import Any, Dict, List, Optional
@@ -197,8 +196,9 @@ def _layer_hook(module, grad_input, grad_output) -> None:
         p.grad = None
         # Drop the local reference. PyTorch tensors are refcounted,
         # so the grad tensor is now ready for the allocator to
-        # reuse. ``gc.collect()`` forces release of any circular
-        # refs that might keep the wrapper alive.
+        # reuse. (No ``gc.collect()`` needed — grad tensors don't
+        # form cycles, and the Caching Allocator reuses freed
+        # blocks without it.)
         del g
 
     cpu_slot = info["cpu_slot"]
@@ -208,12 +208,17 @@ def _layer_hook(module, grad_input, grad_output) -> None:
     _QUEUE.put(("layer", info, cpu_slot, event))
 
     buf[:layer_size].zero_()
-    # Aggressive cleanup: force the allocator to release cached
-    # .grad blocks back to the pool. PyTorch's caching allocator
-    # holds blocks even after the Python ref is gone; without this
-    # collect, N layers' worth of grad blocks accumulate in the
-    # pool before the next mb reuses them.
-    gc.collect()
+    # NOTE: ``gc.collect()`` was here until 2026-07-13 — it was
+    # supposed to force the Caching Allocator to release cached
+    # ``.grad`` blocks, but the allocator already reuses freed
+    # blocks without it. Grad tensors don't form cycles (they're
+    # leaf tensors or freshly-materialized intermediate grads),
+    # so gc.collect had nothing to release. In the original
+    # codebase (2026-07-12 v4 ship) it cost ~1 ms; after several
+    # refactors (loop.py / param_offload.py / tp_layers splits,
+    # NVFP4 mode-3 additions) it grew to 130-150 ms per call,
+    # making v4 5-8x slower than v1 at the 4L/256 test shape.
+    # Removed — see ``auto-memory/project_v4_gc_collect_regression.md``.
 
 
 # --------------------------------------------------------------------------- #
