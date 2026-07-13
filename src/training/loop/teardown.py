@@ -34,19 +34,6 @@ def _teardown_worker(ctx: Dict[str, Any]) -> None:
             prefetcher.close()
         except Exception as e:
             log.warning("prefetcher close failed: %r", e)
-    # Shut down the per-layer GPU accumulator worker thread if it
-    # was installed (offload_strategy="per_layer_gpu"). Idempotent
-    # under cpu_add (the module's shutdown is a no-op when the
-    # worker was never started). Must run BEFORE destroying the
-    # distributed process group so the worker can finish any
-    # in-flight CPU adds cleanly.
-    args = ctx.get("args")
-    if args is not None and getattr(args, "offload_strategy", "cpu_add") == "per_layer_gpu":
-        try:
-            from src.training.param_offload import shutdown_per_layer_gpu_accum
-            shutdown_per_layer_gpu_accum()
-        except Exception as e:
-            log.warning("shutdown_per_layer_gpu_accum failed: %r", e)
     if dist.is_available() and dist.is_initialized():
         try:
             dist.destroy_process_group()

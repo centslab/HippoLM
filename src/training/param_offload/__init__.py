@@ -96,11 +96,6 @@ boundaries are preserved):
     reset, the module-level :data:`_pending_grads` /
     :data:`_manual_flush_param_ids` queues).
   * :mod:`.param_groups` — :func:`build_param_groups`.
-  * :mod:`.per_layer_gpu_accum` — OPT-IN alternative to the
-    streaming path. Per-layer GPU accumulator + worker-thread
-    CPU ``add_`` pipeline. Wins 33-44% step time vs the
-    default CPU-add path at every MBS measured; see the
-    module docstring for the A/B numbers and the v4 design.
 
 Public API is preserved by re-exporting every name below; all
 callers (the training loop, every optimizer test, the
@@ -128,12 +123,6 @@ from .offload import (
     zero_cpu_grad_accum,
 )
 from .param_groups import build_param_groups
-from .per_layer_gpu_accum import (
-    flush_per_layer_gpu_accum,
-    setup_per_layer_gpu_accum,
-    shutdown_per_layer_gpu_accum,
-    transfer_per_layer_gpu_accum_join,
-)
 
 
 __all__ = [
@@ -149,12 +138,6 @@ __all__ = [
     "flush_pending_grads",
     "register_grad_offload_hooks",
     "zero_cpu_grad_accum",
-    # Per-layer GPU accumulator (opt-in v4 path; see
-    # per_layer_gpu_accum.py for the A/B numbers).
-    "setup_per_layer_gpu_accum",
-    "flush_per_layer_gpu_accum",
-    "transfer_per_layer_gpu_accum_join",
-    "shutdown_per_layer_gpu_accum",
     # Module-level queues (mutated by register_grad_offload_hooks
     # and flush_*_grads; exposed so tests can assert on them).
     "_manual_flush_param_ids",

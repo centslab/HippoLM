@@ -8,19 +8,15 @@ The contract is:
 
   1. ``prefetcher.close()`` is called if the ctx carries a
      prefetcher (and a close failure is logged, not raised).
-  2. When ``args.offload_strategy == "per_layer_gpu"`` the
-     per-layer GPU accumulator worker thread is shut down (must
-     happen BEFORE ``dist.destroy_process_group`` so the worker
-     can finish any in-flight CPU adds cleanly).
-  3. ``dist.destroy_process_group()`` is called when the
+  2. ``dist.destroy_process_group()`` is called when the
      process group was initialized (failure logged, not raised).
-  4. Safe to call with a partially-populated ctx (e.g. only
+  3. Safe to call with a partially-populated ctx (e.g. only
      ``prefetcher`` set, only ``args`` set, empty ctx) — no
      AttributeError on missing keys.
 
 These tests pin that contract by mocking ``dist`` and the
-prefetcher / per_layer_gpu shutdown helpers and observing what
-gets called in each branch.
+prefetcher shutdown helper and observing what gets called in
+each branch.
 """
 from __future__ import annotations
 
@@ -85,9 +81,8 @@ def _patched_dist(
 def test_empty_ctx_is_safe_no_destroy_no_shutdown():
     """An empty ctx (caller bailed before any setup) must not raise.
 
-    ``prefetcher`` is None → skip close. ``args`` is None → skip
-    per_layer_gpu shutdown. ``dist`` is not initialized (in this
-    test) → skip destroy.
+    ``prefetcher`` is None → skip close. ``dist`` is not
+    initialized (in this test) → skip destroy.
     """
     cm, fake_dist = _patched_dist(initialized=False)
     with cm:
@@ -95,19 +90,13 @@ def test_empty_ctx_is_safe_no_destroy_no_shutdown():
     fake_dist.destroy_process_group.assert_not_called()
 
 
-def test_ctx_with_only_args_but_default_offload_skips_per_layer_gpu_shutdown():
-    """``offload_strategy`` defaults to ``"cpu_add"`` (not the
-    per_layer_gpu path) → the shutdown helper must NOT be
-    called."""
-    fake_shutdown = MagicMock()
-    args = SimpleNamespace(offload_strategy="cpu_add")
+def test_ctx_with_only_args_skips_noop_cleanup():
+    """``args`` set but no prefetcher and dist not initialized →
+    teardown is a no-op."""
+    args = SimpleNamespace()
     cm, fake_dist = _patched_dist(initialized=False)
-    with patch(
-        "src.training.param_offload.shutdown_per_layer_gpu_accum",
-        fake_shutdown,
-    ), cm:
+    with cm:
         _teardown_worker(_make_ctx(args=args))
-    fake_shutdown.assert_not_called()
     fake_dist.destroy_process_group.assert_not_called()
 
 
@@ -118,7 +107,7 @@ def test_prefetcher_close_is_called():
     """When ctx carries a prefetcher, ``close()`` is called exactly
     once."""
     prefetcher = MagicMock()
-    args = SimpleNamespace(offload_strategy="cpu_add")
+    args = SimpleNamespace()
     cm, _fake_dist = _patched_dist(initialized=False)
     with cm:
         _teardown_worker(_make_ctx(prefetcher=prefetcher, args=args))
@@ -131,7 +120,7 @@ def test_prefetcher_close_failure_is_logged_not_raised(caplog):
     process group is still torn down."""
     prefetcher = MagicMock()
     prefetcher.close.side_effect = RuntimeError("prefetcher dead")
-    args = SimpleNamespace(offload_strategy="cpu_add")
+    args = SimpleNamespace()
     cm, fake_dist = _patched_dist(initialized=True)
     with caplog.at_level(logging.WARNING, logger="src.training.loop.teardown"):
         with cm:
@@ -140,60 +129,6 @@ def test_prefetcher_close_failure_is_logged_not_raised(caplog):
     assert any(
         "prefetcher close failed" in rec.message for rec in caplog.records
     ), f"expected warning about prefetcher close; got: {[r.message for r in caplog.records]}"
-
-
-# --------------------------------------------------------------------------- #
-# per_layer_gpu shutdown branch.                                              #
-# --------------------------------------------------------------------------- #
-def test_per_layer_gpu_shutdown_is_called_when_strategy_matches():
-    """When ``offload_strategy == "per_layer_gpu"``, the per-layer
-    GPU accumulator worker thread is shut down BEFORE the
-    process group is destroyed."""
-    fake_shutdown = MagicMock()
-    args = SimpleNamespace(offload_strategy="per_layer_gpu")
-    call_order: list[str] = []
-
-    def record_shutdown():
-        call_order.append("shutdown")
-
-    fake_shutdown.side_effect = record_shutdown
-
-    cm, fake_dist = _patched_dist(initialized=True)
-    fake_dist.destroy_process_group.side_effect = lambda: call_order.append("destroy")
-
-    with patch(
-        "src.training.param_offload.shutdown_per_layer_gpu_accum",
-        fake_shutdown,
-    ), cm:
-        _teardown_worker(_make_ctx(args=args))
-    fake_shutdown.assert_called_once()
-    fake_dist.destroy_process_group.assert_called_once()
-    # Order: shutdown must precede destroy (the per-layer worker
-    # holds in-flight CPU adds that depend on the process group
-    # being alive).
-    assert call_order == ["shutdown", "destroy"], (
-        f"per_layer_gpu shutdown must run before dist.destroy_process_group; "
-        f"got call order: {call_order}"
-    )
-
-
-def test_per_layer_gpu_shutdown_failure_is_logged_not_raised(caplog):
-    """A failure in the per-layer shutdown is logged, not raised —
-    teardown continues to dist.destroy_process_group."""
-    fake_shutdown = MagicMock(side_effect=RuntimeError("worker wedged"))
-    args = SimpleNamespace(offload_strategy="per_layer_gpu")
-    cm, fake_dist = _patched_dist(initialized=True)
-    with caplog.at_level(logging.WARNING, logger="src.training.loop.teardown"):
-        with patch(
-            "src.training.param_offload.shutdown_per_layer_gpu_accum",
-            fake_shutdown,
-        ), cm:
-            _teardown_worker(_make_ctx(args=args))
-    fake_dist.destroy_process_group.assert_called_once()
-    assert any(
-        "shutdown_per_layer_gpu_accum failed" in rec.message
-        for rec in caplog.records
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -223,7 +158,7 @@ def test_dist_destroy_failure_is_logged_not_raised(caplog):
     raised — otherwise the finally clause would mask the
     original loop-body exception with a teardown exception."""
     prefetcher = MagicMock()
-    args = SimpleNamespace(offload_strategy="cpu_add")
+    args = SimpleNamespace()
     cm, _fake_dist = _patched_dist(initialized=True, destroy_raises=True)
     with caplog.at_level(logging.WARNING, logger="src.training.loop.teardown"):
         with cm:
@@ -247,7 +182,7 @@ def test_teardown_is_idempotent_when_called_twice():
     ``dist.destroy_process_group()`` are both called twice and
     both must not raise."""
     prefetcher = MagicMock()
-    args = SimpleNamespace(offload_strategy="cpu_add")
+    args = SimpleNamespace()
     cm, _fake_dist = _patched_dist(initialized=True)
     with cm:
         _teardown_worker(_make_ctx(prefetcher=prefetcher, args=args))
@@ -262,7 +197,7 @@ def test_teardown_swallows_prefetcher_close_but_still_destroys_dist(caplog):
     runs (otherwise the process group leaks)."""
     prefetcher = MagicMock()
     prefetcher.close.side_effect = RuntimeError("close kaboom")
-    args = SimpleNamespace(offload_strategy="cpu_add")
+    args = SimpleNamespace()
     cm, fake_dist = _patched_dist(initialized=True)
     with caplog.at_level(logging.WARNING, logger="src.training.loop.teardown"):
         with cm:

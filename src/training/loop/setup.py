@@ -51,7 +51,6 @@ from src.training.data.cache import purge_stale_cache_if_no_hit
 from src.training.param_offload import (
     build_param_groups,
     register_grad_offload_hooks,
-    setup_per_layer_gpu_accum,
 )
 from src.training.precision_config import PrecisionConfig
 from src.training.tokenizer import load_tokenizer
@@ -409,33 +408,13 @@ def _setup_worker(
     embed_param = device_mods["embed_tokens"] if "embed_tokens" in device_mods else None
     if embed_param is not None and hasattr(embed_param, "weight"):
         manual_flush.append(embed_param.weight)
-    # Offload-strategy dispatch. ``cpu_add`` (default, prod-proven)
-    # installs the per-param streaming hooks; the per-mb
+    # Install the per-param streaming hooks. The per-mb
     # ``accumulate_grads_to_cpu`` + ``flush_manual_flush_params`` path
     # in :func:`_run_training_loop` syncs + CPU-adds the queued D2Hs.
-    # ``per_layer_gpu`` (opt-in v4) replaces this with a shared
-    # GPU accumulator per ``TPHippoLayer`` + per-layer async D2H to
-    # a CPU pinned slot + worker-thread CPU add — amortizes the
-    # D2H into the per-mb bwd tail (33-44% step-time win at the test
-    # scale; see :mod:`.per_layer_gpu_accum` for the A/B numbers and
-    # VRAM analysis). v4 installs its OWN per-param
-    # ``register_post_accumulate_grad_hook`` for manual-flush-style
-    # params (anything not under any ``TPHippoLayer`` — tied embed,
-    # top-level norm, attn_res, lm_head), so we don't need the
-    # ``manual_flush_params=`` list under v4.
-    offload_strategy = getattr(args, "offload_strategy", "cpu_add")
-    if offload_strategy == "per_layer_gpu":
-        if rank == 0:
-            logger.info(
-                f"Offload strategy: per_layer_gpu (v4 — see "
-                f"src.training.param_offload.per_layer_gpu_accum)"
-            )
-        setup_per_layer_gpu_accum(model, [muon_opt, adamw_opt])
-    else:
-        register_grad_offload_hooks(
-            [muon_opt, adamw_opt],
-            manual_flush_params=manual_flush or None,
-        )
+    register_grad_offload_hooks(
+        [muon_opt, adamw_opt],
+        manual_flush_params=manual_flush or None,
+    )
     # NVFP4 mode-3 entries have ``s.param is None`` (the
     # weight lives on the module as FP4 packed buffers, not as a
     # leaf Parameter). Fall back to ``s.nvfp4_n`` (cached at

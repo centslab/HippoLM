@@ -2,19 +2,22 @@
 
 Owns the OpenMP kernel that's used by both:
 
-  * v4's per-layer worker (:mod:`.per_layer_gpu_accum`) for
-    fused BF16 ``tgt += slice`` across all per-param accumulators
-    in one C++ call.
-  * The end-of-cycle zero path in :meth:`CPUMuon.step` and
-    :func:`zero_cpu_grad_accum` for fused ``memset`` across all
-    per-param ``mom_buf`` / ``s.m`` tensors.
+  * :func:`zero_cpu_grad_accum` and :meth:`CPUMuon.step` for
+    fused ``memset`` across all per-param ``mom_buf`` / ``s.m``
+    tensors — collapses the per-tensor ``.zero_()`` Python loop
+    into one C++ call.
+  * The per-mb add path (see :func:`flush_pending_grads`) for
+    fused BF16 ``tgt += src`` across all per-param accumulators
+    in one C++ call — used to amortize the cross-op Python+dispatch
+    overhead of the streaming post-accumulate-grad hook into a
+    single C++ entry per microbatch.
 
 Why one C++ call beats a Python loop:
   PyTorch's per-op internal OMP parallelizes within a single op
   but not across ops. A loop of N ``tgt.add_(slice)`` or N
   ``t.zero_()`` calls thus serializes across ops while
   parallelizing within each op. For our shape (17 params ×
-  80 KiB BF16 at 4L/256 test scale) the cross-op Python+dispatch
+  ~80 KiB BF16 at 4L/256 test scale) the cross-op Python+dispatch
   overhead alone is ~1 ms / layer — the bottleneck for small
   shapes. The fused kernel does all N ops in ONE C++ call with
   OMP parallel across ops, eliminating the Python overhead and
@@ -32,18 +35,8 @@ per-op Python loops (the original behavior) if no C++ toolchain
 is available at runtime — correctness is preserved either way,
 only the speedup is lost.
 
-Set ``HIPPO_FUSED_FORCE_PYLOOP=1`` (or the legacy
-``HIPPO_V4_FORCE_PYLOOP=1``) to force the slow Python-loop
+Set ``HIPPO_FUSED_FORCE_PYLOOP=1`` to force the slow Python-loop
 fallback for debugging / A/B benchmarking.
-
-A/B numbers (5060 Ti 16G dev box) for the fused add path
-(v4 worker — see :mod:`.per_layer_gpu_accum`):
-
-| Shape | v1 (cpu_add) | v4 (py_loop) | v4 (fused OMP) | fused vs v1 |
-|---|---|---|---|---|
-| 4L/256 seq=4096 mbs=1024 | 602 ms | 984 ms | 513 ms | **-15%** |
-| 8L/256 seq=4096 mbs=512 | 1725 ms | 2728 ms | 1466 ms | **-15%** |
-| 16L/512 seq=4096 mbs=512 | 4189 ms | 6321 ms | 2627 ms | **-37%** |
 
 The zero path follows the same model — same Python-loop
 overhead to remove, same multi-core parallelism to unlock.
