@@ -268,7 +268,18 @@ class CPUAdamW:
                     if hasattr(module, "in_features_per_partition")
                     else module.in_features
                 )
-                for r_start, r_end in s.nvfp4_chunk_ranges:
+                # Defer the per-chunk Marlin scales-cache rebuild
+                # to the last chunk only: the cache is consumed by
+                # the *next* step's fwd, and the training loop's
+                # end-of-step ``repack_nvfp4_weights`` already
+                # rebuilds it once per module per step. Per-chunk
+                # rebuilds (the pre-change default) are dead
+                # compute — (N_chunks-1) wasted rebuilds per
+                # module per step. Each rebuild is ~800 µs at
+                # base.yml FFN shapes (microbench
+                # ``bench_nvfp4_apply_chunk.py``).
+                n_chunks = len(s.nvfp4_chunk_ranges)
+                for ci, (r_start, r_end) in enumerate(s.nvfp4_chunk_ranges):
                     flat_start = r_start * cols
                     flat_end = r_end * cols
                     v_chunk_fp32 = v[flat_start:flat_end].float()
@@ -282,7 +293,10 @@ class CPUAdamW:
                     # ``bf16 -= lr * factor`` element-wise).
                     factor = factor.view(r_end - r_start, cols)
                     factor = factor.to(module.packed_weight.device, non_blocking=True)
-                    module.apply_chunk_update(r_start, r_end, factor, lr)
+                    module.apply_chunk_update(
+                        r_start, r_end, factor, lr,
+                        rebuild_scales_cache=(ci == n_chunks - 1),
+                    )
                 s.m.zero_()
                 continue
             p_flat = s.param.data.view(-1)

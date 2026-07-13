@@ -524,6 +524,7 @@ class NVFP4Linear(nn.Module):
 
     def apply_chunk_update(
         self, start: int, end: int, grad_chunk: torch.Tensor, factor: float,
+        rebuild_scales_cache: bool = True,
     ) -> None:
         """Apply ``W[start:end] -= factor * grad_chunk`` at the FP4 level.
 
@@ -532,6 +533,17 @@ class NVFP4Linear(nn.Module):
           1. material the chunk BF16 view
           2. subtract ``factor * grad_chunk`` in place
           3. commit the updated chunk back to FP4
+          4. (optionally) refresh Marlin scales cache
+
+        ``rebuild_scales_cache`` (default True) controls the final
+        scales-cache rebuild. The optimizer's per-chunk loop typically
+        passes ``False`` for all but the last chunk, so the cache is
+        rebuilt exactly once per module per step (vs once per chunk
+        per step). The cached ``scales_for_kernel`` is consumed by
+        the *next* step's fwd; the per-step
+        ``repack_nvfp4_weights`` call at the end of the training
+        loop also rebuilds it, so the chunk-internal rebuilds are
+        pure dead compute that the deferred-change removes.
 
         Caller is the optimizer, which holds ``grad_chunk`` (a slice
         of the stashed ``_latest_grad_w``). No-grad.
@@ -539,20 +551,20 @@ class NVFP4Linear(nn.Module):
         bf16 = self.material_chunk(start, end)
         bf16.sub_(grad_chunk.to(bf16.dtype), alpha=factor)
         self.commit_chunk(start, end, bf16)
-        # Refresh Marlin caches after the commit — the per-block scales
-        # may have changed.
-        from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
-        _build_marlin_scales_caches(
-            self, self.scales, self.global_scale,
-            size_k=self.in_features, size_n=self.out_features,
-            block_size=self.block_size,
-        )
+        if rebuild_scales_cache:
+            from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
+            _build_marlin_scales_caches(
+                self, self.scales, self.global_scale,
+                size_k=self.in_features, size_n=self.out_features,
+                block_size=self.block_size,
+            )
 
     def decay_and_apply_chunk(
         self,
         start: int, end: int,
         update_chunk: torch.Tensor, lr: float,
         wd_factor: float = 1.0,
+        rebuild_scales_cache: bool = True,
     ) -> None:
         """Apply Muon-style ``W = W * wd_factor - lr * update`` at the
         FP4 level (no full BF16 master materialize).
@@ -562,6 +574,10 @@ class NVFP4Linear(nn.Module):
           2. ``bf16 *= wd_factor``        (decoupled WD)
           3. ``bf16 -= lr * update_chunk`` (the NS output)
           4. commit back to FP4
+          5. (optionally) refresh Marlin scales cache
+
+        See :meth:`apply_chunk_update` for the
+        ``rebuild_scales_cache`` contract.
 
         ``update_chunk`` is the per-row Newton-Schulz output for the
         chunk. We cast to BF16 here (matches ``material_chunk``'s
@@ -576,12 +592,13 @@ class NVFP4Linear(nn.Module):
             bf16.mul_(wd_factor)
         bf16.sub_(update_chunk.to(bf16.dtype), alpha=lr)
         self.commit_chunk(start, end, bf16)
-        from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
-        _build_marlin_scales_caches(
-            self, self.scales, self.global_scale,
-            size_k=self.in_features, size_n=self.out_features,
-            block_size=self.block_size,
-        )
+        if rebuild_scales_cache:
+            from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
+            _build_marlin_scales_caches(
+                self, self.scales, self.global_scale,
+                size_k=self.in_features, size_n=self.out_features,
+                block_size=self.block_size,
+            )
 
     def chunk_ranges(self) -> list[tuple[int, int]]:
         """Yield ``(start, end)`` row ranges covering the full weight.

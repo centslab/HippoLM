@@ -335,7 +335,19 @@ class CPUMuon:
                 # Casting the update to BF16 here keeps the
                 # math the same precision as legacy.
                 target_dtype = torch.bfloat16
-            for r_start in range(0, rows, CHUNK_ROWS):
+            # Defer the per-chunk Marlin scales-cache rebuild
+            # to the last chunk only: the cache is consumed by
+            # the *next* step's fwd, and the training loop's
+            # end-of-step ``repack_nvfp4_weights`` already
+            # rebuilds it once per module per step. Per-chunk
+            # rebuilds (the pre-change default) are dead
+            # compute — (N_chunks-1) wasted rebuilds per
+            # module per step. Each rebuild is ~800 µs at
+            # base.yml FFN shapes (microbench
+            # ``bench_nvfp4_apply_chunk.py``).
+            n_chunks = (rows + CHUNK_ROWS - 1) // CHUNK_ROWS
+            for chunk_i in range(n_chunks):
+                r_start = chunk_i * CHUNK_ROWS
                 r_end = min(r_start + CHUNK_ROWS, rows)
                 m_chunk = m_fp16[r_start:r_end]
                 update = self._newton_schulz(m_chunk)
@@ -355,6 +367,7 @@ class CPUMuon:
                     # works without translation.
                     module.decay_and_apply_chunk(
                         r_start, r_end, update, lr, wd_factor=wd_factor,
+                        rebuild_scales_cache=(chunk_i == n_chunks - 1),
                     )
 
             # ---- Sync the device stream before next param's H2D.

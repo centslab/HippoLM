@@ -471,38 +471,43 @@ class NVFP4ColumnParallelLinear(nn.Module):
 
     def apply_chunk_update(
         self, start: int, end: int, grad_chunk: torch.Tensor, factor: float,
+        rebuild_scales_cache: bool = True,
     ) -> None:
         bf16 = self.material_chunk(start, end)
         bf16.sub_(grad_chunk.to(bf16.dtype), alpha=factor)
         self.commit_chunk(start, end, bf16)
-        from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
-        _build_marlin_scales_caches(
-            self, self.scales, self.global_scale,
-            size_k=self.in_features, size_n=self.out_features_per_partition,
-            block_size=self.block_size,
-        )
+        if rebuild_scales_cache:
+            from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
+            _build_marlin_scales_caches(
+                self, self.scales, self.global_scale,
+                size_k=self.in_features, size_n=self.out_features_per_partition,
+                block_size=self.block_size,
+            )
 
     def decay_and_apply_chunk(
         self,
         start: int, end: int,
         update_chunk: torch.Tensor, lr: float,
         wd_factor: float = 1.0,
+        rebuild_scales_cache: bool = True,
     ) -> None:
         """Muon-style apply. See ``NVFP4Linear.decay_and_apply_chunk``
         for the math. ``start`` / ``end`` are local-partition rows
-        (``out_features_per_partition``).
+        (``out_features_per_partition``). See there for the
+        ``rebuild_scales_cache`` contract.
         """
         bf16 = self.material_chunk(start, end)
         if wd_factor != 1.0:
             bf16.mul_(wd_factor)
         bf16.sub_(update_chunk.to(bf16.dtype), alpha=lr)
         self.commit_chunk(start, end, bf16)
-        from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
-        _build_marlin_scales_caches(
-            self, self.scales, self.global_scale,
-            size_k=self.in_features, size_n=self.out_features_per_partition,
-            block_size=self.block_size,
-        )
+        if rebuild_scales_cache:
+            from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
+            _build_marlin_scales_caches(
+                self, self.scales, self.global_scale,
+                size_k=self.in_features, size_n=self.out_features_per_partition,
+                block_size=self.block_size,
+            )
 
     def chunk_ranges(self) -> list[tuple[int, int]]:
         rows_per_chunk = max(1, (4 * 1024 * 1024) // max(1, self.in_features))
@@ -751,39 +756,44 @@ class NVFP4RowParallelLinear(nn.Module):
 
     def apply_chunk_update(
         self, start: int, end: int, grad_chunk: torch.Tensor, factor: float,
+        rebuild_scales_cache: bool = True,
     ) -> None:
         bf16 = self.material_chunk(start, end)
         bf16.sub_(grad_chunk.to(bf16.dtype), alpha=factor)
         self.commit_chunk(start, end, bf16)
-        from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
-        _build_marlin_scales_caches(
-            self, self.scales, self.global_scale,
-            size_k=self.in_features_per_partition, size_n=self.out_features,
-            block_size=self.block_size,
-        )
+        if rebuild_scales_cache:
+            from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
+            _build_marlin_scales_caches(
+                self, self.scales, self.global_scale,
+                size_k=self.in_features_per_partition, size_n=self.out_features,
+                block_size=self.block_size,
+            )
 
     def decay_and_apply_chunk(
         self,
         start: int, end: int,
         update_chunk: torch.Tensor, lr: float,
         wd_factor: float = 1.0,
+        rebuild_scales_cache: bool = True,
     ) -> None:
         """Muon-style apply. See ``NVFP4Linear.decay_and_apply_chunk``
         for the math. ``start`` / ``end`` are rows in the global
         ``out_features`` dim (since the row-parallel partition is
-        sharded along the **input** axis, not the output).
+        sharded along the **input** axis, not the output). See
+        there for the ``rebuild_scales_cache`` contract.
         """
         bf16 = self.material_chunk(start, end)
         if wd_factor != 1.0:
             bf16.mul_(wd_factor)
         bf16.sub_(update_chunk.to(bf16.dtype), alpha=lr)
         self.commit_chunk(start, end, bf16)
-        from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
-        _build_marlin_scales_caches(
-            self, self.scales, self.global_scale,
-            size_k=self.in_features_per_partition, size_n=self.out_features,
-            block_size=self.block_size,
-        )
+        if rebuild_scales_cache:
+            from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
+            _build_marlin_scales_caches(
+                self, self.scales, self.global_scale,
+                size_k=self.in_features_per_partition, size_n=self.out_features,
+                block_size=self.block_size,
+            )
 
     def chunk_ranges(self) -> list[tuple[int, int]]:
         rows_per_chunk = max(1, (4 * 1024 * 1024) // max(1, self.in_features_per_partition))
