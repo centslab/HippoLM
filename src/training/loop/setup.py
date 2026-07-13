@@ -49,6 +49,7 @@ from src.training.data import (
 )
 from src.training.data.cache import purge_stale_cache_if_no_hit
 from src.training.param_offload import (
+    _start_cpu_add_worker,
     build_param_groups,
     register_grad_offload_hooks,
 )
@@ -415,6 +416,16 @@ def _setup_worker(
         [muon_opt, adamw_opt],
         manual_flush_params=manual_flush or None,
     )
+    # Start the async CPU-add worker (Priority 2 overlap).
+    # After this call, the per-param streaming hook and the
+    # manual-flush / NVFP4 stash paths push ``(event, target,
+    # src)`` entries to a background queue instead of doing a
+    # synchronous ``cuda.synchronize`` + CPU-add on the main
+    # thread. The next chunk's fwd can launch while the worker
+    # drains chunk i's adds — see
+    # :func:`_drain_cpu_add_queue` for the end-of-step join.
+    # Stopped in :func:`_teardown_worker`.
+    _start_cpu_add_worker()
     # NVFP4 mode-3 entries have ``s.param is None`` (the
     # weight lives on the module as FP4 packed buffers, not as a
     # leaf Parameter). Fall back to ``s.nvfp4_n`` (cached at

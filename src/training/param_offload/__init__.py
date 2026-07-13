@@ -113,9 +113,15 @@ from ._state import (
 from .adamw import CPUAdamW
 from .muon import CPUMuon
 from .offload import (
+    _cpu_add_async_enabled,
+    _cpu_add_worker_thread,
+    _drain_cpu_add_queue,
+    _enqueue_cpu_add,
     _manual_flush_param_ids,
     _make_offload_hook,
     _pending_grads,
+    _start_cpu_add_worker,
+    _stop_cpu_add_worker,
     accumulate_grads_to_cpu,
     flush_manual_flush_params,
     flush_pending_grads,
@@ -138,6 +144,15 @@ __all__ = [
     "flush_pending_grads",
     "register_grad_offload_hooks",
     "zero_cpu_grad_accum",
+    # Async CPU-add worker (Priority 2 overlap): started by the
+    # training loop in _setup_worker, drained at end of step,
+    # stopped in _teardown_worker. No-op in sync mode (tests).
+    "_cpu_add_async_enabled",
+    "_cpu_add_worker_thread",
+    "_drain_cpu_add_queue",
+    "_enqueue_cpu_add",
+    "_start_cpu_add_worker",
+    "_stop_cpu_add_worker",
     # Module-level queues (mutated by register_grad_offload_hooks
     # and flush_*_grads; exposed so tests can assert on them).
     "_manual_flush_param_ids",

@@ -25,8 +25,16 @@ def _teardown_worker(ctx: Dict[str, Any]) -> None:
     finally clause in :func:`_run_training_loop` calls this, and
     a caller that bails out of setup_worker would call it
     directly with a partially-populated ctx).
+
+    Also stops the async CPU-add worker if one was started in
+    :func:`_setup_worker`. The stop function drains any
+    in-flight entries first, so the per-param accumulators are
+    left consistent on return (callers can inspect them after
+    teardown if needed).
     """
     import torch.distributed as dist
+
+    from src.training.param_offload import _stop_cpu_add_worker
 
     prefetcher = ctx.get("prefetcher")
     if prefetcher is not None:
@@ -34,6 +42,14 @@ def _teardown_worker(ctx: Dict[str, Any]) -> None:
             prefetcher.close()
         except Exception as e:
             log.warning("prefetcher close failed: %r", e)
+    # Stop the async CPU-add worker first (drains its queue
+    # before returning) so the optimizer state is consistent
+    # before destroy_process_group runs. Idempotent: a no-op if
+    # the worker was never started.
+    try:
+        _stop_cpu_add_worker()
+    except Exception as e:
+        log.warning("cpu-add worker stop failed: %r", e)
     if dist.is_available() and dist.is_initialized():
         try:
             dist.destroy_process_group()

@@ -34,6 +34,8 @@ import torch
 from src.training import save_checkpoint
 from src.training.diagnostics import log_post_opt_diag, log_pre_step_diag
 from src.training.param_offload import (
+    _cpu_add_async_enabled,
+    _drain_cpu_add_queue,
     accumulate_grads_to_cpu,
     flush_manual_flush_params,
     zero_cpu_grad_accum,
@@ -342,16 +344,41 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 # gradient_accumulation_steps" gate collapses to
                 # "every step is a step" — the chunked forward IS
                 # the gradient accumulation (n_chunks = gas).
-                # Drain any remaining NVFP4 stashes (idempotent if
-                # already drained per-chunk).
-                accumulate_grads_to_cpu(
-                    [muon_opt, adamw_opt], sync_device=gpus[rank],
-                )
-                # End-of-step drain timer: post-chunk
-                # ``accumulate_grads_to_cpu`` call drains the NVFP4
-                # ``_latest_grad_w`` stash and the per-param grad
-                # accumulators. On mode-3 (no BF16 master) this is
-                # the only path the FP4 grads reach the CPU side.
+                #
+                # End-of-step drain: in async mode (the production
+                # path with the CPU-add worker started in
+                # :func:`_setup_worker`), the per-chunk
+                # :func:`accumulate_grads_to_cpu` /
+                # :func:`flush_manual_flush_params` calls pushed
+                # ``(event, target, src)`` entries to the worker
+                # queue and returned immediately. The worker drains
+                # them in the background, overlapping with the
+                # next chunk's fwd. Here at end-of-step we MUST
+                # wait for the worker to finish so the accumulators
+                # are consistent before the inf/nan check, grad
+                # norm, and optimizer step read them. Without this
+                # drain the optimizer would race with the worker's
+                # CPU adds and apply a stale (incomplete) gradient.
+                # Side benefit: fixes the latent ``_pending_grads``
+                # drain bug from commit 0473912 (the comment said
+                # ``accumulate_grads_to_cpu`` drains the queue but
+                # the drain was never wired up; the async worker
+                # path is the actual drain in production).
+                if _cpu_add_async_enabled():
+                    _drain_cpu_add_queue(timeout=60.0)
+                else:
+                    # Sync path (no worker): the post-chunk call
+                    # syncs CUDA + applies any leftover CPU adds
+                    # defensively. Most entries are drained by the
+                    # per-chunk ``accumulate_grads_to_cpu`` calls
+                    # already; this is a barrier + safety net.
+                    accumulate_grads_to_cpu(
+                        [muon_opt, adamw_opt], sync_device=gpus[rank],
+                    )
+                # End-of-step drain timer. In async mode this is
+                # the worker's drain (Priority 2 overlap saving);
+                # in sync mode it's the legacy
+                # ``accumulate_grads_to_cpu`` sync+add barrier.
                 _mb_t_drain_end = time.perf_counter()
                 # Inf/nan check on the accumulated CPU grads.
                 from src.training.param_offload.cpu_fused import (
