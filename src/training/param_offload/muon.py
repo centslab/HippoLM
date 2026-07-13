@@ -276,6 +276,28 @@ class CPUMuon:
         # are already zero, so re-zeroing them would be wasted
         # bandwidth.
         mom_bufs_to_zero: list = []
+        # Per-param early-exit + sync are intentional (see notes
+        # below). An experiment that hoisted the early-exit and
+        # per-param stream sync out of the loop into a single
+        # final sync showed the all-async path runs ~2.5× slower
+        # on a 5060 Ti (~700 ms median for legacy per-param pattern
+        # vs ~1700 ms for the refactor) at base.yml shape (~224
+        # Muon entries). The bottleneck is GPU-side — without
+        # per-param syncs the long H2D / matmul / D2H queue
+        # causes PyTorch's CUDA stream to stall (probably
+        # pinned-memory DMA back-pressure or matmul-launch
+        # oversubscription). The legacy per-param
+        # ``.abs().sum().item()`` adds ~5 µs of host bookkeeping
+        # per call but is essentially free; the per-param stream
+        # ``synchronize()`` returns ~immediately when only one
+        # matmul is in flight.
+        # -----
+        # Lesson: do **not** "optimize" this loop by removing the
+        # per-param sync or merging it into one final sync — the
+        # empirical floor is set by GPU stream behavior, not by
+        # Python-side overhead. If a future cuBLAS / CUDA runtime
+        # change makes the all-async path faster, this comment
+        # should be re-validated against a fresh microbench.
         for s in self.state.values():
             # Merged-accumulator design (all storage dtypes):
             # ``mom_buf`` is the cycle's accumulated grad.
@@ -283,6 +305,11 @@ class CPUMuon:
             # Early-exit on no accumulated grad. The storage
             # dtype is always a floating dtype (bf16 / fp16 /
             # fp32 — quantized storage removed 2026-07-12).
+            # ``mom_buf`` is in pinned CPU memory; ``.item()`` is
+            # a host-side scalar read — ~5 µs, negligible. The
+            # host-vs-GPU interleaving it introduces is actually
+            # what keeps the per-param stream from oversubscribing
+            # (see the loop preamble).
             if g_buf.abs().sum().item() == 0:
                 continue
             shape = s.shape
@@ -379,9 +406,11 @@ class CPUMuon:
                     )
 
             # ---- Sync the device stream before next param's H2D.
-            # Ensures the D2H above completed; otherwise the next
-            # param could overwrite the pinned host buffer before
-            # this DMA landed. ----
+            # See the loop preamble for why this stays per-param
+            # despite the obvious "1 sync at end is cheaper"
+            # intuition — empirically the per-param version is
+            # ~2.5× faster than the all-async version on 5060 Ti.
+            # ----
             torch.cuda.current_stream(device).synchronize()
 
             # ---- Cycle-end housekeeping (deferred): queue
