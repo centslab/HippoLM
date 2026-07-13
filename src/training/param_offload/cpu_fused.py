@@ -140,7 +140,21 @@ static inline bool _avx512f_available() {
 }
 
 // ===========================================================================
-// fused_add_into_many — BF16 / FP16 element-wise add across many ops.
+// fused_add_into_many — BF16-only element-wise add across many ops.
+//
+// BF16-only by construction: the FP32-promote + FP32-add +
+// BF16-RNE-narrow inner kernel relies on BF16's bit layout
+// being the upper 16 bits of FP32 (sign:1, exp:8, mantissa:7).
+// FP16 / FP32 / any other dtype would silently corrupt data
+// — both the scalar fallback and the SIMD loop hard-code the
+// shift-left-16 + round-to-nearest-even narrow. Microbench
+// confirms the discrepancy:
+//   bf16: max abs diff = 0.000e+00  (correct)
+//   fp16: max abs diff = 1.930e+00  (WRONG)
+//   fp32: max abs diff = 2.129e-02  (WRONG)
+// The Python wrapper enforces this with a dtype assert —
+// important because Muon's configurable ``mom_buf`` storage
+// dtype (BF16 / FP16 / FP32) makes a non-BF16 call plausible.
 //
 // NOTE: as of 2026-07-13 this kernel is NOT wired into the
 // per-mb add paths in :mod:`.offload` — microbench on a Zen1
@@ -692,14 +706,37 @@ def fused_add_into_many(
     """Add each ``src_tensors[i]`` into ``tgt_tensors[i]`` in place
     using the fused OpenMP kernel.
 
-    All tensors must be 2-byte element dtypes (BF16 / FP16) for
-    the SIMD add path (AVX-2 / AVX-512 operate on 16-bit lanes).
+    BF16-only. The FP32-promote + FP32-add + BF16-RNE-narrow
+    inner kernel relies on BF16's bit layout (BF16 = upper 16
+    bits of FP32); FP16 / FP32 would silently corrupt data
+    (microbench: fp16 max abs diff = 1.93e+00, fp32 = 2.13e-02,
+    bf16 = 0.0). The dtype assert below enforces this — important
+    because Muon's ``mom_buf`` storage dtype is configurable
+    (BF16 / FP16 / FP32) and a non-BF16 call would otherwise pass
+    the type system but corrupt training. Use ``t.add_(src)``
+    directly for non-BF16 tensors.
+
     Returns True if the fused path was used, False if the
     fallback was used.
     """
     if not tgt_tensors:
         return True
     assert len(tgt_tensors) == len(src_tensors)
+    # BF16-only correctness guard (see docstring). The
+    # promote-add-narrow inner kernel hard-codes the BF16
+    # bit-layout assumption (sign:1, exp:8, mantissa:7).
+    for t in tgt_tensors:
+        assert t.dtype == torch.bfloat16, (
+            f"fused_add_into_many is BF16-only; got {t.dtype} "
+            f"on a tgt tensor. Use t.add_(src) directly for "
+            f"non-BF16 tensors."
+        )
+    for t in src_tensors:
+        assert t.dtype == torch.bfloat16, (
+            f"fused_add_into_many is BF16-only; got {t.dtype} "
+            f"on a src tensor. Use t.add_(src) directly for "
+            f"non-BF16 tensors."
+        )
     ext = _try_load_ext()
     if ext is None:
         for tgt, src in zip(tgt_tensors, src_tensors):
