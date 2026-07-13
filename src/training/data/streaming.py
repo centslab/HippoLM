@@ -40,7 +40,21 @@ class StreamingDataset(IterableDataset):
         shuffle: bool = False,
         ms_dataset_name: Optional[str] = None,
         use_modelscope: bool = True,
+        tokenize_batch_size: int = 64,
     ):
+        """Args:
+            tokenize_batch_size: how many texts to accumulate before
+                a single ``tokenizer(texts, ...)`` call. With
+                ``<=1`` the iterator tokenizes per-doc (legacy path).
+                The batched path cuts tokenize wall-clock ~3-4× at
+                the cost of a single small Python-side buffer; see
+                ``feedback_verify_correctness.md`` for the
+                equivalence requirement and
+                ``test/_tmp/bench_tokenize_batched.py`` for the
+                microbench. Default ``64`` is empirically past the
+                knee (3.1-3.8× speedup vs per-doc at HF
+                AutoTokenizer on the bundled Qwen tokenizer.json).
+        """
         super().__init__()
         self.dataset_name = dataset_name
         self.ms_dataset_name = ms_dataset_name
@@ -53,6 +67,7 @@ class StreamingDataset(IterableDataset):
         self.config_name = config_name
         self.seed = seed
         self.shuffle = shuffle
+        self.tokenize_batch_size = max(1, int(tokenize_batch_size))
 
         # Lazy init dataset
         self._ds = None
@@ -90,29 +105,84 @@ class StreamingDataset(IterableDataset):
 
     def __iter__(self):
         self._ensure_dataset()
+        if self.tokenize_batch_size <= 1:
+            # Legacy per-doc path. Kept as a fallback so we can
+            # pin-tokenize-frequency bugs by toggling
+            # tokenize_batch_size=1 at the call site.
+            for example in self._ds:
+                text = self._example_to_text(example)
+                if not text:
+                    continue
+                ids = self._tokenize_one(text)
+                if ids is not None:
+                    yield {"input_ids": ids, "labels": list(ids)}
+            return
+
+        # Batched path: buffer up to ``tokenize_batch_size`` non-empty
+        # texts, tokenize once via the list-input API, yield each
+        # result dict in order. HF AutoTokenizer's batched call is
+        # bit-equivalent to the per-doc path (verified in
+        # ``test/_tmp/bench_tokenize_batched.py`` with
+        # ``max_length``+``truncation`` enabled); the speedup comes
+        # from amortizing the Python→Rust call overhead per batch
+        # and from letting the Rust backend parallelize over the
+        # batch internally when configured to.
+        #
+        # A side benefit relative to ``StreamingDataset._ds``:
+        # when ``_example_to_text`` returns ``None`` (e.g., SFT
+        # examples with empty ``messages``) we just skip the
+        # example without polluting the buffer. The tokenize
+        # batch only ever sees real texts.
+        batch: list[str] = []
         for example in self._ds:
             text = self._example_to_text(example)
-            if text:
-                # ``return_tensors=None`` returns a 1D list of
-                # token ids directly; the legacy code passed
-                # ``return_tensors="pt"`` and then ``.squeeze(0)``'d
-                # the resulting ``[1, T]`` tensor back to 1D — pure
-                # overhead. The result is a Python list, which
-                # :func:`pack_chunk_aligned` (and any consumer that
-                # doesn't need a tensor) can use directly.
-                encoded = self.tokenizer(
-                    text,
-                    max_length=self.max_seq_len,
-                    truncation=True,
-                    return_tensors=None,
-                )
-                # Qwen tokenizer returns a list under "input_ids"
-                # (or a BatchEncoding with .input_ids as a list).
-                ids = encoded["input_ids"] if isinstance(
-                    encoded, dict,
-                ) else encoded.input_ids
-                if len(ids) >= 2:
-                    yield {"input_ids": ids, "labels": list(ids)}
+            if not text:
+                continue
+            batch.append(text)
+            if len(batch) >= self.tokenize_batch_size:
+                yield from self._flush_batch(batch)
+                batch = []
+        if batch:
+            yield from self._flush_batch(batch)
+
+    def _tokenize_one(self, text: str) -> Optional[list[int]]:
+        """Per-doc tokenize. ``return_tensors=None`` returns a 1D
+        list of token ids directly; ``return_tensors="pt"`` would
+        wrap in ``[1, T]`` and require ``.squeeze(0)`` — pure
+        overhead. Qwen tokenizer returns either a dict under
+        ``"input_ids"`` or a BatchEncoding with ``.input_ids``.
+        """
+        encoded = self.tokenizer(
+            text,
+            max_length=self.max_seq_len,
+            truncation=True,
+            return_tensors=None,
+        )
+        ids = (
+            encoded["input_ids"]
+            if isinstance(encoded, dict)
+            else encoded.input_ids
+        )
+        return ids if len(ids) >= 2 else None
+
+    def _flush_batch(self, batch: list[str]):
+        """Tokenize the buffered batch in one call and yield per-doc
+        result dicts. Used by the batched ``__iter__`` path.
+        """
+        encoded = self.tokenizer(
+            batch,
+            max_length=self.max_seq_len,
+            truncation=True,
+            return_tensors=None,
+        )
+        ids_lists = (
+            encoded["input_ids"]
+            if isinstance(encoded, dict)
+            else encoded.input_ids
+        )
+        for ids in ids_lists:
+            if len(ids) >= 2:
+                yield {"input_ids": ids, "labels": list(ids)}
 
     def __len__(self) -> int:
         # Streaming: arbitrary large number for any caller that needs it.
