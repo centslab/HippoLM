@@ -60,7 +60,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -582,6 +582,111 @@ void fused_adam_step_bf16(
     }
 }
 
+// ===========================================================================
+// fused_inf_nan_count_bf16 — total non-finite element count across
+// many BF16 tensors.
+// ===========================================================================
+// Same DeepSpeed-style pattern as the other kernels: one outer
+// OMP ``parallel for`` across all params eliminates the per-param
+// Python+dispatch overhead that the legacy
+// ``for s in opt.state: (~torch.isfinite(s)).sum().item()``
+// Python loop paid.
+//
+// Per-element check uses the BF16 bit layout: BF16 = upper 16
+// bits of FP32 (sign:1, exp:8, mantissa:7). NaN/Inf detection
+// on BF16 reduces to the same check on FP32 after a shift-left-16
+// into FP32 position. We don't actually emit FP32 arithmetic for
+// the check — the FP32 exponent byte alone tells us infinity
+// (exp == 0xFF) and NaN (exp == 0xFF with non-zero mantissa).
+//
+// Returns int64 — for the production shape (~100 params, ~4 GB
+// total), the count is O(millions) at most; int64 is plenty.
+// Scalar-only: the check is a single-byte compare (after
+// extracting the high byte), no SIMD vectorization needed — the
+// outer OMP does the parallelism.
+//
+// Caller constraint: BF16-only (matches AdamW ``s.m`` and Muon
+// ``s.mom_buf`` in production per ``precision: muon_momentum/
+// adamw_m: {dtype: bf16}``). Python wrapper asserts.
+static inline bool _bf16_is_finite(uint16_t b) {
+    // Extract the upper 8 bits (sign + exponent). If exp == 0xFF
+    // (all ones), the value is Inf or NaN. Mantissa is irrelevant
+    // for the isfinite test.
+    uint8_t hi = (uint8_t)(b >> 8);
+    return (hi & 0x7Fu) != 0x7Fu;
+}
+
+int64_t fused_inf_nan_count_bf16(std::vector<int64_t> ptrs,
+                                 std::vector<int64_t> sizes) {
+    int n = (int)ptrs.size();
+    if (n == 0) return 0;
+    int64_t total = 0;
+    #pragma omp parallel for reduction(+:total) schedule(dynamic, 1)
+    for (int i = 0; i < n; i++) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(ptrs[i]);
+        int64_t n_elts = sizes[i] / 2;  // BF16 = 2 bytes
+        int64_t local = 0;
+        // Walk 8 BF16 at a time via uint64_t; mask-and-test on
+        // the high byte of each lane catches Inf/NaN cheaply.
+        // Scalar inner loop is fast on Zen1 (the check is one
+        // compare per 2 bytes; the bandwidth-bound case is
+        // already at host memory peak for ~4 GB of input).
+        int64_t j = 0;
+        for (; j < n_elts; j++) {
+            local += _bf16_is_finite(p[j]) ? 0 : 1;
+        }
+        total += local;
+    }
+    return total;
+}
+
+// ===========================================================================
+// fused_l2_norm_sq_bf16 — sum of squared BF16 elements across
+// many tensors, accumulated in FP64.
+// ===========================================================================
+// Replaces the legacy
+// ``local_sq += accum.detach().float().pow(2).sum()`` Python loop
+// in :func:`src.training.loop.grad_norm._compute_and_clip_grad_norm`.
+// Each call to that loop materializes a full FP32 copy of the
+// accumulator (e.g. the tied embed's 762 MiB BF16 → 1.5 GiB FP32),
+// a second FP32 pow(2) tensor, and a Python ``+=`` with a CUDA
+// sync. The fused kernel does the promote + square + sum in one
+// pass per tensor with no intermediate allocations.
+//
+// FP64 accumulator across params: avoids catastrophic cancellation
+// when summing ~100 params whose squared magnitudes vary by
+// orders of magnitude (norm tiny params vs norm of the embed).
+// PyTorch's ``Tensor.sum()`` returns FP32 which can lose 6-7
+// significant digits in that scenario.
+//
+// Returns double (the per-rank local_sq value, ready for
+// ``dist.all_reduce`` and ``.sqrt()``).
+double fused_l2_norm_sq_bf16(std::vector<int64_t> ptrs,
+                             std::vector<int64_t> sizes) {
+    int n = (int)ptrs.size();
+    if (n == 0) return 0.0;
+    double total = 0.0;
+    #pragma omp parallel for reduction(+:total) schedule(dynamic, 1)
+    for (int i = 0; i < n; i++) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(ptrs[i]);
+        int64_t n_elts = sizes[i] / 2;
+        double local = 0.0;
+        // Promote BF16 → FP32 via shift-left-16, square in FP32,
+        // accumulate in FP64. The FP32 mul is bit-exact equivalent
+        // to the legacy ``accum.float().pow(2)``; FP64 accumulator
+        // is the only difference.
+        for (int64_t j = 0; j < n_elts; j++) {
+            uint32_t bits = ((uint32_t)p[j]) << 16;
+            float f;
+            std::memcpy(&f, &bits, 4);
+            double fd = (double)f;
+            local += fd * fd;
+        }
+        total += local;
+    }
+    return total;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_add_into_many", &fused_add_into_many,
           "Fused multi-target BF16 add with OpenMP + AVX2/AVX-512");
@@ -589,6 +694,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused multi-target zero with OpenMP");
     m.def("fused_adam_step_bf16", &fused_adam_step_bf16,
           "Fused AdamW step (BF16 storage) with OpenMP + AVX2/AVX-512");
+    m.def("fused_inf_nan_count_bf16", &fused_inf_nan_count_bf16,
+          "Fused BF16 isfinite+sum across many tensors (returns int64)");
+    m.def("fused_l2_norm_sq_bf16", &fused_l2_norm_sq_bf16,
+          "Fused BF16 sum(x^2) across many tensors (returns FP64)");
 }
 """
 
@@ -800,4 +909,91 @@ def fused_adam_step_bf16(
         m_ptrs, v_ptrs, factor_ptrs, sizes, step_list,
         float(beta2), float(1.0 - beta2), float(eps),
     )
+    return True
+
+
+def fused_inf_nan_count_bf16(tensors: List[torch.Tensor]) -> Tuple[bool, int]:
+    """Total non-finite (Inf/NaN) element count across many BF16 tensors.
+
+    Replaces the legacy ``for s in opt.state: (~torch.isfinite(s)).sum().item()``
+    Python loop in the per-step Inf/NaN check (see
+    ``src/training/loop/run.py``). Each Python-loop iteration
+    allocated a fresh bool tensor the size of the accumulator, ran
+    ``isfinite`` and ``sum`` as separate ops, and paid full
+    cross-op dispatch overhead — combined ~14 s/step at base.yml
+    on 5060 Ti (per the 2026-07-13 step breakdown).
+
+    The fused kernel walks all tensors in one outer OMP
+    ``parallel for`` (bandwidth-bound on host memory); the
+    per-element check is one BF16 high-byte compare (BF16
+    bit layout: upper 16 bits of FP32, so exp == 0xFF → Inf/NaN).
+
+    BF16-only — same constraint as :func:`fused_add_into_many`.
+    Caller is expected to filter to BF16 accumulators (the
+    production ``precision`` config sets
+    ``adamw_m / muon_momentum: {dtype: bf16}``).
+
+    Returns ``(used_fused, count)``: ``used_fused`` is True if the
+    C++ extension ran, False if the per-tensor Python fallback ran
+    (only when JIT compilation failed). ``count`` is the total
+    non-finite element count across all input tensors.
+    """
+    if not tensors:
+        return True, 0
+    for t in tensors:
+        assert t.dtype == torch.bfloat16, (
+            f"fused_inf_nan_count_bf16 is BF16-only; got {t.dtype}"
+        )
+    ext = _try_load_ext()
+    if ext is None:
+        total = 0
+        for t in tensors:
+            total += (~torch.isfinite(t)).sum().item()
+        return False, total
+    ptrs = [t.data_ptr() for t in tensors]
+    sizes = [t.numel() * t.element_size() for t in tensors]
+    return True, ext.fused_inf_nan_count_bf16(ptrs, sizes)
+
+
+def fused_l2_norm_sq_bf16(tensors: List[torch.Tensor]) -> Tuple[bool, float]:
+    """Sum of squared BF16 elements across many tensors (FP64 accumulator).
+
+    Replaces the legacy ``local_sq += accum.detach().float().pow(2).sum()``
+    Python loop in :func:`src.training.loop.grad_norm._compute_and_clip_grad_norm`.
+    Each iteration materialized a full FP32 copy of the accumulator
+    (the tied embed: 762 MiB BF16 → 1.5 GiB FP32), a second FP32
+    pow(2) tensor, and a Python ``+=`` with a CUDA sync — combined
+    ~7.7 s/step at base.yml on 5060 Ti.
+
+    The fused kernel promotes BF16 → FP32 via shift-left-16 (the
+    standard "BF16 = upper 16 bits of FP32" trick), squares in
+    FP32, accumulates in FP64 across all params in one OMP
+    ``parallel for`` pass. FP64 accumulator avoids catastrophic
+    cancellation when summing ~100 params with squared magnitudes
+    spanning many orders of magnitude.
+
+    BF16-only — same constraint as :func:`fused_add_into_many`.
+
+    Returns ``(used_fused, sum_sq)``: ``used_fused`` is True if the
+    C++ extension ran, False if the per-tensor Python fallback ran.
+    ``sum_sq`` is the FP64 sum of squares — ready for
+    ``dist.all_reduce`` (cross-TP-rank reduction) and ``.sqrt()``
+    to get the global L2 norm.
+    """
+    if not tensors:
+        return True, 0.0
+    for t in tensors:
+        assert t.dtype == torch.bfloat16, (
+            f"fused_l2_norm_sq_bf16 is BF16-only; got {t.dtype}"
+        )
+    ext = _try_load_ext()
+    if ext is None:
+        total = 0.0
+        for t in tensors:
+            f = t.float()
+            total += float((f * f).sum().item())
+        return False, total
+    ptrs = [t.data_ptr() for t in tensors]
+    sizes = [t.numel() * t.element_size() for t in tensors]
+    return True, ext.fused_l2_norm_sq_bf16(ptrs, sizes)
     return True

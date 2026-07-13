@@ -316,26 +316,18 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 _mb_t_bwd_end = _mb_t_fwd_end
                 _mb_t_sync_end = _mb_t_fwd_end
 
-                # Per-step timing log (chunked path: one row per
-                # step, not per chunk). The breakdown is the same
-                # data_ms / fwd_ms / bwd_ms / sync_ms columns but
-                # with fwd+bwd fused because the per-chunk loop
-                # interleaves them.
-                mb_timing = getattr(args, "mb_timing", 0)
-                if rank == 0 and mb_timing > 0 and batch_idx < mb_timing:
-                    n_real_docs = (
-                        cu_seqlens.numel() - args.batch_size
-                        if cu_seqlens is not None else -1
-                    )
-                    logger.info(
-                        f"  [mb-time] step={global_step}"
-                        f" n_chunks={n_chunks}/{n_chunks}"
-                        f" data_ms={(_mb_t_data_end - _mb_t_loop_start) * 1000:6.1f}"
-                        f" compute_ms={(_mb_t_fwd_end - _mb_t_data_end) * 1000:6.1f}"
-                        f" shape={tuple(input_ids.shape)}"
-                        f" cu_seqlens=[{cu_seqlens.tolist() if cu_seqlens is not None else 'None'}]"
-                        f" real_docs={n_real_docs}"
-                    )
+                # Capture the per-step shape info before we drop the
+                # batch tensors; the timing log below runs after the
+                # optimizer phase so it can include all post-chunk
+                # component times.
+                _mb_t_shape = tuple(input_ids.shape)
+                _mb_t_cu = (
+                    cu_seqlens.tolist() if cu_seqlens is not None else None
+                )
+                _mb_t_n_real_docs = (
+                    cu_seqlens.numel() - args.batch_size
+                    if cu_seqlens is not None else -1
+                )
 
                 del input_ids, labels
                 # Free the chunk-local cu_seqlens tensors and the
@@ -355,28 +347,38 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                 accumulate_grads_to_cpu(
                     [muon_opt, adamw_opt], sync_device=gpus[rank],
                 )
+                # End-of-step drain timer: post-chunk
+                # ``accumulate_grads_to_cpu`` call drains the NVFP4
+                # ``_latest_grad_w`` stash and the per-param grad
+                # accumulators. On mode-3 (no BF16 master) this is
+                # the only path the FP4 grads reach the CPU side.
+                _mb_t_drain_end = time.perf_counter()
                 # Inf/nan check on the accumulated CPU grads.
-                found_inf = False
-                n_nan_accum_total = 0
-                for opt_name, opt in (("muon", muon_opt), ("adamw", adamw_opt)):
-                    for sid, s in opt.state.items():
-                        accum = (
-                            s.m if s.kind == "adamw"
-                            else s.mom_buf
-                        )
-                        n_nan = (~torch.isfinite(accum)).sum().item()
-                        n_nan_accum_total += n_nan
-                        if n_nan > 0:
-                            found_inf = True
-                            break
-                    if found_inf:
-                        break
+                from src.training.param_offload.cpu_fused import (
+                    fused_inf_nan_count_bf16,
+                )
+                _inf_nan_accums = [
+                    (s.m if s.kind == "adamw" else s.mom_buf)
+                    for opt in (muon_opt, adamw_opt)
+                    for s in opt.state.values()
+                ]
+                _used_fused_infnan, n_nan_accum_total = fused_inf_nan_count_bf16(
+                    _inf_nan_accums
+                )
+                found_inf = n_nan_accum_total > 0
                 if rank == 0 and global_step < 5:
                     print(f"  [CHECK-DEBUG] step={global_step} n_nan_accum_total={n_nan_accum_total} found_inf={found_inf}")
+                # Post-chunk phase timer: inf/nan check on CPU
+                # accumulators. The CPU side walks every per-param
+                # momentum / m tensor and counts non-finite elements;
+                # on a 32-layer + 248K-vocab model this can be
+                # noticeable (per-param .item() syncs each call).
+                _mb_t_infnan_end = time.perf_counter()
                 if not found_inf:
                     total_norm = _compute_and_clip_grad_norm(
                         [muon_opt, adamw_opt], args.max_grad_norm,
                     )
+                    _mb_t_gradnorm_end = time.perf_counter()
                     if global_step < _DIAG_STEPS and rank == 0:
                         log_pre_step_diag(
                             logger,
@@ -398,6 +400,7 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     muon_opt.lr = cur_muon_lr
                     adamw_opt.lr = cur_adamw_lr
                     muon_opt.step()
+                    _mb_t_muon_end = time.perf_counter()
                     if global_step < _DIAG_STEPS and rank == 0:
                         log_post_opt_diag(
                             logger,
@@ -406,6 +409,7 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                             state=muon_opt.state,
                         )
                     adamw_opt.step()
+                    _mb_t_adamw_end = time.perf_counter()
                     if global_step < _DIAG_STEPS and rank == 0:
                         log_post_opt_diag(
                             logger,
@@ -414,6 +418,13 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                             state=adamw_opt.state,
                         )
                     zero_cpu_grad_accum([muon_opt, adamw_opt])
+                    _mb_t_zero_end = time.perf_counter()
+                    # End of optimizer phase (grad-norm + clip +
+                    # muon.step + adamw.step + zero_cpu_grad_accum).
+                    # The optional diag-logging above is only emitted
+                    # for the first _DIAG_STEPS so steady-state cost
+                    # is zero.
+                    _mb_t_opt_end = _mb_t_zero_end
                     if getattr(args, "ffn_nvfp4", False):
                         from src.models.ops.nvfp4_linear import repack_nvfp4_weights
                         n_repacked = repack_nvfp4_weights(model)
@@ -422,10 +433,66 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                                 "[nvfp4] step=%d repacked %d NVFP4 weight(s)",
                                 global_step, n_repacked,
                             )
+                    else:
+                        n_repacked = 0
+                    _mb_t_repack_end = time.perf_counter()
                 else:
                     total_norm = float("nan")
+                    n_repacked = 0
+                    # Both opt and repack are skipped on the
+                    # found_inf path; collapse the two timestamps
+                    # so the timing log still prints sane values.
+                    _mb_t_gradnorm_end = time.perf_counter()
+                    _mb_t_muon_end = _mb_t_gradnorm_end
+                    _mb_t_adamw_end = _mb_t_gradnorm_end
+                    _mb_t_zero_end = _mb_t_gradnorm_end
+                    _mb_t_opt_end = _mb_t_zero_end
+                    _mb_t_repack_end = _mb_t_opt_end
                 scaler.update()
                 torch.cuda.synchronize(gpus[rank])
+                _mb_t_scaler_end = time.perf_counter()
+
+                # Per-step timing log (chunked path: one row per
+                # step, not per chunk). The breakdown includes the
+                # full post-chunk phase: data wait + H2D, fwd+bwd
+                # (interleaved), post-chunk drain (NVFP4 stash +
+                # grad accum flush), inf/nan check, grad-norm + opt
+                # step, NVFP4 repack, scaler update. All components
+                # use ``time.perf_counter``; the only sync is the
+                # post-scaler ``cuda.synchronize`` which is required
+                # anyway before the next step's H2D.
+                mb_timing = getattr(args, "mb_timing", 0)
+                if rank == 0 and mb_timing > 0 and batch_idx < mb_timing:
+                    _t_data = _mb_t_data_end - _mb_t_loop_start
+                    _t_compute = _mb_t_fwd_end - _mb_t_data_end
+                    _t_drain = _mb_t_drain_end - _mb_t_fwd_end
+                    _t_infnan = _mb_t_infnan_end - _mb_t_drain_end
+                    _t_gradnorm = _mb_t_gradnorm_end - _mb_t_infnan_end
+                    _t_muon = _mb_t_muon_end - _mb_t_gradnorm_end
+                    _t_adamw = _mb_t_adamw_end - _mb_t_muon_end
+                    _t_zero = _mb_t_zero_end - _mb_t_adamw_end
+                    _t_repack = _mb_t_repack_end - _mb_t_zero_end
+                    _t_scaler = _mb_t_scaler_end - _mb_t_repack_end
+                    _t_total = _mb_t_scaler_end - _mb_t_loop_start
+                    logger.info(
+                        f"  [mb-time] step={global_step}"
+                        f" n_chunks={n_chunks}/{n_chunks}"
+                        f" data_ms={_t_data * 1000:7.1f}"
+                        f" compute_ms={_t_compute * 1000:7.1f}"
+                        f" drain_ms={_t_drain * 1000:7.1f}"
+                        f" infnan_ms={_t_infnan * 1000:7.1f}"
+                        f" gradnorm_ms={_t_gradnorm * 1000:7.1f}"
+                        f" muon_ms={_t_muon * 1000:7.1f}"
+                        f" adamw_ms={_t_adamw * 1000:7.1f}"
+                        f" zero_ms={_t_zero * 1000:7.1f}"
+                        f" repack_ms={_t_repack * 1000:7.1f}"
+                        f" (n={n_repacked})"
+                        f" scaler_ms={_t_scaler * 1000:7.1f}"
+                        f" total_ms={_t_total * 1000:7.1f}"
+                        f" shape={_mb_t_shape}"
+                        f" cu_seqlens={_mb_t_cu}"
+                        f" real_docs={_mb_t_n_real_docs}"
+                    )
 
                 global_step += 1
                 avg_loss = accumulated_loss  # one loss value per step now
