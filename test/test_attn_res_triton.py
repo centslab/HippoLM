@@ -247,6 +247,82 @@ def test_fused_backward_matches_reference(N, B, T, H, D_h):
         )
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_fused_tp_slice_forward_backward(rank):
+    """TP>1: query is the LOCAL head slice and ``slice_start != 0``.
+
+    Exercises the single online-softmax kernel's full-head-space path
+    (RMSNorm over the full hidden, compute/write only the local head
+    range) and the autograd Function's backward slice of K. This is a
+    regression guard for the latent backward bug where K (full hidden)
+    was viewed directly as the local head count — hit once the forward
+    started succeeding at world > 1 (the old 2-kernel path compile-failed
+    at world > 1 and silently fell back to PyTorch, hiding the bug).
+    """
+    if not is_available():
+        pytest.skip("Triton fused path not available")
+
+    torch.manual_seed(100 + rank)
+    N, B, T, D_h = 4, 1, 256, 128
+    H_full, world = 12, 2
+    hpp = H_full // world
+    D = H_full * D_h
+    device = "cuda"
+
+    hs = rank * hpp
+    slice_start = hs * D_h
+    slice_width = hpp * D_h
+
+    V_full = torch.randn(N, B, T, D, dtype=torch.bfloat16, device=device)
+    V_full.requires_grad_(True)
+    query_full = torch.randn(H_full, D_h, dtype=torch.bfloat16, device=device) * 0.02
+    query = query_full[hs:hs + hpp].detach().clone().requires_grad_(True)
+    norm_weight = torch.ones(D, dtype=torch.bfloat16, device=device)
+    norm_weight.requires_grad_(True)
+    V_local = V_full[..., slice_start:slice_start + slice_width].contiguous().view(
+        N, B, T, hpp, D_h,
+    )
+    grad_out = torch.randn(B, T, hpp, D_h, dtype=torch.bfloat16, device=device)
+
+    # Fused (Triton) path with an explicit TP slice_start.
+    out_fused = fused_attn_res_forward(
+        V_full, V_local, query, norm_weight, slice_start=slice_start,
+    )
+    out_fused.backward(grad_out)
+    dV_f = V_full.grad.detach().clone()
+    dq_f = query.grad.detach().clone()
+    dw_f = norm_weight.grad.detach().clone()
+    V_full.grad = None
+    query.grad = None
+    norm_weight.grad = None
+
+    # Full reference: RMSNorm over the full hidden, K sliced to local heads.
+    var = V_full.float().pow(2).mean(dim=-1, keepdim=True)
+    K = (V_full.float() * torch.rsqrt(var + 1e-6) * norm_weight.float()).view(
+        N, B, T, H_full, D_h,
+    )
+    K = K[..., hs:hs + hpp, :].to(V_full.dtype)
+    logits = torch.einsum("hd,nbthd->nbth", query, K)
+    weights = torch.softmax(logits, dim=0)
+    V_local_ref = V_full[..., slice_start:slice_start + slice_width].contiguous().view(
+        N, B, T, hpp, D_h,
+    )
+    out_ref = torch.einsum("nbth,nbthd->bthd", weights, V_local_ref)
+
+    # Forward match.
+    max_rel = (out_fused - out_ref).abs().max().item() / (out_ref.abs().max().item() + 1e-9)
+    assert max_rel < 0.02, f"rank={rank} forward diverged: rel={max_rel:.4e}"
+
+    out_ref.backward(grad_out)
+    dV_r = V_full.grad.detach().clone()
+    dq_r = query.grad.detach().clone()
+    dw_r = norm_weight.grad.detach().clone()
+
+    for name, fused, ref in [("dV", dV_f, dV_r), ("dq", dq_f, dq_r), ("dw", dw_f, dw_r)]:
+        rel = (fused - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
+        assert rel < 0.05, f"rank={rank} {name} diverged: rel={rel:.4e}"
+
+
 def test_uniform_with_zero_query_triton():
     """With zero pseudo-query, weights are uniform; output = mean(V)."""
     if not is_available():

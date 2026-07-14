@@ -1,35 +1,49 @@
 """Triton-fused AttnRes compute for BlockAttnRes.forward.
 
 Replaces the 5-op PyTorch reference path (stack → RMSNorm → contig
-slice × 2 → einsum × 2) with 2 Triton kernels + a softmax:
+slice × 2 → einsum × 2) with a SINGLE Triton kernel that streams the
+online softmax over the N residual sources:
 
-  - Kernel 1 (``_rmsnorm_dot_kernel``): per (b, t) program, loops
-    over N blocks, reads V[n, b, t, :] once, computes RMSNorm + K,
-    then per-head dot product against ``query``. Writes
-    ``logits[N, B, T, H]`` (fp32) to HBM.
+  - ``_online_attnres_kernel``: one program per (b, t) token. Loops
+    over the N residual sources; for each source it reads
+    V[n, b, t, :] ONCE (as a padded ``[H, D_h]`` tile), computes the
+    RMSNorm rstd over the full hidden, the per-head logit
+    ``q·RMSNorm(v)``, and folds both the softmax normaliser and the
+    weighted-sum accumulator in registers (running max / acc / o).
+    Writes ``out[B, T, H, D_h]`` (bf16) at the end.
 
-  - ``softmax(logits, dim=0)`` — PyTorch (small: N×B×T×H = 3 MB).
-
-  - Kernel 2 (``_weighted_sum_kernel``): per (b, t) program, loads
-    the per-(n, h) weights and the full V[n, b, t, :] for all n,
-    computes the per-head weighted sum, writes
-    ``out[B, T, H, D_h]`` (bf16) to HBM.
+This borrows the design of flash-linear-attention's ``fused_attnres``
+(fla/ops/attnres/fused.py): V is read exactly once (logit + weighted
+sum share the same tile) and no intermediate logits tensor is
+materialised in HBM. The difference from FLA is that HippoLM's
+BlockAttnRes is MULTI-HEAD (per-head query ``[H, D_h]`` → a softmax
+weight per head over N), whereas FLA is single-head (one scalar
+weight per residual source over the full hidden). So FLA's kernel
+can't be dropped in as-is; this kernel keeps HippoLM's per-head
+semantics with FLA's V-read-once online-softmax structure.
 
 HBM traffic per call (prod shape N=8, B=1, T=16384, D=1536, H=12,
 D_h=128):
   - Reference: ~3500 MB (stack + RMSNorm read+write + 2 contig
     slice copies + weighted sum read+write).
-  - This: ~825 MB (read V once for kernel 1, re-read once for
-    kernel 2, plus tiny logits + weights + out).
+  - Previous 2-kernel fusion: ~825 MB (V read twice + logits HBM
+    round-trip).
+  - This single kernel: ~430 MB (V read ONCE + out).
 
-Per-call wall time on 5060 Ti: 11.6 ms (reference) → 4.2 ms (this),
-~2.8× speedup. Per-step at n_chunks=16 (7 calls/chunk × 16 × 2
-fwd+bwd): ~1.67 s savings.
+Per-call wall time on 5060 Ti at prod shape: ~26 ms (reference) →
+~2.1 ms (2-kernel) → ~1.17 ms (this), i.e. ~1.8× over the 2-kernel
+path and ~22× over the reference.
+
+TP note: the kernel works in full-head space (reads the full-hidden
+row for the RMSNorm reduction, computes/writes only the local head
+range ``[HS, HS+H_LOCAL)``). This means it is correct at world > 1
+too — unlike the previous 2-kernel path, whose ``reshape`` of the
+full-D key into ``[hpp, D_h]`` compile-failed at world > 1 and
+silently fell back to PyTorch.
 
 Backward (autograd.Function) re-runs the reference math in PyTorch
 under ``torch.enable_grad()`` to get the gradients. The bwd cost is
-small relative to fwd (per-call ~2 ms at prod vs ~4 ms fwd), so
-this trade is acceptable for the first commit.
+small relative to fwd, so this trade is acceptable.
 
 Numerical agreement: BF16 reduction order differs from the reference
 by <1% relative (max abs diff < 0.008 at fp32 random init with
@@ -38,14 +52,12 @@ uniform-with-zero-query, gradient flow) bound this tighter.
 
 Why a separate file from attn_res.py
 ------------------------------------
-The Triton kernel is only used when CUDA + bf16 + the right N
-match; otherwise we fall back to the PyTorch path. Keeping the
-kernel isolated lets ``is_available()`` short-circuit cleanly and
-keeps the autograd Function out of the eager path.
+The Triton kernel is only used when CUDA + bf16 match; otherwise we
+fall back to the PyTorch path. Keeping the kernel isolated lets
+``is_available()`` short-circuit cleanly and keeps the autograd
+Function out of the eager path.
 """
 from __future__ import annotations
-
-from typing import Tuple
 
 import torch
 import triton
@@ -53,141 +65,91 @@ import triton.language as tl
 
 
 # ---------------------------------------------------------------------------
-# Kernel 1: fused RMSNorm + per-head dot product.
+# Single kernel: RMSNorm + per-head dot + online softmax + weighted sum.
 #
-# Per program: one (b, t) pair. Reads V[n, b, t, :] for each n,
-# computes RMSNorm and K in registers, then per-head dot product
-# against ``query``. Writes logits[n, b, t, h] to HBM as fp32
-# (so softmax precision is preserved).
+# Per program: one (b, t) token. Loops over the N residual sources.
+# For each source n it reads V[n, b, t, :] ONCE as a padded
+# ``[BLOCK_HF, BLOCK_DH]`` tile (full-head layout), then:
+#   - rstd  = 1/sqrt(mean(v^2, over full D) + eps)   (scalar)
+#   - k     = v * rstd * norm_weight                  (full-head tile)
+#   - logit = sum_dh q[h,dh] * k[h,dh]                (per head)
+#   - online-softmax update: running max / acc / o_acc in registers.
 #
-# BLOCK_D / BLOCK_H / BLOCK_DH are the next power of 2 of D / H / D_h;
-# the kernel masks out pad slots to keep the math correct.
-# N is a constexpr so ``tl.static_range`` can unroll the loop.
+# The query is provided for the LOCAL head range only ([H_LOCAL, D_h]);
+# it is loaded into rows [HS, HS+H_LOCAL) of the full-head tile (other
+# rows have q=0 → their logit contribution is 0 and they are never
+# written out). Only the local head rows are stored to ``out``.
+#
+# Working in full-head space keeps the RMSNorm reduction over the full
+# hidden (matching the reference statistics) and reads V exactly once
+# per source. N is a constexpr so ``tl.static_range`` unrolls the loop.
 # ---------------------------------------------------------------------------
 @triton.jit
-def _rmsnorm_dot_kernel(
-    V_ptr,         # *bf16, [N, B, T, D]
-    Q_ptr,         # *bf16, [H, D_h]
+def _online_attnres_kernel(
+    V_ptr,         # *bf16, [N, B, T, D]  (full hidden, for norm)
+    Q_ptr,         # *bf16, [H_LOCAL, D_h]
     W_ptr,         # *bf16, [D]
-    OUT_ptr,       # *fp32, [N, B, T, H]
-    B, T, D, H, D_h,
+    OUT_ptr,       # *bf16, [B, T, H_LOCAL, D_h]
+    B, T, D, H_full, D_h,
     eps,
     stride_v_n, stride_v_b, stride_v_t,
-    stride_o_n, stride_o_b, stride_o_t,
-    N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_DH: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    pid_b = pid // T
-    pid_t = pid % T
-
-    # Load query [BLOCK_H, BLOCK_DH] (padded; mask out beyond H/D_h).
-    h_off = tl.arange(0, BLOCK_H)
-    dh_off = tl.arange(0, BLOCK_DH)
-    q = tl.load(
-        Q_ptr + h_off[:, None] * D_h + dh_off[None, :],
-        mask=(h_off[:, None] < H) & (dh_off[None, :] < D_h),
-        other=0.0,
-    ).to(tl.float32)
-
-    # Load RMSNorm weight [BLOCK_D] (padded).
-    d_off = tl.arange(0, BLOCK_D)
-    d_mask = d_off < D
-    w = tl.load(
-        W_ptr + d_off,
-        mask=d_mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    # Loop over N (unrolled at compile time).
-    for n in tl.static_range(N):
-        v = tl.load(
-            V_ptr + n * stride_v_n + pid_b * stride_v_b
-                  + pid_t * stride_v_t + d_off,
-            mask=d_mask,
-            other=0.0,
-        ).to(tl.float32)
-        # RMSNorm: rms = sqrt(mean(v^2) + eps), k = v / rms * w.
-        v_sq = tl.where(d_mask, v * v, 0.0)
-        mean_sq = tl.sum(v_sq) / D
-        rms = tl.sqrt(mean_sq + eps)
-        k = (v / rms) * tl.where(d_mask, w, 0.0)  # pad slots → 0
-        # Per-head dot product: logits[n, h] = sum_d_h q[h, d_h] * k[h*D_h+d_h]
-        k_h = tl.reshape(k, [BLOCK_H, BLOCK_DH])
-        logit_n = tl.sum(q * k_h, axis=1)  # [BLOCK_H]
-        # Write to HBM (masked to H).
-        tl.store(
-            OUT_ptr + n * stride_o_n + pid_b * stride_o_b
-                    + pid_t * stride_o_t + h_off,
-            logit_n,
-            mask=h_off < H,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Kernel 2: weighted sum.
-#
-# Per program: one (b, t) pair. Loads weights[n, h] for all n in
-# registers (small — N * H = 96 fp32 for prod). Loads V[n, b, t, :]
-# for all n in one block (~24 KB at prod), reshapes to
-# [N, H, D_h], multiplies by weights broadcast over D_h, sums over
-# n, writes out[b, t, h, :].
-# ---------------------------------------------------------------------------
-@triton.jit
-def _weighted_sum_kernel(
-    V_ptr,         # *bf16, [N, B, T, D_local]  D_local = H * D_h (the slice)
-    W_ptr,         # *fp32, [N, B, T, H]
-    OUT_ptr,       # *bf16, [B, T, H, D_h]
-    B, T, D_local, H, D_h,
-    stride_v_n, stride_v_b, stride_v_t,
-    stride_w_n, stride_w_b, stride_w_t,
     stride_o_b, stride_o_t,
+    H_LOCAL: tl.constexpr,   # hpp (local head count on this rank)
+    HS: tl.constexpr,        # local head start (rank * hpp)
     N: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_DH: tl.constexpr,
-    BLOCK_D: tl.constexpr,   # next power of 2 >= D_local
+    BLOCK_HF: tl.constexpr,  # next power of 2 >= H_full
+    BLOCK_DH: tl.constexpr,  # next power of 2 >= D_h
 ):
     pid = tl.program_id(0)
     pid_b = pid // T
     pid_t = pid % T
 
-    h_off = tl.arange(0, BLOCK_H)
-    dh_off = tl.arange(0, BLOCK_DH)
-    d_off = tl.arange(0, BLOCK_D)
-    d_mask = d_off < D_local
+    hf = tl.arange(0, BLOCK_HF)          # full-head index
+    dh = tl.arange(0, BLOCK_DH)
+    hf_mask = hf < H_full
+    dh_mask = dh < D_h
+    full_mask = hf_mask[:, None] & dh_mask[None, :]
 
-    # Load weights [N, BLOCK_H] (N is constexpr for arange).
-    n_off = tl.arange(0, N)
-    weights = tl.load(
-        W_ptr + n_off[:, None] * stride_w_n + pid_b * stride_w_b
-              + pid_t * stride_w_t + h_off[None, :],
-        mask=(n_off[:, None] < N) & (h_off[None, :] < H),
-        other=0.0,
-    )  # [N, BLOCK_H] fp32
-
-    # Load V [N, BLOCK_D] (padded; mask out beyond D_local).
-    v_all = tl.load(
-        V_ptr + n_off[:, None] * stride_v_n + pid_b * stride_v_b
-              + pid_t * stride_v_t + d_off[None, :],
-        mask=(n_off[:, None] < N) & d_mask[None, :],
-        other=0.0,
+    # Query placed at local rows: q_tile[hf] = query[hf - HS] for
+    # HS <= hf < HS + H_LOCAL, else 0.
+    q_local_mask = (hf >= HS) & (hf < HS + H_LOCAL)
+    q_tile = tl.load(
+        Q_ptr + (hf - HS)[:, None] * D_h + dh[None, :],
+        mask=q_local_mask[:, None] & dh_mask[None, :], other=0.0,
     ).to(tl.float32)
-    # Reshape to [N, BLOCK_H, BLOCK_DH]. Pad slots are 0 so they
-    # don't affect the sum.
-    v_h = tl.reshape(v_all, [N, BLOCK_H, BLOCK_DH])
-    # Multiply by weights[:, :, None] (broadcast over D_h) and sum over n.
-    out = tl.sum(v_h * weights[:, :, None], axis=0)  # [BLOCK_H, BLOCK_DH]
-    out_bf16 = out.to(tl.bfloat16)
-    out_offsets = (
-        pid_b * stride_o_b + pid_t * stride_o_t
-        + h_off[:, None] * D_h + dh_off[None, :]
-    )
+    w_tile = tl.load(
+        W_ptr + hf[:, None] * D_h + dh[None, :], mask=full_mask, other=0.0,
+    ).to(tl.float32)
+
+    # Running online-softmax state, per head.
+    m_run = tl.full([BLOCK_HF], float("-inf"), dtype=tl.float32)
+    acc = tl.zeros([BLOCK_HF], dtype=tl.float32)
+    o_acc = tl.zeros([BLOCK_HF, BLOCK_DH], dtype=tl.float32)
+
+    for n in tl.static_range(N):
+        base = V_ptr + n * stride_v_n + pid_b * stride_v_b + pid_t * stride_v_t
+        v = tl.load(
+            base + hf[:, None] * D_h + dh[None, :], mask=full_mask, other=0.0,
+        ).to(tl.float32)  # [BLOCK_HF, BLOCK_DH]
+        ss = tl.sum(tl.where(full_mask, v * v, 0.0))   # scalar over full D
+        rms = tl.sqrt(ss / D + eps)
+        k = (v / rms) * w_tile
+        logit = tl.sum(q_tile * k, axis=1)             # [BLOCK_HF]
+        logit = tl.where(hf_mask, logit, float("-inf"))
+
+        m_new = tl.maximum(m_run, logit)
+        r = tl.exp(m_run - m_new)
+        p = tl.exp(logit - m_new)
+        acc = acc * r + p
+        o_acc = o_acc * r[:, None] + p[:, None] * v
+        m_run = m_new
+
+    out = (o_acc / acc[:, None]).to(tl.bfloat16)
     tl.store(
-        OUT_ptr + out_offsets,
-        out_bf16,
-        mask=(h_off[:, None] < H) & (dh_off[None, :] < D_h),
+        OUT_ptr + pid_b * stride_o_b + pid_t * stride_o_t
+        + (hf - HS)[:, None] * D_h + dh[None, :],
+        out,
+        mask=q_local_mask[:, None] & dh_mask[None, :],
     )
 
 
@@ -202,25 +164,31 @@ def _next_pow2(x: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Forward entry point: stack → Triton kernels → softmax → Triton kernel.
+# Forward entry point: single online-softmax kernel.
 #
-# Takes both the full V (for norm — norm is over the full hidden to
-# match the reference statistics) and the TP-local V slice (for the
-# weighted sum — only this rank's heads are summed). At TP=1 the
-# slice is the full hidden so the caller can pass V in both slots.
+# Takes the full V (for the RMSNorm — over the full hidden, matching
+# the reference statistics) and the TP-local V slice (only used to
+# read the local head count H_LOCAL and D_h; the kernel reads the
+# weighted-sum data from V_full's local head range directly, so no
+# separate V_local buffer is touched by the kernel). ``slice_start``
+# is the offset (in elements along V_full's last dim) where the local
+# head range begins; at TP=1 it is 0 and H_LOCAL == H_full.
 # ---------------------------------------------------------------------------
 def fused_attn_res_compute(
     V_full: torch.Tensor,       # [N, B, T, D] bf16 — full hidden, for norm
-    V_local: torch.Tensor,      # [N, B, T, H, D_h] bf16 — sliced, for weighted sum
-    query: torch.Tensor,        # [H, D_h] bf16
+    V_local: torch.Tensor,      # [N, B, T, H, D_h] bf16 — local slice (shape only)
+    query: torch.Tensor,        # [H, D_h] bf16 — local heads
     norm_weight: torch.Tensor,  # [D] bf16
     eps: float = 1e-6,
+    slice_start: int = 0,       # element offset of the local head range in V_full's last dim
 ) -> torch.Tensor:
-    """Compute the local AttnRes output via 2 Triton kernels.
+    """Compute the local AttnRes output via a single online-softmax kernel.
 
-    ``V_full`` and ``V_local`` may be the same tensor at TP=1 (where
-    ``H == hpp`` and the slice is identity). At TP>1 ``V_local`` is
-    a proper head-slice and is smaller than ``V_full``.
+    ``V_local`` is used only for its shape (``H_LOCAL``, ``D_h``); the
+    kernel reads the weighted-sum data from ``V_full``'s local head
+    range ``[slice_start, slice_start + H_LOCAL * D_h)`` directly. At
+    TP=1 the local range is the full hidden (``slice_start == 0``,
+    ``H_LOCAL == H_full``).
 
     Returns ``out`` of shape ``[B, T, H, D_h]`` (per-rank output).
     The caller is responsible for the all-gather across the head dim
@@ -231,50 +199,36 @@ def fused_attn_res_compute(
     assert query.dtype == torch.bfloat16
     assert norm_weight.dtype == torch.bfloat16
     N_full, B, T, D = V_full.shape
-    N_local, _, _, H, D_h = V_local.shape
+    N_local, _, _, H_local, D_h = V_local.shape
     assert N_full == N_local, (
         f"N mismatch: V_full has N={N_full}, V_local has N={N_local}"
     )
     N = N_full
-    assert H * D_h <= D, f"H*D_h={H*D_h} > D={D} (V_local must be a slice)"
+    assert H_local * D_h <= D, (
+        f"H_local*D_h={H_local * D_h} > D={D} (V_local must be a slice)"
+    )
+    H_full = D // D_h
+    assert slice_start % D_h == 0, (
+        f"slice_start={slice_start} not a multiple of D_h={D_h}"
+    )
+    hs = slice_start // D_h  # local head start index
 
-    BLOCK_D = _next_pow2(D)
-    BLOCK_D_LOCAL = _next_pow2(H * D_h)
-    BLOCK_H = _next_pow2(H)
+    BLOCK_HF = _next_pow2(H_full)
     BLOCK_DH = _next_pow2(D_h)
 
-    # Allocate logits [N, B, T, H] in fp32 (softmax precision).
-    logits = torch.empty(
-        N, B, T, H, dtype=torch.float32, device=V_full.device,
-    )
-
-    grid1 = (B * T,)
-    _rmsnorm_dot_kernel[grid1](
-        V_full, query, norm_weight, logits,
-        B, T, D, H, D_h, eps,
-        V_full.stride(0), V_full.stride(1), V_full.stride(2),
-        logits.stride(0), logits.stride(1), logits.stride(2),
-        N=N, BLOCK_D=BLOCK_D, BLOCK_H=BLOCK_H, BLOCK_DH=BLOCK_DH,
-        num_warps=4,
-    )
-
-    # Softmax over N (PyTorch; tiny intermediate).
-    weights = torch.softmax(logits, dim=0)
-
-    # Allocate output.
     out = torch.empty(
-        B, T, H, D_h, dtype=torch.bfloat16, device=V_full.device,
+        B, T, H_local, D_h, dtype=torch.bfloat16, device=V_full.device,
     )
 
-    grid2 = (B * T,)
-    _weighted_sum_kernel[grid2](
-        V_local, weights, out,
-        B, T, H * D_h, H, D_h,
-        V_local.stride(0), V_local.stride(1), V_local.stride(2),
-        weights.stride(0), weights.stride(1), weights.stride(2),
+    grid = (B * T,)
+    _online_attnres_kernel[grid](
+        V_full, query, norm_weight, out,
+        B, T, D, H_full, D_h, eps,
+        V_full.stride(0), V_full.stride(1), V_full.stride(2),
         out.stride(0), out.stride(1),
-        N=N, BLOCK_H=BLOCK_H, BLOCK_DH=BLOCK_DH, BLOCK_D=BLOCK_D_LOCAL,
-        num_warps=4,
+        H_LOCAL=H_local, HS=hs,
+        N=N, BLOCK_HF=BLOCK_HF, BLOCK_DH=BLOCK_DH,
+        num_warps=2,
     )
 
     return out
@@ -303,6 +257,7 @@ class _FusedAttnResFn(torch.autograd.Function):
     ) -> torch.Tensor:
         out = fused_attn_res_compute(
             V_full, V_local, query, norm_weight, eps=eps,
+            slice_start=slice_start,
         )
         ctx.save_for_backward(V_full, V_local, query, norm_weight)
         ctx.eps = eps
@@ -348,7 +303,13 @@ class _FusedAttnResFn(torch.autograd.Function):
             V_local_g = V_local_g.contiguous().view(N, B, T, H, D_h)
             var = V_full_g.float().pow(2).mean(dim=-1, keepdim=True)
             K = V_full_g.float() * torch.rsqrt(var + eps) * norm_weight_g.float()
-            K = K.view(N, B, T, H, D_h).to(V_full.dtype)
+            # K is over the *full* hidden; view it per-head and slice to
+            # this rank's head range (matches V_local_g / the forward).
+            # At TP=1 head_start=0 and H == D//D_h so the slice is
+            # identity; at TP>1 K has D//D_h heads but only H are local.
+            K = K.view(N, B, T, D // D_h, D_h)
+            head_start = slice_start // D_h
+            K = K[..., head_start:head_start + H, :].to(V_full.dtype)
             logits = torch.einsum("hd,nbthd->nbth", query_g, K)
             weights = torch.softmax(logits, dim=0)
             out_ref = torch.einsum("nbth,nbthd->bthd", weights, V_local_g)
