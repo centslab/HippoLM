@@ -92,8 +92,16 @@ def _compute_and_clip_grad_norm(opts, max_norm: float) -> float:
     #       (quadratic clip instead of linear).
     if max_norm > 0.0 and total_norm > max_norm:
         clip_coef = max_norm / (total_norm + 1e-6)
-        from src.training.param_offload import _scale_accum
+        from src.training.param_offload.cpu_fused import (
+            fused_scale_many_bf16,
+        )
+        accumulators = []
         for opt in opts:
             for s in opt.state.values():
-                _scale_accum(s, clip_coef)
+                accum = (
+                    s.m if s.kind == "adamw"
+                    else s.mom_buf
+                )
+                accumulators.append(accum)
+        fused_scale_many_bf16(accumulators, clip_coef)
     return total_norm

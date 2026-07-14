@@ -641,6 +641,130 @@ int64_t fused_inf_nan_count_bf16(std::vector<int64_t> ptrs,
 }
 
 // ===========================================================================
+// fused_scale_many_bf16 — in-place BF16 *= coef across many tensors.
+// ===========================================================================
+// Replaces the per-param ``s.m.mul_(clip_coef)`` /
+// ``s.mom_buf.mul_(clip_coef)`` Python loop in
+// :func:`_compute_and_clip_grad_norm` when ``total_norm > max_norm``.
+// At base.yml shape this loop touches 614 params (~3.5 GiB total BF16)
+// and pays ~50 µs/param of cross-op Python+dispatch overhead. The
+// fused kernel does the whole pass in one OMP parallel-for with the
+// promote-multiply-narrow inner kernel mirroring ``_add_into_scalar``.
+//
+// FP32 promotion is required: integer mul on raw BF16 bit patterns is
+// only correct for same-exponent operands; cross-exponent values
+// silently produce wrong results (same trap as
+// ``feedback_bf16_int_add_wrong.md`` notes for the add variant).
+// RNE-narrow to BF16 on store; the result bit-matches ``t.mul_(c)``
+// because PyTorch's CPU mul uses the same FP32-promote + round path.
+//
+// coef is passed as a Python float (FP64); we narrow to FP32 on the
+// host side before the kernel call so the inner loop is FP32-only.
+static inline void _scale_into_scalar(uint8_t* tgt, int64_t n_bytes, float c) {
+    int64_t n_aligned = n_bytes & ~1;
+    for (int64_t i = 0; i < n_aligned; i += 2) {
+        uint16_t a_bf16;
+        std::memcpy(&a_bf16, tgt + i, 2);
+        // BF16 → FP32.
+        uint32_t a_bits = ((uint32_t)a_bf16) << 16;
+        float a_fp32;
+        std::memcpy(&a_fp32, &a_bits, 4);
+        float prod = a_fp32 * c;
+        // FP32 → BF16 (RNE).
+        uint32_t prod_bits;
+        std::memcpy(&prod_bits, &prod, 4);
+        uint32_t lsb = (prod_bits >> 16) & 1u;
+        prod_bits += 0x7FFFu + lsb;
+        uint16_t r_bf16 = (uint16_t)(prod_bits >> 16);
+        std::memcpy(tgt + i, &r_bf16, 2);
+    }
+}
+
+#ifdef __AVX2__
+// AVX-2 scale: 16 BF16 per chunk (32 bytes) — promote to FP32,
+// multiply by coef (broadcast), narrow back. Inner loop mirrors
+// ``_add_chunk_avx2`` exactly except the per-lane op is FP32 mul
+// instead of add and there's no source operand to load.
+__attribute__((target("avx2,fma")))
+static inline void _scale_chunk_avx2(uint8_t* tgt, int64_t n_bytes, float c) {
+    int64_t i = 0;
+    int64_t n_aligned = n_bytes & ~31;
+    __m256 c_vec = _mm256_set1_ps(c);
+    for (; i < n_aligned; i += 32) {
+        __m256i a_i16 = _mm256_loadu_si256((__m256i*)(tgt + i));
+        __m128i a_lo = _mm256_castsi256_si128(a_i16);
+        __m128i a_hi = _mm256_extracti128_si256(a_i16, 1);
+        __m256i a_lo_i32 = _mm256_cvtepu16_epi32(a_lo);
+        __m256i a_hi_i32 = _mm256_cvtepu16_epi32(a_hi);
+        __m256 a_lo_fp = _mm256_castsi256_ps(_mm256_slli_epi32(a_lo_i32, 16));
+        __m256 a_hi_fp = _mm256_castsi256_ps(_mm256_slli_epi32(a_hi_i32, 16));
+        __m256 prod_lo = _mm256_mul_ps(a_lo_fp, c_vec);
+        __m256 prod_hi = _mm256_mul_ps(a_hi_fp, c_vec);
+        alignas(32) uint16_t out[16];
+        _narrow_8x_fp32_to_bf16(prod_lo, &out[0]);
+        _narrow_8x_fp32_to_bf16(prod_hi, &out[8]);
+        _mm256_storeu_si256((__m256i*)(tgt + i), _mm256_loadu_si256((__m256i*)out));
+    }
+    if (i < n_bytes) _scale_into_scalar(tgt + i, n_bytes - i, c);
+}
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+// AVX-512 scale: 32 BF16 per chunk (64 bytes). Same shape as the
+// AVX-2 path with 16-lane ZMM.
+__attribute__((target("avx512f,avx512bw")))
+static inline void _scale_chunk_avx512(uint8_t* tgt, int64_t n_bytes, float c) {
+    int64_t i = 0;
+    int64_t n_aligned = n_bytes & ~63;
+    __m512 c_vec = _mm512_set1_ps(c);
+    for (; i < n_aligned; i += 64) {
+        __m512i a_i16 = _mm512_loadu_si512((__m512i*)(tgt + i));
+        __m256i a_lo = _mm512_castsi512_si256(a_i16);
+        __m256i a_hi = _mm512_extracti64x4_epi64(a_i16, 1);
+        __m512i a_lo_i32 = _mm512_cvtepu16_epi32(a_lo);
+        __m512i a_hi_i32 = _mm512_cvtepu16_epi32(a_hi);
+        __m512 a_lo_fp = _mm512_castsi512_ps(_mm512_slli_epi32(a_lo_i32, 16));
+        __m512 a_hi_fp = _mm512_castsi512_ps(_mm512_slli_epi32(a_hi_i32, 16));
+        __m512 prod_lo = _mm512_mul_ps(a_lo_fp, c_vec);
+        __m512 prod_hi = _mm512_mul_ps(a_hi_fp, c_vec);
+        alignas(64) uint16_t out[32];
+        _narrow_16x_fp32_to_bf16(prod_lo, &out[0]);
+        _narrow_16x_fp32_to_bf16(prod_hi, &out[16]);
+        _mm512_storeu_si512((__m512i*)(tgt + i), _mm512_loadu_si512((__m512i*)out));
+    }
+    if (i < n_bytes) _scale_into_scalar(tgt + i, n_bytes - i, c);
+}
+#endif
+
+void fused_scale_many_bf16(std::vector<int64_t> ptrs,
+                          std::vector<int64_t> sizes,
+                          double coef) {
+    int n = (int)ptrs.size();
+    if (n == 0) return;
+    float c = (float)coef;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < n; i++) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(ptrs[i]);
+        int64_t nb = sizes[i];
+        bool used_simd = false;
+    #ifdef __AVX512F__
+        if (_avx512f_available() && nb >= 64) {
+            _scale_chunk_avx512(p, nb, c);
+            used_simd = true;
+        }
+    #endif
+        if (!used_simd) {
+        #ifdef __AVX2__
+            if (nb >= 32) _scale_chunk_avx2(p, nb, c);
+            else _scale_into_scalar(p, nb, c);
+        #else
+            _scale_into_scalar(p, nb, c);
+        #endif
+        }
+    }
+}
+
+// ===========================================================================
 // fused_l2_norm_sq_bf16 — sum of squared BF16 elements across
 // many tensors, accumulated in FP64.
 // ===========================================================================
@@ -698,6 +822,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused BF16 isfinite+sum across many tensors (returns int64)");
     m.def("fused_l2_norm_sq_bf16", &fused_l2_norm_sq_bf16,
           "Fused BF16 sum(x^2) across many tensors (returns FP64)");
+    m.def("fused_scale_many_bf16", &fused_scale_many_bf16,
+          "Fused BF16 in-place *= coef across many tensors");
 }
 """
 
@@ -996,4 +1122,57 @@ def fused_l2_norm_sq_bf16(tensors: List[torch.Tensor]) -> Tuple[bool, float]:
     ptrs = [t.data_ptr() for t in tensors]
     sizes = [t.numel() * t.element_size() for t in tensors]
     return True, ext.fused_l2_norm_sq_bf16(ptrs, sizes)
+
+
+def fused_scale_many_bf16(
+    tensors: List[torch.Tensor], coef: float,
+) -> bool:
+    """In-place BF16 ``t *= coef`` across many tensors in one C++ pass.
+
+    Replaces the per-param ``s.m.mul_(clip_coef)`` /
+    ``s.mom_buf.mul_(clip_coef)`` Python loop in
+    :func:`_compute_and_clip_grad_norm` when ``total_norm > max_norm``.
+    At base.yml shape the loop touches 614 params (~3.5 GiB BF16 total)
+    and pays ~50 µs/param of cross-op Python+dispatch overhead. The
+    fused kernel does the whole pass in one OMP parallel-for.
+
+    Per-element math is identical to ``t.mul_(coef)``: BF16 → FP32,
+    multiply, RNE-narrow to BF16. The FP32 promotion is required —
+    integer mul on raw BF16 bit patterns is only correct for
+    same-exponent operands (same trap as the add variant; see
+    ``feedback_bf16_int_add_wrong.md``).
+
+    BF16-only — same constraint as :func:`fused_add_into_many`. Both
+    Muon's ``s.mom_buf`` and AdamW's ``s.m`` are BF16 by default
+    (``precision.muon_momentum.dtype = bf16``,
+    ``precision.adamw_m.dtype = bf16``). Any future change to a
+    different storage dtype must either flip this function to a new
+    kernel or skip the path.
+
+    No-op (returns True) when ``coef == 1.0`` or the list is empty.
+    The caller (:func:`_compute_and_clip_grad_norm`) short-circuits
+    on ``coef == 1.0`` already; the in-kernel guard keeps the same
+    contract for direct callers.
+
+    Falls back to the per-tensor Python loop if the JIT extension
+    failed to compile (no C++ toolchain at runtime); correctness is
+    preserved either way, only the speedup is lost.
+
+    Returns True if the fused path was used, False if the fallback
+    was used.
+    """
+    if not tensors or coef == 1.0:
+        return True
+    for t in tensors:
+        assert t.dtype == torch.bfloat16, (
+            f"fused_scale_many_bf16 is BF16-only; got {t.dtype}"
+        )
+    ext = _try_load_ext()
+    if ext is None:
+        for t in tensors:
+            t.mul_(coef)
+        return False
+    ptrs = [t.data_ptr() for t in tensors]
+    sizes = [t.numel() * t.element_size() for t in tensors]
+    ext.fused_scale_many_bf16(ptrs, sizes, float(coef))
     return True
