@@ -37,6 +37,12 @@ import torch.nn.functional as F
 from src.models.norms import RMSNorm
 from src.models.tp_model._primitives import _TP_GROUP, get_tp_rank, get_tp_world_size
 
+# Triton-fused path: replaces the 5+ PyTorch ops below with 2 kernels
+# + a softmax (see src/models/ops/attn_res_triton.py for the kernel
+# design + autograd Function). Fallback to the PyTorch reference
+# happens inside ``fused_attn_res_forward`` on any failure.
+from src.models.ops.attn_res_triton import fused_attn_res_forward
+
 
 class _AllGatherAlongHeadDim(torch.autograd.Function):
     """Autograd-aware all-gather along the head dim for BlockAttnRes.
@@ -242,37 +248,47 @@ class BlockAttnRes(nn.Module):
             ``world > 1`` the head dim is all-gathered across the
             TP group.
         """
-        V = torch.stack(blocks, dim=0)  # [N, B, T, D]
+        V = torch.stack(blocks, dim=0).contiguous()  # [N, B, T, D]
         N, B, T, D = V.shape
 
-        # Normalise keys (full hidden, then slice).
-        K = self.norm(V)  # [N, B, T, D]
-        # Reshape to per-head: [N, B, T, H, D_h].
-        K = K.view(N, B, T, self.num_heads, self.head_dim)
-        V_h = V.view(N, B, T, self.num_heads, self.head_dim)
-
-        # TP slice: this rank's heads.
+        # TP slice for the weighted sum: rank r owns heads
+        # [r*hpp, (r+1)*hpp) of the head dim. We slice BEFORE the
+        # kernel call so kernel 2 only reads this rank's slice (HBM
+        # savings at TP>1; no-op at TP=1 since hpp == num_heads).
+        # For the norm we use the full V so the per-row statistics
+        # match the reference (norm is over the full hidden, not
+        # the per-rank slice).
         start = self.rank * self.hpp
-        K_local = K[..., start:start + self.hpp, :].contiguous()  # [N, B, T, hpp, D_h]
-        V_local = V_h[..., start:start + self.hpp, :].contiguous()  # [N, B, T, hpp, D_h]
+        V_local = V[..., start * self.head_dim:(start + self.hpp) * self.head_dim]
+        V_local = V_local.contiguous()  # [N, B, T, hpp * D_h]
+        V_local_per_head = V_local.view(N, B, T, self.hpp, self.head_dim)
 
-        # Attention logits per head: w_l[h, :] @ K[..., h, :]
-        # query: [hpp, D_h], K_local: [N, B, T, hpp, D_h]
-        # -> logits: [N, B, T, hpp]
-        logits = torch.einsum("hd,nbthd->nbth", self.query, K_local)
-        weights = F.softmax(logits, dim=0)  # softmax over N (block depth)
+        # Triton-fused compute (2 kernels + softmax). Falls back to
+        # the PyTorch reference path on any failure — see
+        # src/models/ops/attn_res_triton.py.
+        query = self.query  # [hpp, D_h] — already sliced to local heads
+        norm_weight = self.norm.weight  # [D] — full hidden
+        out_per_head = fused_attn_res_forward(
+            V,                  # [N, B, T, D] — full, for norm
+            V_local_per_head,   # [N, B, T, hpp, D_h] — sliced, for weighted sum
+            query,
+            norm_weight,
+            eps=self.norm.eps,
+            # Pass the slice start so the autograd Function can
+            # rebuild a view of V_full_g covering the same TP-local
+            # slice during backward. At TP=1 the auto-detect works
+            # too, but passing it explicitly is robust to contig()
+            # copies under TP>1.
+            slice_start=start * self.head_dim,
+        )  # [B, T, hpp, D_h]
 
-        # Per-head weighted sum: out[b, t, h, :] = sum_n weights[n, b, t, h] * V_local[n, b, t, h, :]
-        # weights: [N, B, T, hpp], V_local: [N, B, T, hpp, D_h]
-        # -> out: [B, T, hpp, D_h]
-        out = torch.einsum("nbth,nbthd->bthd", weights, V_local)
         # Flatten heads: [B, T, hpp * D_h] (a slice of full hidden).
-        out = out.reshape(B, T, self.hpp * self.head_dim)
+        out = out_per_head.reshape(B, T, self.hpp * self.head_dim)
 
         # All-gather across the head dim to restore the full
-        # residual. The wrapper is autograd-aware: backward
-        # slices the upstream gradient to the local head slice,
-        # which is what the pseudo-query's gradient needs.
+        # residual. The wrapper is autograd-aware: backward slices
+        # the upstream gradient to the local head slice, which is
+        # what the pseudo-query's gradient needs.
         out = _all_gather_along_head_dim(
             out, self.world, self.rank, self.hpp, self.head_dim,
         )
