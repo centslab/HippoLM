@@ -104,7 +104,7 @@ def test_fused_forward_matches_reference(N, B, T, H, D_h):
     norm_weight = torch.ones(D, dtype=torch.bfloat16, device=device)
 
     ref_out = _reference_compute(V_full, V_local, query, norm_weight)
-    fused_out = fused_attn_res_compute(V_full, V_local, query, norm_weight)
+    fused_out, _, _ = fused_attn_res_compute(V_full, V_local, query, norm_weight)
 
     assert fused_out.shape == ref_out.shape, (
         f"shape mismatch: {fused_out.shape} vs {ref_out.shape}"
@@ -178,18 +178,19 @@ def test_fused_forward_via_module_matches_reference(N, B, T, H, D_h):
 
 
 @pytest.mark.parametrize("N, B, T, H, D_h", [
-    (4, 1, 256, 8, 32),    # small enough that bwd cost is small
-    (8, 1, 1024, 12, 64),  # medium
+    (4, 1, 256, 8, 32),       # small enough that bwd cost is small
+    (8, 1, 1024, 12, 64),     # medium
+    (8, 1, 4096, 12, 128),    # prod-ish (mbs=4096, 8 blocks)
 ])
 def test_fused_backward_matches_reference(N, B, T, H, D_h):
     """Backward gradients on V, query, norm_weight match between
-    Triton-fused forward + PyTorch backward (via the autograd
+    Triton-fused forward + Triton backward (via the autograd
     Function) and the pure-PyTorch reference.
 
-    The autograd Function's backward re-runs the reference math in
-    ``torch.enable_grad()`` and uses PyTorch autograd to compute the
-    gradients. This test verifies the integration doesn't break the
-    gradient flow.
+    The autograd Function's backward runs two Triton kernels
+    (dv/dqw → dq/dw) adapted from FLA's attnres_bwd. This test
+    verifies the integration against the PyTorch reference path
+    (re-run under ``torch.enable_grad()``) within BF16 noise.
     """
     if not is_available():
         pytest.skip("Triton fused path not available")
@@ -382,7 +383,7 @@ def test_triton_path_handles_extreme_inputs():
     norm_weight = torch.ones(D, dtype=torch.bfloat16, device=device)
 
     ref_out = _reference_compute(V_full, V_local, query, norm_weight)
-    fused_out = fused_attn_res_compute(V_full, V_local, query, norm_weight)
+    fused_out, _, _ = fused_attn_res_compute(V_full, V_local, query, norm_weight)
 
     max_abs = (fused_out - ref_out).abs().max().item()
     max_rel = max_abs / (ref_out.abs().max().item() + 1e-9)
