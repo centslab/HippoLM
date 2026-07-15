@@ -1007,13 +1007,53 @@ def fused_adam_step_bf16(
     size ``m_list[i].numel()``. The Python side chunks it for
     H2D + GPU ``add_`` apply.
 
+    The C++ kernel is **BF16-only**: it reinterprets the m/v
+    storage as ``uint16_t`` and promotes to FP32 via shift-left-16
+    (BF16's "upper 16 bits of FP32" bit layout). Calling it with
+    FP16 or FP32 tensors silently corrupts the storage — FP16
+    isn't the upper half of FP32, and FP32 has 4 bytes per
+    element where the kernel only reads/writes 2 bytes (the
+    upper 16 bits are lost). When the dtypes don't all match
+    BF16 we fall back to a per-param Python loop that does the
+    promote-cast-narrow correctly. Production (``base.yml``) is
+    BF16 for both ``adamw_m`` and ``adamw_v`` so the fallback
+    only fires on non-prod precision tests.
+
     Returns True if the fused path was used, False if the
-    per-param Python-loop fallback was used (only when the JIT
-    extension failed to compile).
+    per-param Python-loop fallback was used (when JIT is missing
+    OR when the dtype is non-BF16).
     """
     if not m_list:
         return True
     assert len(m_list) == len(v_list) == len(factor_list) == len(step_list)
+    # BF16-only correctness guard (see docstring). Without this
+    # dispatch, FP32 m/v storage would get its low 16 bits
+    # reinterpreted as BF16 and written back — silently
+    # corrupting every parameter and producing NaN when the
+    # truncated exponent pattern is invalid. Test cases that
+    # exercise non-BF16 ``adamw_m`` / ``adamw_v`` would mask a
+    # real bug, so they go through the dtype-correct fallback.
+    all_bf16 = (
+        all(m.dtype == torch.bfloat16 for m in m_list)
+        and all(v.dtype == torch.bfloat16 for v in v_list)
+    )
+    if not all_bf16:
+        one_minus_beta2 = 1.0 - beta2
+        for m, v, factor, step in zip(m_list, v_list, factor_list, step_list):
+            bc2 = 1.0 - beta2 ** step
+            inv_bc2 = 1.0 / bc2
+            m_fp32 = m.float()
+            v_fp32 = v.float()
+            v_new = beta2 * v_fp32 + one_minus_beta2 * m_fp32 * m_fp32
+            # Write the new v back at its native dtype (BF16 /
+            # FP16 / FP32 — whatever the precision config asks
+            # for). The old `v.copy_(v_new.to(torch.bfloat16))`
+            # assumed BF16 storage; we now narrow to v's own
+            # dtype so FP16/FP32 storage survives the round-trip.
+            v.copy_(v_new.to(v.dtype))
+            denom = (v_new * inv_bc2).sqrt_().add_(eps)
+            factor.copy_((m_fp32 / denom))
+        return False
     ext = _try_load_ext()
     if ext is None:
         one_minus_beta2 = 1.0 - beta2
