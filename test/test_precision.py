@@ -12,8 +12,8 @@ model tests because model code iterates too fast). Covers:
     precision ``muon_momentum`` dtypes (bf16 / fp16 / fp32).
   - End-to-end ``step()`` runs on a tiny model for every
     precision combination (the early-return guard on
-    ``s.m.abs().sum() == 0`` for AdamW / ``s.mom_buf.abs().sum() == 0``
-    for Muon masks dtype bugs that would only show up when the
+    ``s.grad.abs().sum() == 0`` for both AdamW and Muon
+    masks dtype bugs that would only show up when the
     algorithm actually runs).
   - Parity: same RNG seed + same precision → same result.
     Catches any unexpected fp-cast that breaks
@@ -224,8 +224,9 @@ def test_precision_config_to_dict_round_trips_activations():
 # --------------------------------------------------------------------------- #
 def _small_linear() -> nn.Linear:
     """A tiny 2D-weight + 1D-bias module: exercises both
-    ``m`` (2D weight) and ``v`` (2D weight) plus the 1D-bias
-    AdamW path.
+    ``grad`` (per-step accumulator, 2D weight) and
+    ``exp_avg`` / ``exp_avg_sq`` (EMAs, 2D weight) plus the
+    1D-bias AdamW path.
     """
     torch.manual_seed(0)
     return nn.Linear(8, 8)
@@ -236,15 +237,17 @@ def test_adamw_default_storage_is_bf16():
     lin = _small_linear()
     opt = CPUAdamW(list(lin.parameters()))
     s = next(iter(opt.state.values()))
-    assert s.m.dtype == torch.bfloat16
+    assert s.grad.dtype == torch.bfloat16
+    assert s.exp_avg.dtype == torch.bfloat16
     assert s.exp_avg_sq.dtype == torch.bfloat16
 
 
 def test_adamw_storage_matches_precision_config():
     """Each tensor's dtype follows the corresponding entry in
-    the precision config: m ← adamw_m, v ← adamw_v.
-    There is no separate accum tensor in the merged-accumulator
-    design — ``m`` doubles as the accumulator.
+    the precision config:
+      - ``s.grad``     ← ``adamw_m`` (per-step accumulator)
+      - ``s.exp_avg``  ← ``adamw_m`` (β1 EMA)
+      - ``s.exp_avg_sq`` ← ``adamw_v`` (β2 EMA)
     """
     lin = _small_linear()
     opt = CPUAdamW(list(lin.parameters()), precision=PrecisionConfig(
@@ -252,7 +255,8 @@ def test_adamw_storage_matches_precision_config():
         adamw_v=TensorPrecision(dtype=DType.FP16),
     ))
     s = next(iter(opt.state.values()))
-    assert s.m.dtype == torch.float32
+    assert s.grad.dtype == torch.float32
+    assert s.exp_avg.dtype == torch.float32
     assert s.exp_avg_sq.dtype == torch.float16
 
 
@@ -272,14 +276,16 @@ def _muon_param() -> nn.Parameter:
 ])
 def test_muon_floating_momentum_uses_full_precision_storage(mom_dtype, torch_dt):
     """``muon_momentum: { dtype: bf16/fp16/fp32 }`` is honored:
-    the momentum buffer is allocated in the configured dtype
-    and there is no scale tensor (no quantization)."""
+    both the per-step grad accumulator (``s.grad``) and the
+    SGD momentum (``s.exp_avg``) are allocated in the configured
+    dtype. There is no scale tensor (no quantization)."""
     p = _muon_param()
     opt = CPUMuon([p], precision=PrecisionConfig(
         muon_momentum=TensorPrecision(dtype=mom_dtype),
     ))
     s = next(iter(opt.state.values()))
-    assert s.mom_buf.dtype == torch_dt
+    assert s.grad.dtype == torch_dt
+    assert s.exp_avg.dtype == torch_dt
 
 
 # --------------------------------------------------------------------------- #
@@ -326,10 +332,10 @@ def test_adamw_step_runs_for_all_canonical_precisions():
 
 def test_adamw_parity_default_and_explicit_bf16():
     """``CPUAdamW(precision=None)`` and
-    ``CPUAdamW(precision=PrecisionConfig(m=BF16, v=BF16))``
-    must give bit-identical results with the same RNG seed.
-    Catches any "default vs explicit" divergence in the
-    dtype resolution path.
+    ``CPUAdamW(precision=PrecisionConfig(adamw_m=BF16,
+    adamw_v=BF16))`` must give bit-identical results with the
+    same RNG seed. Catches any "default vs explicit"
+    divergence in the dtype resolution path.
     """
     torch.manual_seed(0)
     lin_a = nn.Linear(8, 8)
@@ -382,10 +388,10 @@ def test_muon_step_runs_for_all_floating_storage_paths(mom_dtype):
 # --------------------------------------------------------------------------- #
 def test_accumulate_grads_casts_to_accumulator_dtype():
     """The cast target on the GPU is the accumulator's storage
-    dtype (``s.m.dtype`` for AdamW — the ``gradients`` precision
-    config no longer governs the cast target). This is the
-    PCIe-bandwidth-critical path: a wrong cast inflates the
-    transfer size 2x.
+    dtype (``s.grad.dtype`` for AdamW — the ``gradients``
+    precision config no longer governs the cast target). This
+    is the PCIe-bandwidth-critical path: a wrong cast inflates
+    the transfer size 2x.
     """
     torch.manual_seed(0)
     lin = nn.Linear(8, 8)
@@ -395,11 +401,11 @@ def test_accumulate_grads_casts_to_accumulator_dtype():
     for p in lin.parameters():
         p.grad = torch.randn_like(p) * 0.01
     accumulate_grads_to_cpu([opt])
-    # Every state's ``m`` (which is also the accumulator) should
+    # Every state's ``s.grad`` (per-step accumulator) should
     # now contain nonzero data in the configured dtype (FP32).
     for s in opt.state.values():
-        assert s.m.dtype == torch.float32
-        assert s.m.abs().sum() > 0
+        assert s.grad.dtype == torch.float32
+        assert s.grad.abs().sum() > 0
 
 
 # --------------------------------------------------------------------------- #

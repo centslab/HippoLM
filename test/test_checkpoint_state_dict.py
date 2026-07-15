@@ -82,16 +82,20 @@ def _populate_state(model, adamw, muon, seed: int = 1) -> None:
     for p in model.parameters():
         p.grad = torch.randn(p.shape, generator=g, dtype=p.dtype) * 1e-3
     for s in adamw.state.values():
-        s.m.add_(s.param.grad.detach().to("cpu").reshape(-1))
+        # Post-2026-07-15: ``s.grad`` is the per-step
+        # accumulator (was ``s.m`` in the merged-accumulator
+        # design).
+        s.grad.add_(s.param.grad.detach().to("cpu").reshape(-1))
         s.step = 3
-    # Muon (merged-accumulator design — quantized storage
-    # removed 2026-07-12): ``s.mom_buf`` doubles as the
-    # accumulator. There is no separate ``s.accum`` /
-    # ``s.mom_scale``; the per-mb grad is added directly
-    # to ``mom_buf`` in its storage dtype.
+    # Muon: post-2026-07-15 explicit-accumulator layout —
+    # ``s.grad`` is the per-step accumulator, ``s.exp_avg``
+    # is the SGD momentum (zero at this point, preserved
+    # across steps). Quantized storage (int8 / mxfp8) was
+    # removed 2026-07-12; only full-precision bf16 / fp16 /
+    # fp32 storage remains.
     for s in muon.state.values():
-        s.mom_buf.add_(
-            s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1)
+        s.grad.add_(
+            s.param.grad.detach().to(s.grad.dtype).reshape(-1)
         )
         s.step = 7
 
@@ -109,7 +113,11 @@ def test_adamw_state_dict_contains_hyperparams_and_per_param_state(adamw_opt):
     for entry in sd["state"]:
         assert entry["kind"] == "adamw"
         assert entry["step"] == 0
-        assert entry["m"] is not None
+        # Post-2026-07-15: state_dict keys are ``grad``,
+        # ``exp_avg``, ``exp_avg_sq`` (the merged-accumulator
+        # key ``m`` was deleted along with the merged design).
+        assert entry["grad"] is not None
+        assert entry["exp_avg"] is not None
         assert entry["exp_avg_sq"] is not None
 
 
@@ -130,7 +138,10 @@ def test_adamw_state_dict_load_state_dict_roundtrip_is_byte_equal(
     assert fresh.beta1 == adamw_opt.beta1
     assert fresh.beta2 == adamw_opt.beta2
     for s_new, s_old in zip(fresh.state.values(), adamw_opt.state.values()):
-        assert torch.equal(s_new.m, s_old.m)
+        # Post-2026-07-15 explicit-accumulator layout: round-trip
+        # the per-step grad accumulator + β1 EMA + β2 EMA.
+        assert torch.equal(s_new.grad, s_old.grad)
+        assert torch.equal(s_new.exp_avg, s_old.exp_avg)
         assert torch.equal(s_new.exp_avg_sq, s_old.exp_avg_sq)
         assert s_new.step == s_old.step
 
@@ -147,7 +158,8 @@ def test_adamw_load_state_dict_rejects_shape_mismatch(tiny_model):
     opt = CPUAdamW(list(tiny_model.parameters()), lr=1e-4)
     bad_state = [
         {"shape": [999, 999], "step": 0, "kind": "adamw",
-         "m": torch.zeros(1), "exp_avg_sq": torch.zeros(1)}
+         "grad": torch.zeros(1), "exp_avg": torch.zeros(1),
+         "exp_avg_sq": torch.zeros(1)}
     ]
     with pytest.raises(ValueError, match="shape mismatch"):
         opt.load_state_dict(
@@ -194,7 +206,11 @@ def test_muon_state_dict_roundtrip_is_byte_equal(tiny_model):
         precision=precision,
     )
     for s in opt.state.values():
-        assert s.mom_buf.dtype == torch.bfloat16
+        # Post-2026-07-15 explicit-accumulator layout: ``s.grad``
+        # (per-step accumulator) and ``s.exp_avg`` (SGD
+        # momentum) share the configured storage dtype.
+        assert s.grad.dtype == torch.bfloat16
+        assert s.exp_avg.dtype == torch.bfloat16
 
     _populate_state(tiny_model, adamw_opt_for(tiny_model), opt, seed=3)
     sd = opt.state_dict()
@@ -206,7 +222,9 @@ def test_muon_state_dict_roundtrip_is_byte_equal(tiny_model):
     )
     fresh.load_state_dict(sd)
     for s_new, s_old in zip(fresh.state.values(), opt.state.values()):
-        assert torch.equal(s_new.mom_buf, s_old.mom_buf)
+        # Round-trip both buffers; both must be byte-equal.
+        assert torch.equal(s_new.grad, s_old.grad)
+        assert torch.equal(s_new.exp_avg, s_old.exp_avg)
         assert s_new.step == s_old.step
 
 
@@ -277,7 +295,14 @@ def test_load_checkpoint_restores_step_loss_and_optimizer_state(
     assert step == 99
     assert loss == 0.5
     for s_new, s_old in zip(adamw2.state.values(), adamw.state.values()):
-        assert torch.equal(s_new.m, s_old.m)
+        # Post-2026-07-15 explicit-accumulator layout: round-trip
+        # all three AdamW per-param buffers (grad + exp_avg +
+        # exp_avg_sq).
+        assert torch.equal(s_new.grad, s_old.grad)
+        assert torch.equal(s_new.exp_avg, s_old.exp_avg)
         assert torch.equal(s_new.exp_avg_sq, s_old.exp_avg_sq)
     for s_new, s_old in zip(muon2.state.values(), muon.state.values()):
-        assert torch.equal(s_new.mom_buf, s_old.mom_buf)
+        # Round-trip the two Muon per-param buffers (grad +
+        # exp_avg).
+        assert torch.equal(s_new.grad, s_old.grad)
+        assert torch.equal(s_new.exp_avg, s_old.exp_avg)

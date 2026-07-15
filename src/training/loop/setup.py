@@ -442,41 +442,54 @@ def _setup_worker(
     # line below (and any future debugger) can see the components
     # separately.
     #
-    # Accumulator layout: AdamW uses ``s.m`` (BF16) as both the
-    # grad accumulator and the first moment — no separate
-    # ``accum`` buffer. Muon uses the merged-accumulator design
-    # for every supported storage dtype (``s.mom_buf`` doubles
-    # as the accumulator; no separate ``accum``, no scale
-    # tensor). Quantized storage formats (int8 per-row BF16
-    # scale, mxfp8 per-block E8M0 scale) were removed on
-    # 2026-07-12 after long-training runs showed
-    # quantization-error accumulation destabilizing
-    # optimization. See ``docs/optimizer_layout.md`` for the
-    # post-removal layout.
+    # Post-2026-07-15 layout (mu=1 merged-accumulator trick was
+    # deleted; the grad accumulator and the optimizer's momentum
+    # state are now separate buffers):
+    #
+    #   AdamW per param: ``s.grad`` (per-step accumulator,
+    #                     dtype = adamw_m),
+    #                     ``s.exp_avg`` (β1 EMA, dtype = adamw_m),
+    #                     ``s.exp_avg_sq`` (β2 EMA, dtype = adamw_v).
+    #   Muon per param:  ``s.grad`` (per-step accumulator),
+    #                     ``s.exp_avg`` (SGD momentum).
+    #                     Both share ``precision.muon_momentum``
+    #                     dtype (bf16 / fp16 / fp32).
+    #
+    # Quantized storage formats (int8 per-row BF16 scale, mxfp8
+    # per-block E8M0 scale) were removed on 2026-07-12 after
+    # long-training runs showed quantization-error accumulation
+    # destabilizing optimization. See
+    # ``docs/optimizer_layout.md`` for the post-removal layout.
+    adamw_m_dtype_t = precision.adamw_m.dtype.to_torch()
+    adamw_v_dtype_t = precision.adamw_v.dtype.to_torch()
+    adamw_m_bytes = n_adamw * adamw_m_dtype_t.itemsize
+    adamw_exp_avg_bytes = n_adamw * adamw_m_dtype_t.itemsize
+    adamw_v_bytes = n_adamw * adamw_v_dtype_t.itemsize
     muon_states = list(muon_opt.state.values())
     if muon_states:
-        muon_mom_dtype = muon_states[0].mom_buf.dtype
-        muon_mom_bytes_per_elt = muon_mom_dtype.itemsize
+        muon_storage_dtype = muon_states[0].grad.dtype
+        muon_bytes_per_elt = muon_storage_dtype.itemsize * 2  # grad + exp_avg
     else:
-        muon_mom_dtype = torch.bfloat16
-        muon_mom_bytes_per_elt = 2
-    muon_mom = n_muon * muon_mom_bytes_per_elt
-    adamw_m = n_adamw * 2
-    adamw_v = n_adamw * 2
-    muon_bytes = muon_mom
-    adamw_bytes = adamw_m + adamw_v
-    muon_mom_label = (
-        f"{str(muon_mom_dtype).replace('torch.', '')}_mom"
+        muon_storage_dtype = torch.bfloat16
+        muon_bytes_per_elt = 4  # BF16 × 2 buffers
+    muon_bytes = n_muon * muon_bytes_per_elt
+    adamw_bytes = adamw_m_bytes + adamw_exp_avg_bytes + adamw_v_bytes
+    muon_label = (
+        f"{str(muon_storage_dtype).replace('torch.', '')}_m+ema"
     )
-    accum_note = "merged-accumulator (mom_buf doubles as accumulator)"
+    accum_note = (
+        "grad accumulator + EMA moments (post-2026-07-15 "
+        "explicit-accumulator layout)"
+    )
     logger.info(
         f"Device {gpus[rank]}: Muon params={n_muon:,}"
         f" ({muon_bytes / 1024**3:.2f} GB total:"
-        f" {muon_mom_label}={muon_mom / 1024**3:.3f} GB),"
+        f" {muon_label}={muon_bytes / 1024**3:.3f} GB),"
         f" AdamW params={n_adamw:,}"
         f" ({adamw_bytes / 1024**3:.2f} GB total:"
-        f" bf16_m={adamw_m / 1024**3:.3f} GB"
-        f" + bf16_v={adamw_v / 1024**3:.3f} GB)"
+        f" bf16_grad={adamw_m_bytes / 1024**3:.3f} GB"
+        f" + bf16_exp_avg={adamw_exp_avg_bytes / 1024**3:.3f} GB"
+        f" + bf16_exp_avg_sq={adamw_v_bytes / 1024**3:.3f} GB)"
         f" [{accum_note}]."
     )
 

@@ -88,32 +88,32 @@ def log_pre_step_diag(
     """Emit the pre-optimizer-step diagnostic.
 
     For each optimizer we report the max abs of the cycle's
-    grad accumulator (``m`` for AdamW; ``mom_buf`` for Muon —
-    merged-accumulator design, the only supported layout since
-    int8/mxfp8 removal on 2026-07-12), the max abs of the
-    remaining optimizer-internal state (only ``exp_avg_sq`` for
-    AdamW; Muon has no separate internal state at this point
-    — ``mom_buf`` is populated at step end, not read here),
-    and the max abs of the param. Combined with ``total_norm``
-    this is enough to localize the source of an explosion to a
-    specific optimizer (muon vs adamw) and stage (grad vs
-    state vs param).
+    per-step grad accumulator (``s.grad`` for both AdamW and
+    Muon — the post-2026-07-15 explicit-accumulator layout),
+    the max abs of the optimizer's momentum state (AdamW's
+    ``exp_avg`` / ``exp_avg_sq``; Muon's ``exp_avg``), and the
+    max abs of the param. Combined with ``total_norm`` this is
+    enough to localize the source of an explosion to a specific
+    optimizer (muon vs adamw) and stage (grad vs state vs param).
     """
-    # For Muon the accumulator is ``s.mom_buf`` (merged
-    # design — no separate ``accum`` since the int8/mxfp8
-    # paths were removed 2026-07-12).
-    def muon_accum_max(state: Dict[int, OptimizerState]) -> float:
+    # Post-2026-07-15: ``s.grad`` is the per-step accumulator
+    # for both AdamW and Muon (the merged-accumulator design
+    # where ``s.m`` / ``s.mom_buf`` doubled as the accumulator
+    # was deleted).
+    def muon_grad_max(state: Dict[int, OptimizerState]) -> float:
         if not state:
             return 0.0
-        vals = [amax_cpu(s.mom_buf) for s in state.values()]
+        vals = [amax_cpu(s.grad) for s in state.values()]
         return max(vals)
 
     logger.info(
         f"  [diag-step {step} pre]"
         f" total_norm={total_norm:.3e}"
-        f" muon: mom_max={muon_accum_max(muon_state):.3e}"
+        f" muon: grad_max={muon_grad_max(muon_state):.3e}"
+        f" exp_avg_max={_max_over_states(muon_state, 'exp_avg'):.3e}"
         f" pmax={_max_over_states(muon_state, 'param'):.3e}"
-        f" | adamw: m_max={_max_over_states(adamw_state, 'm'):.3e}"
+        f" | adamw: grad_max={_max_over_states(adamw_state, 'grad'):.3e}"
+        f" exp_avg_max={_max_over_states(adamw_state, 'exp_avg'):.3e}"
         f" v_max={_max_over_states(adamw_state, 'exp_avg_sq'):.3e}"
         f" pmax={_max_over_states(adamw_state, 'param'):.3e}"
     )

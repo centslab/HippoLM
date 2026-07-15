@@ -58,6 +58,15 @@ mxfp8 storage format. After mxfp8 storage was removed
 plain ``.add_()`` entries: every per-mb grad is folded into
 its accumulator with a CPU tensor add. The pre-removal code
 lives on the ``archive/int8-mxfp8-muon`` branch.
+
+On 2026-07-15 the "merged-accumulator" / mu=1 trick was
+deleted: the per-mb grad now folds into ``s.grad`` (a dedicated
+BF16 pinned accumulator) instead of ``s.m`` / ``s.mom_buf``,
+which are gone. The optimizer's momentum state (β1 EMA for
+AdamW, SGD momentum for Muon) lives in ``s.exp_avg`` and is
+updated in place by ``step()``. See
+:mod:`src.training.param_offload._state` for the new field
+layout and the rationale.
 """
 from __future__ import annotations
 
@@ -74,9 +83,9 @@ from .cpu_fused import fused_add_into_many, fused_zero_many
 
 # Module-level queue for in-flight D2H transfers issued by the
 # hooks. Each entry is ``(target_tensor, src_cpu)`` — ``src_cpu``
-# is added in place into ``target_tensor`` (``s.m`` for AdamW
-# or ``s.mom_buf`` for Muon; both are floating dtypes, so a
-# plain ``.add_()`` is the right op).
+# is added in place into ``target_tensor`` (``s.grad`` for both
+# AdamW and Muon, post-2026-07-15; both are floating dtypes, so
+# a plain ``.add_()`` is the right op).
 #
 # In sync mode (no async worker started — tests / manual path)
 # :func:`flush_pending_grads` drains this list. In async mode
@@ -383,8 +392,9 @@ def _make_nvfp4_offload_cb(
     backward via :meth:`NVFP4Linear._stash_grad_w`.
 
     The closure is single-purpose: it captures ``target`` (the
-    CPU accumulator, e.g. ``s.mom_buf`` for Muon) and the cast
-    dtype, and pulls ``grad_w`` from the backward call.
+    CPU accumulator, ``s.grad`` for both AdamW and Muon
+    post-2026-07-15) and the cast dtype, and pulls ``grad_w``
+    from the backward call.
 
     Idempotent w.r.t. the async worker: each call enqueues one
     entry; the worker drains in FIFO order with per-entry
@@ -462,8 +472,9 @@ def register_grad_offload_hooks(
     clear is the source of truth.
 
     The cast target follows the accumulator's storage dtype
-    (``s.m.dtype`` for AdamW, ``s.mom_buf.dtype`` for Muon).
-    See :func:`_accumulator_target` for the resolution rules.
+    (``s.grad.dtype`` for both AdamW and Muon,
+    post-2026-07-15). See :func:`_accumulator_target` for the
+    resolution rules.
 
     ``manual_flush_params`` (optional): list of params whose
     grad arrives via a custom autograd Function that fires
@@ -704,9 +715,11 @@ def accumulate_grads_to_cpu(
     hooks via :func:`register_grad_offload_hooks`). The training
     loop uses the streaming path.
 
-    The accumulator is ``s.m`` (AdamW) or ``s.mom_buf`` (Muon).
-    The cast target follows the accumulator's dtype — see
-    :func:`_accumulator_target`.
+    The accumulator is ``s.grad`` for both AdamW and Muon
+    (post-2026-07-15; the previous "merged-accumulator" layout
+    where ``s.m`` / ``s.mom_buf`` doubled as the accumulator was
+    deleted). The cast target follows the accumulator's dtype —
+    see :func:`_accumulator_target`.
 
     The async ``.to("cpu")`` is issued first (with a flattened
     view of the grad, so the resulting ``src_cpu`` matches the
@@ -749,10 +762,13 @@ def accumulate_grads_to_cpu(
                 # grad_w is stashed (either by legacy path or
                 # by the callback's worker-not-running fallback).
                 # Process it here.
-                # The merged-accumulator design (post-2026-07-12)
-                # applies to both mode-3 and mode-0: a single
-                # ``.add_()`` folds the microbatch grad into
-                # either ``s.m`` (AdamW) or ``s.mom_buf`` (Muon).
+                # Post-2026-07-15 explicit-accumulator layout:
+                # a single ``.add_()`` folds the microbatch grad
+                # into ``s.grad`` (both AdamW and Muon — the
+                # "merged-accumulator" design where ``s.m`` /
+                # ``s.mom_buf`` doubled as the accumulator was
+                # deleted; ``s.exp_avg`` is the optimizer's
+                # momentum state, updated in place by ``step()``).
                 target, cast_dtype = _accumulator_target(s)
                 src_cpu = (
                     grad_w.detach()
@@ -807,30 +823,35 @@ def accumulate_grads_to_cpu(
 
 
 def zero_cpu_grad_accum(optimizers: List) -> None:
-    """Reset CPU accumulators (call this AFTER step() to start the
-    next accumulation cycle).
+    """Reset the per-step CPU grad accumulators (call this AFTER
+    step() to start the next accumulation cycle, or when
+    ``found_inf`` is detected and the optimizers are NOT
+    stepped — we still want to clear the accumulated grads
+    before the next cycle).
 
-    For AdamW, zero ``s.m`` (the merged accumulator + first
-    moment). For Muon, zero ``s.mom_buf`` (the merged
+    For both AdamW and Muon, zero ``s.grad`` (the per-step
     accumulator). The optimizer's own ``step()`` already zeros
-    the accumulator it consumes; this function is a defensive
-    zero for the case where ``found_inf`` is detected and the
-    optimizers are NOT stepped — we still want to clear the
-    accumulated grads before the next cycle.
+    ``s.grad`` for the entries it consumes; this function is a
+    defensive sweep for the cycle that wasn't stepped.
 
-    All collected ``s.m`` / ``s.mom_buf`` tensors are zeroed in
-    ONE fused OpenMP call (DeepSpeed CPUAdam-style) instead of
-    N separate Python ``.zero_()`` calls — same win as
-    :mod:`.cpu_fused` brings to v4's per-layer worker and to
+    All collected ``s.grad`` tensors are zeroed in ONE fused
+    OpenMP call (DeepSpeed CPUAdam-style) instead of N separate
+    Python ``.zero_()`` calls — same win as :mod:`.cpu_fused`
+    brings to v4's per-layer worker and to
     :meth:`CPUMuon.step`'s end-of-cycle housekeeping.
+
+    Note: this function does NOT touch ``s.exp_avg`` /
+    ``s.exp_avg_sq`` — those are the optimizer's EMA / momentum
+    state and are preserved across steps. Only the per-step
+    ``s.grad`` accumulator is reset here.
     """
     bufs: list = []
     for opt in optimizers:
         for s in opt.state.values():
-            if s.kind == "adamw":
-                bufs.append(s.m)
-            else:
-                # Muon (and nvfp4 variants): merged-accumulator
-                # design — zero ``mom_buf`` for the next cycle.
-                bufs.append(s.mom_buf)
+            # Post-2026-07-15 explicit-accumulator layout:
+            # ``s.grad`` is the per-step accumulator for both
+            # AdamW and Muon. The optimizer's momentum state
+            # (``s.exp_avg`` / ``s.exp_avg_sq``) is NOT reset
+            # here — only ``s.grad``.
+            bufs.append(s.grad)
     fused_zero_many(bufs)

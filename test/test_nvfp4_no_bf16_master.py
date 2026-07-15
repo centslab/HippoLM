@@ -30,14 +30,18 @@ This test pins that contract end-to-end:
 
   **Optimizer integration**
     - CPUAdamW.register_nvfp4_module adds the module to state
-      (with BF16 pinned m / v) and ``accumulate_grads_to_cpu``
-      flushes ``module._latest_grad_w`` into ``s.m``
+      (with BF16 pinned grad / exp_avg / exp_avg_sq) and
+      ``accumulate_grads_to_cpu`` flushes
+      ``module._latest_grad_w`` into ``s.grad``
     - ``CPUAdamW.step()`` modifies ``module.packed_weight`` and
-      leaves ``s.m`` reset to zero (cycle semantics)
+      leaves ``s.grad`` reset to zero (cycle semantics; the
+      EMA ``s.exp_avg`` / ``s.exp_avg_sq`` are preserved)
     - CPUMuon.register_nvfp4_module adds the module to state
       with the configured storage (BF16 — int8 / mxfp8 muon
-      removed 2026-07-12); after a
-      step the FP4 packed buffers must have changed (no NaN, finite)
+      removed 2026-07-12); after a step the FP4 packed
+      buffers must have changed (no NaN, finite); the
+      per-step ``s.grad`` is reset to zero (the SGD
+      momentum ``s.exp_avg`` is preserved)
 
 Run:
     python -m pytest test/test_nvfp4_no_bf16_master.py -v
@@ -494,8 +498,10 @@ class TestSwiGLUMode3:
 # ===========================================================================
 class TestOptimizerIntegration:
     def test_cpuadamw_register_nvfp4_module(self):
-        """CPUAdamW.register_nvfp4_module allocates BF16 pinned m / v
-        on CPU, keys the state by ``id(module)``, no Parameter."""
+        """CPUAdamW.register_nvfp4_module allocates BF16 pinned
+        grad / exp_avg / exp_avg_sq on CPU (post-2026-07-15
+        explicit-accumulator layout), keys the state by
+        ``id(module)``, no Parameter."""
         from src.models.ops.nvfp4_linear import NVFP4Linear
         from src.training.param_offload import CPUAdamW
         torch.manual_seed(0)
@@ -507,7 +513,10 @@ class TestOptimizerIntegration:
         assert state.param is None
         assert state.nvfp4_module is linear
         assert state.kind == "adamw_nvfp4"
-        assert state.m.dtype == torch.bfloat16
+        # All three AdamW per-param buffers at BF16 on CPU
+        # (post-2026-07-15 explicit-accumulator layout).
+        assert state.grad.dtype == torch.bfloat16
+        assert state.exp_avg.dtype == torch.bfloat16
         assert state.exp_avg_sq.dtype == torch.bfloat16
         assert state.nvfp4_n == 64 * 128
 
@@ -542,18 +551,24 @@ class TestOptimizerIntegration:
         assert not torch.equal(linear.packed_weight, packed_before), (
             "AdamW step did not modify packed_weight"
         )
-        # And the CPU pinned m must have been reset to zero at
-        # step end (cycle semantics).
+        # And the per-step CPU pinned grad accumulator must have
+        # been reset to zero at step end (cycle semantics). The
+        # EMA buffers ``s.exp_avg`` / ``s.exp_avg_sq`` are
+        # preserved across steps (post-2026-07-15 explicit-
+        # accumulator layout).
         state = list(opt.state.values())[0]
-        assert state.m.abs().sum().item() == 0.0, (
-            "AdamW step did not reset s.m to zero (cycle-end)"
+        assert state.grad.abs().sum().item() == 0.0, (
+            "AdamW step did not reset s.grad to zero (cycle-end)"
         )
 
     def test_cpumuon_register_nvfp4_module_bf16(self):
         """CPUMuon with bf16 momentum storage (the simplest path)
-        registers the module with a BF16 pinned ``mom_buf`` (no
-        separate ``accum``, no ``mom_scale`` — merged-accumulator
-        design; int8 / mxfp8 quantization removed 2026-07-12)."""
+        registers the module with BF16 pinned ``grad`` (per-step
+        accumulator) and ``exp_avg`` (SGD momentum). The
+        post-2026-07-15 explicit-accumulator layout splits the
+        old "merged accumulator" (``mom_buf`` doing both jobs)
+        into two separate buffers. Quantized storage
+        (int8 / mxfp8) was removed 2026-07-12."""
         from src.models.ops.nvfp4_linear import NVFP4Linear
         from src.training.param_offload import CPUMuon
         from src.training.precision_config import PrecisionConfig
@@ -571,13 +586,12 @@ class TestOptimizerIntegration:
         assert state.param is None
         assert state.nvfp4_module is linear
         assert state.kind == "muon_nvfp4"
-        assert state.mom_buf.dtype == torch.bfloat16
-        # Merged-accumulator design (int8 / mxfp8 removed
-        # 2026-07-12): the separate ``accum`` / ``mom_scale`` /
-        # ``mxfp8_block_size`` fields were deleted from
-        # ``_ParamState`` along with the quantized storage path;
-        # there's nothing to assert here (their absence is the
-        # contract).
+        # Post-2026-07-15: ``s.grad`` (per-step accumulator) and
+        # ``s.exp_avg`` (SGD momentum) share the configured
+        # storage dtype. The merged-accumulator field
+        # ``s.mom_buf`` is gone.
+        assert state.grad.dtype == torch.bfloat16
+        assert state.exp_avg.dtype == torch.bfloat16
 
     def test_cpumuon_step_updates_fp4_buffers(self):
         """A full CPUMuon step (with bf16 momentum storage) updates
@@ -606,8 +620,11 @@ class TestOptimizerIntegration:
             "Muon step did not modify packed_weight"
         )
         state = list(opt.state.values())[0]
-        # bf16 storage: mom_buf is the accumulator, must be reset.
-        assert state.mom_buf.abs().sum().item() == 0.0
+        # Post-2026-07-15 explicit-accumulator layout: the
+        # per-step accumulator (``s.grad``) must be reset to
+        # zero at step end. ``s.exp_avg`` (SGD momentum) is
+        # preserved across steps.
+        assert state.grad.abs().sum().item() == 0.0
 
 
 # ===========================================================================

@@ -2,21 +2,25 @@
 
 This function:
   1. Walks every optimizer in the ``opts`` list.
-  2. For each per-param state entry, reads the merged-accumulator
-     (AdamW ``s.m`` or Muon ``s.mom_buf``) and adds its L2 squared
-     to a running ``local_sq`` scalar.
-  3. (When in a distributed group) all-reduces ``local_sq`` across
-     the TP world.
+  2. For each per-param state entry, reads the per-step grad
+     accumulator (``s.grad`` for both AdamW and Muon —
+     post-2026-07-15 explicit-accumulator layout; the old
+     "merged-accumulator" design where ``s.m`` / ``s.mom_buf``
+     doubled as the accumulator was deleted) and adds its L2
+     squared to a running ``local_sq`` scalar.
+  3. (When in a distributed group) all-reduces ``local_sq``
+     across the TP world.
   4. Computes ``total_norm = sqrt(local_sq.sum())``.
-  5. If ``total_norm > max_norm``, scales every accumulator in place
-     by ``max_norm / (total_norm + 1e-6)``.
+  5. If ``total_norm > max_norm``, scales every accumulator in
+     place by ``max_norm / (total_norm + 1e-6)``.
 
 The interesting bug history (per the long comment in
 ``src/training/loop.py``): an earlier revision applied an
-unconditional second ``.mul_(max_norm / (total_norm + eps))`` that
-double-clipped when total_norm > max_norm (quadratic) and AMPLIFIED
-when total_norm < max_norm. The current code only clips when the
-norm exceeds the cap. These tests pin that contract.
+unconditional second ``.mul_(max_norm / (total_norm + eps))``
+that double-clipped when total_norm > max_norm (quadratic)
+and AMPLIFIED when total_norm < max_norm. The current code
+only clips when the norm exceeds the cap. These tests pin
+that contract.
 """
 from __future__ import annotations
 
@@ -73,16 +77,20 @@ def muon_opt(tiny_model):
 
 
 def _populate_grads(model, adamw, muon, scale: float) -> None:
-    """Inject deterministic grads into each optimizer's accumulator."""
+    """Inject deterministic grads into each optimizer's per-step
+    accumulator (``s.grad`` for both optimizers, post-2026-07-15
+    explicit-accumulator layout)."""
     g = torch.Generator().manual_seed(1)
     for p in model.parameters():
         p.grad = torch.randn(p.shape, generator=g) * scale
     for s in adamw.state.values():
-        # ``m`` is the merged-accumulator for AdamW.
-        s.m.add_(s.param.grad.detach().to(s.m.dtype).reshape(-1))
+        # ``s.grad`` is the per-step accumulator for AdamW
+        # (was ``s.m`` in the merged-accumulator design).
+        s.grad.add_(s.param.grad.detach().to(s.grad.dtype).reshape(-1))
     for s in muon.state.values():
-        # ``mom_buf`` is the merged-accumulator for Muon.
-        s.mom_buf.add_(s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1))
+        # ``s.grad`` is the per-step accumulator for Muon
+        # (was ``s.mom_buf`` in the merged-accumulator design).
+        s.grad.add_(s.param.grad.detach().to(s.grad.dtype).reshape(-1))
 
 
 # --------------------------------------------------------------------------- #
@@ -91,22 +99,22 @@ def _populate_grads(model, adamw, muon, scale: float) -> None:
 def test_norm_below_cap_does_not_modify_accumulators(
     tiny_model, adamw_opt, muon_opt,
 ):
-    """When the total norm is below ``max_norm``, no accumulator is
-    modified (the precondition that prevents the historical bug of
-    amplifying small grads)."""
+    """When the total norm is below ``max_norm``, no accumulator
+    is modified (the precondition that prevents the historical
+    bug of amplifying small grads)."""
     _populate_grads(tiny_model, adamw_opt, muon_opt, scale=1e-4)
-    adamw_before = {id(s.param): s.m.clone() for s in adamw_opt.state.values()}
-    muon_before = {id(s.param): s.mom_buf.clone() for s in muon_opt.state.values()}
+    adamw_before = {id(s.param): s.grad.clone() for s in adamw_opt.state.values()}
+    muon_before = {id(s.param): s.grad.clone() for s in muon_opt.state.values()}
 
     norm = _compute_and_clip_grad_norm([adamw_opt, muon_opt], max_norm=1e2)
 
     assert norm < 1e2, "expected total norm below cap"
     for s in adamw_opt.state.values():
-        assert torch.equal(s.m, adamw_before[id(s.param)]), (
+        assert torch.equal(s.grad, adamw_before[id(s.param)]), (
             "adamw accumulator was modified despite norm < cap"
         )
     for s in muon_opt.state.values():
-        assert torch.equal(s.mom_buf, muon_before[id(s.param)]), (
+        assert torch.equal(s.grad, muon_before[id(s.param)]), (
             "muon accumulator was modified despite norm < cap"
         )
 
@@ -114,17 +122,19 @@ def test_norm_below_cap_does_not_modify_accumulators(
 def test_norm_above_cap_scales_accumulators_by_clip_coef(
     tiny_model, adamw_opt, muon_opt,
 ):
-    """When total_norm > max_norm, every accumulator must be scaled
-    in place by ``max_norm / total_norm`` (single clip, not quadratic)."""
+    """When total_norm > max_norm, every accumulator must be
+    scaled in place by ``max_norm / total_norm`` (single clip,
+    not quadratic)."""
     _populate_grads(tiny_model, adamw_opt, muon_opt, scale=10.0)
 
-    # Save the PRE-call accumulator values so we can compare against the
-    # POST-call values after the function mutates them in place.
-    adamw_before = {id(s.param): s.m.clone() for s in adamw_opt.state.values()}
-    muon_before = {id(s.param): s.mom_buf.clone() for s in muon_opt.state.values()}
+    # Save the PRE-call accumulator values so we can compare
+    # against the POST-call values after the function mutates
+    # them in place.
+    adamw_before = {id(s.param): s.grad.clone() for s in adamw_opt.state.values()}
+    muon_before = {id(s.param): s.grad.clone() for s in muon_opt.state.values()}
 
-    # Compute expected norm by mirroring the function's math on the
-    # pre-call accumulators.
+    # Compute expected norm by mirroring the function's math on
+    # the pre-call accumulators.
     local_sq = torch.zeros(1)
     for opt in (adamw_opt, muon_opt):
         for s in opt.state.values():
@@ -140,35 +150,36 @@ def test_norm_above_cap_scales_accumulators_by_clip_coef(
 
     clip_coef = max_norm / (expected_norm + 1e-6)
     for s in adamw_opt.state.values():
-        # Compare POST-call s.m against PRE-call adamw_before * clip_coef.
-        # BF16 precision: allow generous atol because the scaled value
-        # can be much smaller than the BF16 mantissa resolution.
+        # Compare POST-call s.grad against PRE-call
+        # adamw_before * clip_coef. BF16 precision: allow
+        # generous atol because the scaled value can be much
+        # smaller than the BF16 mantissa resolution.
         expected = adamw_before[id(s.param)].float() * clip_coef
-        actual = s.m.float()
+        actual = s.grad.float()
         assert torch.allclose(actual, expected, atol=5e-3, rtol=5e-2), (
-            f"adamw m not scaled correctly: ratio"
+            f"adamw grad not scaled correctly: ratio"
             f" {(actual / expected).mean().item()}"
         )
     for s in muon_opt.state.values():
         expected = muon_before[id(s.param)].float() * clip_coef
-        actual = s.mom_buf.float()
+        actual = s.grad.float()
         assert torch.allclose(actual, expected, atol=5e-3, rtol=5e-2), (
-            f"muon mom_buf not scaled correctly"
+            f"muon grad not scaled correctly"
         )
 
 
 def test_zero_max_norm_disables_clipping(tiny_model, adamw_opt, muon_opt):
     """``max_norm=0`` (or negative) disables clipping entirely."""
     _populate_grads(tiny_model, adamw_opt, muon_opt, scale=100.0)
-    adamw_before = {id(s.param): s.m.clone() for s in adamw_opt.state.values()}
-    muon_before = {id(s.param): s.mom_buf.clone() for s in muon_opt.state.values()}
+    adamw_before = {id(s.param): s.grad.clone() for s in adamw_opt.state.values()}
+    muon_before = {id(s.param): s.grad.clone() for s in muon_opt.state.values()}
 
     _compute_and_clip_grad_norm([adamw_opt, muon_opt], max_norm=0.0)
 
     for s in adamw_opt.state.values():
-        assert torch.equal(s.m, adamw_before[id(s.param)])
+        assert torch.equal(s.grad, adamw_before[id(s.param)])
     for s in muon_opt.state.values():
-        assert torch.equal(s.mom_buf, muon_before[id(s.param)])
+        assert torch.equal(s.grad, muon_before[id(s.param)])
 
 
 def test_returns_finite_norm(tiny_model, adamw_opt, muon_opt):
@@ -182,23 +193,25 @@ def test_returns_finite_norm(tiny_model, adamw_opt, muon_opt):
 
 def test_no_clip_applied_twice(tiny_model, adamw_opt, muon_opt):
     """The historical bug: an earlier revision applied a SECOND
-    unconditional ``.mul_(max_norm / (total_norm + eps))`` after
-    the function returned. This test verifies the SINGLE-clip
-    contract: the post-call ratio is exactly ``clip_coef`` (not
-    ``clip_coef**2``)."""
+    unconditional ``.mul_(max_norm / (total_norm + eps))``
+    after the function returned. This test verifies the
+    SINGLE-clip contract: the post-call ratio is exactly
+    ``clip_coef`` (not ``clip_coef**2``)."""
     _populate_grads(tiny_model, adamw_opt, muon_opt, scale=10.0)
-    adamw_before = {id(s.param): s.m.clone() for s in adamw_opt.state.values()}
+    adamw_before = {id(s.param): s.grad.clone() for s in adamw_opt.state.values()}
 
     _compute_and_clip_grad_norm([adamw_opt, muon_opt], max_norm=1.0)
 
     for s in adamw_opt.state.values():
-        # Ratio of post-call to pre-call should be close to clip_coef,
-        # which is small (max_norm / large_total_norm). If the bug were
-        # present, the ratio would be clip_coef**2 (much smaller).
-        ratio = (s.m.float() / adamw_before[id(s.param)].float()).mean().item()
-        # Sanity bounds: ratio is positive (no sign flip) and small
-        # (norm was clipped). The exact value depends on BF16 precision
-        # of the multiplication; we just check the order of magnitude.
+        # Ratio of post-call to pre-call should be close to
+        # clip_coef, which is small (max_norm / large_total_norm).
+        # If the bug were present, the ratio would be clip_coef**2
+        # (much smaller).
+        ratio = (s.grad.float() / adamw_before[id(s.param)].float()).mean().item()
+        # Sanity bounds: ratio is positive (no sign flip) and
+        # small (norm was clipped). The exact value depends on
+        # BF16 precision of the multiplication; we just check
+        # the order of magnitude.
         assert 0.0 < ratio < 1.0, (
             f"adamw ratio outside (0, 1): ratio={ratio}"
         )

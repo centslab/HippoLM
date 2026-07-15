@@ -56,13 +56,18 @@ def _populate(model, adamw, muon, seed: int) -> None:
     for p in model.parameters():
         p.grad = torch.randn(p.shape, generator=g, dtype=p.dtype) * 1e-3
     for s in adamw.state.values():
-        s.m.add_(s.param.grad.detach().to("cpu").reshape(-1))
-    # Muon: merged-accumulator design (int8 / mxfp8 storage
-    # removed 2026-07-12). ``s.mom_buf`` doubles as the
-    # accumulator.
+        # Post-2026-07-15: ``s.grad`` is the per-step
+        # accumulator (was ``s.m`` in the merged-accumulator
+        # design).
+        s.grad.add_(s.param.grad.detach().to("cpu").reshape(-1))
+    # Muon: post-2026-07-15 explicit-accumulator layout —
+    # ``s.grad`` is the per-step accumulator, ``s.exp_avg``
+    # is the SGD momentum (zero here, populated by step()).
+    # Quantized storage (int8 / mxfp8) was removed 2026-07-12;
+    # only full-precision bf16 / fp16 / fp32 storage remains.
     for s in muon.state.values():
-        s.mom_buf.add_(
-                s.param.grad.detach().to(s.mom_buf.dtype).reshape(-1)
+        s.grad.add_(
+                s.param.grad.detach().to(s.grad.dtype).reshape(-1)
             )
 
 

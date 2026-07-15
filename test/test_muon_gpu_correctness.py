@@ -12,17 +12,24 @@ silently producing different (and unverified) updates.
 
 The test pins that contract by running the production step() on one
 copy of a model and an inlined, hand-written GPU reference on a
-second copy, then comparing ``mom_buf`` and the post-step param.
-The reference is reconstructed from the algorithm description
-(NS → apply → recast to storage), so a future change to the
-production step() that changes the math will trip the test even
-if the change is locally consistent.
+second copy, then comparing ``grad`` (per-step accumulator) and
+the post-step param. The reference is reconstructed from the
+algorithm description (CPU-side SGD momentum → Nesterov
+correction → H2D → NS → apply → zero grad), so a future change
+to the production step() that changes the math will trip the
+test even if the change is locally consistent.
 
 Quantized storage (int8 + per-row scale, mxfp8 + per-block E8M0)
 was removed on 2026-07-12 — long-training runs showed
 quantization-error accumulation destabilizing optimization. The
-merged-accumulator design (mom_buf doubles as the accumulator) is
-the only supported muon storage path now.
+explicit-accumulator design (``grad`` + ``exp_avg``, both at
+the configured full-precision storage dtype: bf16 / fp16 /
+fp32) is the only supported muon storage path since
+2026-07-15 (the previous "merged-accumulator" / mu=1 design
+where ``mom_buf`` doubled as both the per-step accumulator and
+the SGD momentum was deleted; ``grad`` is the per-step
+accumulator and ``exp_avg`` is the SGD momentum, with cross-
+step EMA state preserved).
 
 Test layout
 -----------
@@ -32,7 +39,7 @@ Test layout
 - Run production ``CPUMuon.step()`` on A.
 - Run the inline GPU reference on B.
 - Assert the outputs agree within tight thresholds
-  (mom_buf ≤ 5/255 in storage units, param ≤ 5e-3).
+  (grad ≤ 5/255 in storage units after the step, param ≤ 5e-3).
 
 The thresholds match the original (pre-quantization-removal) values;
 tightening any of them would catch a real divergence.
@@ -63,41 +70,62 @@ from src.training.precision_config import PrecisionConfig
 def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
     """Independent GPU reference implementation of the muon step.
 
-    Mirrors the algorithm (NS → apply → recast-to-storage) but inlined
+    Mirrors the algorithm (CPU-side SGD momentum → Nesterov
+    correction → H2D → NS → apply → zero ``s.grad``) but inlined
     with explicit per-tensor operations. The production
-    ``CPUMuon.step()`` is the optimized version of the same math; the
-    inlined version is the "what the math should do" reference that
-    the test compares against.
+    ``CPUMuon.step()`` is the optimized version of the same math;
+    the inlined version is the "what the math should do" reference
+    that the test compares against.
 
-    Storage design (merged-accumulator, 2026-07-12):
-    the per-cycle grad sum lives directly in ``s.mom_buf`` (the
-    configured full-precision storage dtype: bf16 / fp16 / fp32).
-    The step reads ``s.mom_buf``, casts to FP32, orthogonalizes,
-    applies the update, then recasts ``s.mom_buf`` to its storage
-    dtype and zeros it for the next cycle.
+    Storage design (post-2026-07-15 explicit-accumulator layout):
+    two CPU pinned buffers per param, distinct roles:
+
+      * ``s.grad``    — per-step grad accumulator. Zeroed at the
+        end of every step. The test compares this AFTER step
+        (both production and reference must zero it identically).
+      * ``s.exp_avg`` — SGD momentum ``β·prev + grad``, preserved
+        across steps. Computed on CPU at step time, then Nesterov
+        correction + H2D before NS. Never recast back / zeroed
+        during step.
     """
     lr = muon_opt.lr
+    beta = muon_opt.momentum
+    nesterov = muon_opt.nesterov
     wd = muon_opt.weight_decay
     CHUNK_ROWS = CPUMuon._STREAM_CHUNK_ROWS
     for s in muon_opt.state.values():
-        # Merged-accumulator: ``s.mom_buf`` IS the accumulator.
-        if s.mom_buf.abs().sum().item() == 0:
+        # Per-step grad accumulator (post-2026-07-15).
+        g_buf = s.grad
+        if g_buf.abs().sum().item() == 0:
             continue
         shape = s.shape
         rows, cols = shape[0], shape[1]
         device = s.param.device
 
-        # Cast to FP32 for the math (the storage dtype may be
-        # BF16 / FP16 / FP32 — FP32 is the compute precision).
-        m_fp32_gpu = s.mom_buf.to(device, non_blocking=True).float() \
-                                    .view(rows, cols)
+        # ---- SGD momentum on CPU (Keller Jordan Muon ref):
+        # ``exp_avg ← β·exp_avg + grad`` in the storage dtype.
+        # Done on CPU (not GPU) to match the production path;
+        # the storage-dtype round trip is intentional (same as
+        # production).
+        exp_avg = s.exp_avg
+        exp_avg.mul_(beta).add_(g_buf)
+
+        # ---- Nesterov correction on CPU. ----
+        if nesterov:
+            g_for_ns = g_buf.add(exp_avg, alpha=beta)
+        else:
+            g_for_ns = exp_avg
+
+        # ---- H2D + cast to FP32 (NS input is always FP32). ----
+        orth_input = g_for_ns.to(device, non_blocking=True) \
+                                .float().view(rows, cols)
 
         # ---- Decoupled weight decay on the full param. ----
         if wd != 0.0:
             s.param.data.mul_(1.0 - lr * wd)
 
         # ---- Stream NS over rows and apply the update. ----
-        m_fp16 = m_fp32_gpu.to(torch.float16)
+        m_fp16 = orth_input.to(torch.float16)
         for r_start in range(0, rows, CHUNK_ROWS):
             r_end = min(r_start + CHUNK_ROWS, rows)
             m_chunk = m_fp16[r_start:r_end]
@@ -107,14 +135,11 @@ def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
 
         torch.cuda.current_stream(device).synchronize()
 
-        # ---- Step-end: recast mom_buf to storage dtype, reset. ----
-        # The accumulator (in FP32 above) is the *post-NS* momentum;
-        # we recast it back to the storage dtype and zero for the
-        # next cycle, mirroring the production path.
-        s.mom_buf.copy_(
-            m_fp32_gpu.to(s.mom_buf.dtype).view(-1), non_blocking=True
-        )
-        s.mom_buf.zero_()
+        # ---- Step-end: zero the per-step grad accumulator
+        # (production zero happens via ``fused_zero_many`` at the
+        # end of step(); same net effect). ``s.exp_avg`` is
+        # preserved across steps — NOT zeroed here. ----
+        s.grad.zero_()
 
 
 def _build_matched_pair(
@@ -147,12 +172,13 @@ def _build_matched_pair(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_muon_step_gpu_matches_inline_reference():
     """Production ``CPUMuon.step()`` must match the inlined GPU
-    reference implementation on ``mom_buf`` and the post-step param.
+    reference implementation on ``s.grad`` (post-step zeroed),
+    ``s.exp_avg`` (post-step SGD momentum) and the post-step param.
 
     A divergence here means the production step changed its math
-    (likely a refactor of the NS chunking or the storage-dtype
-    boundary). Either is a real regression — the muon update must
-    stay bit-equivalent to the inline reference.
+    (likely a refactor of the NS chunking, the SGD momentum update,
+    or the storage-dtype boundary). Either is a real regression —
+    the muon update must stay bit-equivalent to the inline reference.
     """
     torch.manual_seed(0)
     device = 0
@@ -194,12 +220,16 @@ def test_muon_step_gpu_matches_inline_reference():
             flush_pending_grads(sync_device=device)
 
     # Copy pre-step state from A to B so they start identical. Under
-    # the merged-accumulator design the cycle's grad lives in
-    # ``mom_buf`` (the storage dtype), so that is the only buffer that
-    # needs to match for the two steps to be comparable.
+    # the post-2026-07-15 explicit-accumulator layout both buffers
+    # need to match: ``s.grad`` (the per-step accumulator that feeds
+    # into the SGD momentum update) and ``s.exp_avg`` (the prior
+    # step's SGD momentum that ``exp_avg = β·prev + grad`` reads
+    # from). If either is mismatched the two steps diverge at the
+    # SGD-momentum update before NS even sees the input.
     for s_a, s_b in zip(muon_a.state.values(), muon_b.state.values()):
         assert s_a.param is not s_b.param
-        s_b.mom_buf.copy_(s_a.mom_buf)
+        s_b.grad.copy_(s_a.grad)
+        s_b.exp_avg.copy_(s_a.exp_avg)
         s_b.param.data.copy_(s_a.param.data)
         s_b.step = s_a.step
 
@@ -210,22 +240,50 @@ def test_muon_step_gpu_matches_inline_reference():
     # Compare the post-step outputs.
     failures = []
     for s_a, s_b in zip(muon_a.state.values(), muon_b.state.values()):
-        # mom_buf: storage dtype (BF16 / FP16 / FP32). For FP16/BF16
-        # compare in int16-equivalent units (cast through int16);
-        # for FP32 compare in FP32.
-        if s_a.mom_buf.dtype in (torch.bfloat16, torch.float16):
+        # s.grad: per-step accumulator — must be zeroed by the
+        # end-of-step housekeeping in both paths. The post-step
+        # ``.zero_()`` (or ``fused_zero_many`` in production)
+        # touches only this buffer; ``s.exp_avg`` is preserved.
+        # Compare in int16-equivalent units for FP16/BF16
+        # (5/32767 ≈ 5/255 was the original bound for the
+        # storage-dtype post-step residual); for FP32 use the
+        # matching epsilon.
+        if s_a.grad.dtype in (torch.bfloat16, torch.float16):
             d_q = (
-                s_a.mom_buf.to(torch.int16) - s_b.mom_buf.to(torch.int16)
+                s_a.grad.to(torch.int16) - s_b.grad.to(torch.int16)
             ).abs()
             if int(d_q.max()) > 5:
                 failures.append(
-                    f"mom_buf max diff {int(d_q.max())}/32767 exceeds 5"
+                    f"grad max diff {int(d_q.max())}/32767 exceeds 5 "
+                    f"(step-end zero not identical)"
                 )
         else:
-            d_q = (s_a.mom_buf.float() - s_b.mom_buf.float()).abs()
+            d_q = (s_a.grad.float() - s_b.grad.float()).abs()
             if float(d_q.max()) > 1e-5:
                 failures.append(
-                    f"mom_buf (fp32) max diff {float(d_q.max()):.4e} exceeds 1e-5"
+                    f"grad (fp32) max diff {float(d_q.max()):.4e} "
+                    f"exceeds 1e-5"
+                )
+        # s.exp_avg: SGD momentum, post-step. Both paths compute
+        # ``exp_avg ← β·exp_avg + grad`` then (nesterov) read it
+        # into ``g_for_ns = grad + β·exp_avg``. The buffer itself
+        # is bit-identical between paths iff the in-place update
+        # was identical — this catches any divergence in the
+        # momentum math (storage-dtype rounding, beta, etc.).
+        if s_a.exp_avg.dtype in (torch.bfloat16, torch.float16):
+            d_m = (
+                s_a.exp_avg.to(torch.int16) - s_b.exp_avg.to(torch.int16)
+            ).abs()
+            if int(d_m.max()) > 5:
+                failures.append(
+                    f"exp_avg max diff {int(d_m.max())}/32767 exceeds 5"
+                )
+        else:
+            d_m = (s_a.exp_avg.float() - s_b.exp_avg.float()).abs()
+            if float(d_m.max()) > 1e-5:
+                failures.append(
+                    f"exp_avg (fp32) max diff {float(d_m.max()):.4e} "
+                    f"exceeds 1e-5"
                 )
         # param.data: FP16, compare in FP32
         d_p = (s_a.param.data.float() - s_b.param.data.float()).abs()

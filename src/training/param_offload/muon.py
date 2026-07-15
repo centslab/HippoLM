@@ -28,29 +28,46 @@ from .offload import _make_nvfp4_offload_cb
 
 
 class CPUMuon:
-    """Muon with configurable momentum storage on CPU pinned memory.
+    """Muon with CPU-side ``grad`` (per-step accumulator) and
+    ``exp_avg`` (SGD momentum — preserved across steps).
+    Params live on the GPU; grads are streamed to CPU by the
+    post-accumulate-grad hook (see :func:`register_grad_offload_hooks`)
+    or by the manual :func:`accumulate_grads_to_cpu` path.
 
-    State per param:
-        CPU pinned: mom_buf (cfg dtype, numel)
+    Memory layout per trainable param:
+        CPU pinned: grad (cfg dtype, numel),
+                    exp_avg (cfg dtype, numel)
         GPU:         param (FP16), .grad (transient)
 
-    Merged-accumulator design: ``mom_buf`` doubles as the
-    grad accumulator (mu=1 accumulation — each microbatch's grad
-    is added to ``mom_buf`` in place). At ``step()`` time
-    ``mom_buf`` is read (cast to FP32), orthogonalized via
-    Newton-Schulz, applied to the GPU param, then reset to
-    zero for the next accumulation cycle. The cross-step μ
-    momentum smoothing has nothing to smooth across cycles
-    (the buffer resets at every step).
+    The two CPU buffers have distinct, explicitly-named roles
+    (post-2026-07-15; the previous "merged-accumulator" design
+    where ``mom_buf`` doubled as the accumulator and the
+    momentum — with β effectively equal to 1, because the
+    accumulator was reset at every step — was deleted):
+
+    * ``s.grad``    — per-step grad accumulator. Each
+      microbatch's ``.grad`` is added to ``s.grad`` in place
+      (one ``.add_()`` per microbatch). Zeroed at the end of
+      every :meth:`step` (or by :func:`zero_cpu_grad_accum`
+      when ``found_inf`` skips the step). The end-of-step
+      grad-norm clip + TP all-reduce operate on this tensor —
+      see :mod:`src.training.loop.grad_norm` for the "why this
+      must live on CPU" rationale.
+    * ``s.exp_avg`` — SGD momentum: ``β·prev + grad`` (Keller
+      Jordan's Muon reference formulation). Preserved across
+      steps so the momentum smoothing has cross-step state.
+      If ``nesterov=True``, the input to the NS iteration is
+      ``grad + β·exp_avg``; otherwise it's just ``exp_avg``.
+      Initial value is zero.
 
     Storage dtype is ``precision.muon_momentum.dtype``:
 
-    * ``bf16`` / ``fp16`` / ``fp32``: full-precision storage.
-      The Newton-Schulz output precision is unaffected by the
-      storage dtype (NS orthogonalizes the dequantized / raw
-      FP32 momentum on the GPU regardless); the storage
-      precision only affects how much the EMA buffer is
-      rounded between steps.
+    * ``bf16`` / ``fp16`` / ``fp32``: full-precision storage
+      for both ``grad`` and ``exp_avg``. The Newton-Schulz
+      output precision is unaffected by the storage dtype (NS
+      orthogonalizes the dequantized / raw FP32 momentum on
+      the GPU regardless); the storage precision only affects
+      how much the EMA buffer is rounded between steps.
 
     * Quantized storage (``int8`` per-row BF16 scale,
       ``mxfp8`` per-block E8M0 scale) was removed on
@@ -60,10 +77,12 @@ class CPUMuon:
       the post-removal layout.
 
     The training loop's :func:`accumulate_grads_to_cpu` adds
-    the GPU ``.grad`` to ``s.mom_buf`` (CPU, at the storage
-    dtype). On :meth:`step` we H2D ``mom_buf``, cast to FP32,
-    NS, apply the update to the GPU param, then recast back
-    to the storage dtype and D2H.
+    the GPU ``.grad`` to ``s.grad`` (CPU, at the storage
+    dtype). On :meth:`step` we compute the SGD momentum
+    ``exp_avg ← β·exp_avg + grad`` on CPU, compute the
+    Nesterov-corrected input on CPU, H2D + cast to FP32, NS,
+    apply the update to the GPU param, then zero ``s.grad``
+    for the next cycle (preserving ``exp_avg`` across steps).
 
     Then stream each row-chunk to the GPU, run 5 NS iterations
     in FP16 (tensor cores), and apply the update to the GPU
@@ -86,15 +105,20 @@ class CPUMuon:
 
         ``precision`` controls:
 
-        - ``s.mom_buf`` (momentum + grad accumulator, merged)
-          ← ``precision.muon_momentum`` (bf16 / fp16 / fp32).
+        - ``s.grad``    (per-step accumulator)  ← ``precision.muon_momentum``
+        - ``s.exp_avg`` (SGD momentum EMA)     ← ``precision.muon_momentum``
 
-        The ``gradients`` precision config is no longer used
-        (there is no separate accumulator buffer).
+        Both buffers share storage dtype. Quantized storage
+        (``int8`` / ``mxfp8``) was removed on 2026-07-12;
+        supported dtypes are full-precision ``bf16`` / ``fp16``
+        / ``fp32``.
 
-        Supported momentum dtypes: full-precision ``bf16`` /
-        ``fp16`` / ``fp32``. (Quantized ``int8`` / ``mxfp8``
-        was removed on 2026-07-12.)
+        The ``momentum`` and ``nesterov`` hyperparameters are
+        consumed by :meth:`step` (since the 2026-07-15 refactor
+        that deleted the mu=1 merged-accumulator trick): the
+        step computes ``exp_avg = β·exp_avg + grad`` and (when
+        ``nesterov=True``) the Nesterov correction
+        ``g_for_ns = grad + β·exp_avg`` before Newton-Schulz.
         """
         self.lr = lr
         self.momentum = momentum
@@ -105,7 +129,7 @@ class CPUMuon:
 
         # fp* muon: full-precision storage at the configured
         # dtype; no scale, no dequant/requant in step().
-        mom_storage_dtype = precision.muon_momentum.dtype.to_torch()
+        storage_dtype = precision.muon_momentum.dtype.to_torch()
 
         # Keep the precision config so register_nvfp4_module can
         # mirror the storage decisions for module-based (no-BF16-
@@ -129,8 +153,11 @@ class CPUMuon:
             shape = tuple(p.shape)
             st = _ParamState(
                 param=p,
-                mom_buf=torch.zeros(
-                    n, dtype=mom_storage_dtype, device="cpu",
+                grad=torch.zeros(
+                    n, dtype=storage_dtype, device="cpu",
+                ).pin_memory(),
+                exp_avg=torch.zeros(
+                    n, dtype=storage_dtype, device="cpu",
                 ).pin_memory(),
                 kind="muon",
                 shape=shape,
@@ -144,8 +171,7 @@ class CPUMuon:
 
         Mirrors the per-param entry created in :meth:`__init__` —
         the dtype config (``precision.muon_momentum``) controls
-        the storage format (``mom_buf`` dtype only; no scale, no
-        separate ``accum`` in the post-2026-07-12 design).
+        the storage format for both ``grad`` and ``exp_avg``.
 
         In all cases the apply at step time routes through
         :meth:`NVFP4Linear.apply_chunk_update` (the module-side
@@ -170,12 +196,15 @@ class CPUMuon:
         # the module's shape (not a Parameter's). Same precision
         # config so all storage is consistent across the model.
         precision = self._precision
-        mom_storage_dtype = precision.muon_momentum.dtype.to_torch()
+        storage_dtype = precision.muon_momentum.dtype.to_torch()
 
         st = _ParamState(
             param=None,
-            mom_buf=torch.zeros(
-                n, dtype=mom_storage_dtype, device="cpu",
+            grad=torch.zeros(
+                n, dtype=storage_dtype, device="cpu",
+            ).pin_memory(),
+            exp_avg=torch.zeros(
+                n, dtype=storage_dtype, device="cpu",
             ).pin_memory(),
             kind="muon_nvfp4",
             shape=shape,
@@ -209,6 +238,11 @@ class CPUMuon:
             if s.nvfp4_module is not None:
                 continue
             s.param.grad = None
+            # NOTE: do NOT zero ``grad`` here — that would discard
+            # the user's gradient accumulation across micro-batches.
+            # The training loop is responsible for resetting
+            # ``s.grad`` at the end of each accumulation cycle (via
+            # :meth:`step` or :func:`zero_cpu_grad_accum`).
 
     def _newton_schulz(self, x: torch.Tensor) -> torch.Tensor:
         a, b, c = self._NS_COEFFS
@@ -261,37 +295,36 @@ class CPUMuon:
         """One Muon step across every trainable param in this
         optimizer's state.
 
-        Merged-accumulator design (post-2026-07-12): ``mom_buf``
-        doubles as the accumulator for every storage dtype.
-        Per-mb grad accumulation happens via
-        :func:`accumulate_grads_to_cpu` (a cheap CPU add at the
-        storage dtype — bf16 by default). ``mom_buf`` is
-        consumed at step() time: H2D, cast to FP32, NS, apply
-        update, recast back to storage dtype, D2H, zero for the
-        next cycle.
+        For each param with a non-zero ``s.grad`` (the per-cycle
+        grad accumulator):
 
-        No cross-step μ momentum smoothing is applied — the
-        gradient accumulator resets to zero at the end of
-        every step, so the smoothing has nothing to smooth
-        across cycles. The momentum-smoothing benefit was the
-        only reason for the μ coefficient in the original
-        SGD-momentum design; with mu=1 accumulation the same
-        effect is achieved trivially by the per-cycle sum.
+        1. Compute SGD momentum on CPU:
+           ``exp_avg ← β·exp_avg + grad`` (BF16 in place).
+        2. Compute the Nesterov-corrected input on CPU:
+           ``g_for_ns = grad + β·exp_avg`` (nesterov=True) or
+           ``g_for_ns = exp_avg`` (nesterov=False).
+        3. H2D ``g_for_ns``, cast to FP32, view as 2-D.
+        4. Stream NS over rows and apply the update to the GPU
+           param: ``param -= lr * NS(g_for_ns)``.
+        5. Stream sync + ``s.grad.zero_()`` for the next cycle
+           (``s.exp_avg`` is preserved across steps).
 
         State stays on CPU pinned memory; the per-mb VRAM peak
         is one param's worth of buffers (~21 MB for a
         1024×3072 down_proj) regardless of storage dtype.
         """
         lr = self.lr
+        beta = self.momentum
+        nesterov = self.nesterov
         wd = self.weight_decay
         CHUNK_ROWS = self._STREAM_CHUNK_ROWS
-        # Collect mom_buf tensors for the deferred fused zero at
+        # Collect grad tensors for the deferred fused zero at
         # the end of step(). Only entries that actually did work
         # (had non-zero accumulated grad) are included — the
-        # early-exit skip below means inactive params' mom_bufs
-        # are already zero, so re-zeroing them would be wasted
+        # early-exit skip below means inactive params' grads are
+        # already zero, so re-zeroing them would be wasted
         # bandwidth.
-        mom_bufs_to_zero: list = []
+        grads_to_zero: list = []
         # Per-param early-exit + sync are intentional (see notes
         # below). An experiment that hoisted the early-exit and
         # per-param stream sync out of the loop into a single
@@ -315,13 +348,13 @@ class CPUMuon:
         # change makes the all-async path faster, this comment
         # should be re-validated against a fresh microbench.
         for s in self.state.values():
-            # Merged-accumulator design (all storage dtypes):
-            # ``mom_buf`` is the cycle's accumulated grad.
-            g_buf = s.mom_buf
+            # Per-step grad accumulator (post-2026-07-15; was
+            # ``s.mom_buf`` in the merged-accumulator design).
+            g_buf = s.grad
             # Early-exit on no accumulated grad. The storage
             # dtype is always a floating dtype (bf16 / fp16 /
             # fp32 — quantized storage removed 2026-07-12).
-            # ``mom_buf`` is in pinned CPU memory; ``.item()`` is
+            # ``g_buf`` is in pinned CPU memory; ``.item()`` is
             # a host-side scalar read — ~5 µs, negligible. The
             # host-vs-GPU interleaving it introduces is actually
             # what keeps the per-param stream from oversubscribing
@@ -340,20 +373,38 @@ class CPUMuon:
                 module.packed_weight.device if module is not None
                 else s.param.device
             )
-            # fp* muon: merged-accumulator design. H2D mom_buf,
-            # cast to FP32 (NS input is always FP32).
-            mom_buf_gpu = g_buf.to(device, non_blocking=True)
-            m_fp32_gpu = mom_buf_gpu.float().view(rows, cols)
-
-            # ---- No SGD update here: the accumulator IS the
-            # accumulated grad (mu=1). We orthogonalize it as-is. ----
-
-            # ---- Recast FP32 back to the configured storage
-            # dtype + D2H (the only precision loss the
-            # full-precision path incurs). ----
-            new_mom = m_fp32_gpu.to(s.mom_buf.dtype).view(-1)
-            s.mom_buf.copy_(new_mom, non_blocking=True)
-            orth_input = m_fp32_gpu
+            # ---- SGD momentum update on CPU (post-2026-07-15;
+            # replaces the merged-accumulator trick where the
+            # accumulator WAS the momentum, with β=1 effectively).
+            # ``exp_avg ← β·exp_avg + grad`` in BF16 in place
+            # (same storage dtype as ``g_buf`` so the EMA
+            # doesn't accumulate dtype-cast rounding). For
+            # ``β = 0.95`` and an EMA of per-cycle grads, the
+            # magnitudes stay well inside BF16's 7-bit mantissa
+            # range — same precision as the legacy FP32 path in
+            # practice.
+            #
+            # This is the only place the EMA smoothing happens:
+            # before this update, ``s.exp_avg`` holds the prior
+            # step's momentum (or zero on step 0); after the
+            # update, it holds the current step's momentum and
+            # is preserved across steps for the next ``step()``.
+            exp_avg = s.exp_avg
+            exp_avg.mul_(beta).add_(g_buf)
+            # ---- Nesterov correction on CPU. The classical Muon
+            # formulation (Keller Jordan): if nesterov, the
+            # input to NS is ``g + β·buf`` (the "look-ahead"),
+            # otherwise it's just ``buf``. Computing on CPU
+            # avoids an extra GPU buffer + an extra H2D for the
+            # look-ahead term; the cost is one CPU-side
+            # elementwise add per step (negligible vs the H2D).
+            if nesterov:
+                g_for_ns = g_buf.add(exp_avg, alpha=beta)
+            else:
+                g_for_ns = exp_avg
+            # ---- H2D + cast to FP32 (NS input is always FP32).
+            orth_input = g_for_ns.to(device, non_blocking=True) \
+                                    .float().view(rows, cols)
 
             # ---- Decoupled weight decay: applied once to the
             # full GPU param (in place), before the streaming
@@ -430,30 +481,37 @@ class CPUMuon:
             torch.cuda.current_stream(device).synchronize()
 
             # ---- Cycle-end housekeeping (deferred): queue
-            # ``mom_buf`` for the fused zero at the bottom of
-            # step(). Replacing the per-param ``s.mom_buf.zero_()``
+            # ``s.grad`` for the fused zero at the bottom of
+            # step(). Replacing the per-param ``s.grad.zero_()``
             # with one C++ ``memset``-style call across all
             # entries eliminates the per-param Python+dispatch
             # overhead (~50 us each) and unlocks cross-op CPU
             # bandwidth via OpenMP. See
             # :mod:`src.training.param_offload.cpu_fused`. ----
-            mom_bufs_to_zero.append(s.mom_buf)
+            grads_to_zero.append(s.grad)
 
-        # ---- End-of-step fused zero (all mom_bufs in one
+        # ---- End-of-step fused zero (all grads in one
         # C++ call). Falls back to per-tensor ``.zero_()`` if the
         # JIT extension failed to compile (no C++ toolchain at
-        # runtime). ----
-        fused_zero_many(mom_bufs_to_zero)
+        # runtime). ``s.exp_avg`` is preserved across steps
+        # (NOT zeroed here) — only the per-step accumulator
+        # ``s.grad`` is reset. ----
+        fused_zero_many(grads_to_zero)
 
     # ------------------------------------------------------------------ #
     # Checkpoint save/load (resume).                                     #
     # ------------------------------------------------------------------ #
     # See the equivalent block on :class:`CPUAdamW` for the design.
-    # Full-precision storage (``mom_scale is None``) is the only
-    # path supported post-2026-07-12; quantized storage
-    # (``mom_scale is not None``) was removed along with int8 /
-    # mxfp8 storage. The saved entry contains ``mom_buf`` only;
-    # ``load_state_dict`` restores it in place.
+    # Full-precision storage (``precision.muon_momentum``) is the
+    # only path supported post-2026-07-12; quantized storage was
+    # removed along with int8 / mxfp8 storage. The saved entry
+    # contains ``grad`` (per-step accumulator — zero at save time
+    # in steady state) and ``exp_avg`` (SGD momentum — preserved
+    # across steps). ``load_state_dict`` restores both in place.
+    #
+    # State_dict keys changed on 2026-07-15 (was ``"mom_buf"`` for
+    # the merged accumulator); pre-change checkpoints cannot be
+    # loaded by the new code.
     def state_dict(self) -> dict:
         return {
             "lr": self.lr,
@@ -466,7 +524,8 @@ class CPUMuon:
                     "shape": list(s.shape),
                     "step": s.step,
                     "kind": s.kind,
-                    "mom_buf": s.mom_buf,
+                    "grad": s.grad,
+                    "exp_avg": s.exp_avg,
                 }
                 for s in self.state.values()
             ],
@@ -496,5 +555,7 @@ class CPUMuon:
                     f"{tuple(sav.get('shape', ()))} current="
                     f"{tuple(cur.shape)}."
                 )
-            if sav.get("mom_buf") is not None:
-                cur.mom_buf.copy_(sav["mom_buf"])
+            if sav.get("grad") is not None:
+                cur.grad.copy_(sav["grad"])
+            if sav.get("exp_avg") is not None:
+                cur.exp_avg.copy_(sav["exp_avg"])

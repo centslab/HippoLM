@@ -10,7 +10,8 @@ itself here so the algorithmic code is in one place without the
 
 Implementation notes are kept on the class docstring; see
 :mod:`src.training.param_offload` for the package-level design
-rationale (storage layouts, the merged-accumulator trick, etc.).
+rationale (storage layouts, the explicit per-step grad
+accumulator, etc.).
 """
 from __future__ import annotations
 
@@ -26,32 +27,62 @@ from .offload import _make_nvfp4_offload_cb
 
 
 class CPUAdamW:
-    """AdamW with CPU-side m (BF16) and v (BF16) state, GPU-side
-    params. ``m`` doubles as the grad accumulator (mu=1
-    accumulation — each microbatch's grad is added to ``m``
-    in place, no cross-step β1 EMA).
+    """AdamW with CPU-side ``grad`` (BF16, per-step accumulator),
+    ``exp_avg`` (BF16, β1 EMA — preserved across steps) and
+    ``exp_avg_sq`` (BF16, β2 EMA — preserved across steps).
+    Params live on the GPU; grads are streamed to CPU by the
+    post-accumulate-grad hook (see :func:`register_grad_offload_hooks`)
+    or by the manual :func:`accumulate_grads_to_cpu` path.
 
     Memory layout per trainable param:
-        CPU pinned: m (BF16, numel), v (BF16, numel)
+        CPU pinned: grad (BF16, numel),
+                    exp_avg (BF16, numel),
+                    exp_avg_sq (BF16, numel)
         GPU:         param (training dtype, e.g. FP16), .grad (transient)
 
-    No separate accumulator buffer: ``m`` IS the accumulator.
+    The three CPU buffers have distinct, explicitly-named roles
+    (post-2026-07-15; the previous "merged-accumulator" design
+    where ``s.m`` doubled as the accumulator and the first
+    moment — with β1 effectively equal to 1, because the
+    accumulator was reset at every step — was deleted):
+
+    * ``s.grad``       — per-step grad accumulator. Each
+      microbatch's ``.grad`` is added to ``s.grad`` in place
+      (one ``.add_()`` per microbatch). Zeroed at the end of
+      every :meth:`step` (or by :func:`zero_cpu_grad_accum`
+      when ``found_inf`` skips the step). The end-of-step
+      grad-norm clip + TP all-reduce operate on this tensor —
+      see :mod:`src.training.loop.grad_norm` for the "why this
+      must live on CPU" rationale.
+    * ``s.exp_avg``    — AdamW's first moment EMA
+      (``β1·prev + (1-β1)·grad``). Preserved across steps so the
+      EMA smoothing has cross-step state. Initial value is
+      zero.
+    * ``s.exp_avg_sq`` — AdamW's second moment EMA
+      (``β2·prev + (1-β2)·grad²``). Preserved across steps.
+      Initial value is zero.
+
     On :meth:`step`:
-        1. ``m`` holds the sum of microbatch grads (raw, no β1
-           EMA across steps).
-        2. Update ``v`` in place (BF16): ``v = β2*v + (1-β2)*m²``.
-        3. Compute the update factor ``m / (sqrt(v) + eps)`` in
-           FP32 (to recover the mantissa precision lost to the
-           BF16 v sqrt), then cast to FP16 (chunked, streamed
-           to the GPU).
-        4. Apply ``p -= lr * factor`` in place on the GPU.
-        5. Reset ``m`` to zero for the next accumulation cycle.
+        1. ``s.grad`` holds the per-cycle grad sum (raw, no
+           EMA across the cycle).
+        2. Update ``s.exp_avg`` in place (BF16):
+           ``exp_avg ← β1·exp_avg + (1-β1)·grad``.
+        3. Update ``s.exp_avg_sq`` in place (BF16):
+           ``v ← β2·v + (1-β2)·exp_avg²``.
+        4. Compute the update factor
+           ``exp_avg / (sqrt(v/bc2) + eps)`` in FP32 (to
+           recover the mantissa precision lost to the BF16 v
+           sqrt), then cast to FP16 (chunked, streamed to the
+           GPU).
+        5. Apply ``p -= lr * factor`` in place on the GPU.
+        6. Zero ``s.grad`` for the next accumulation cycle
+           (``s.exp_avg`` / ``s.exp_avg_sq`` are preserved).
 
     The training loop is expected to fold each micro-batch's
-    ``.grad`` into ``m`` via the post-accumulate-grad hook
+    ``.grad`` into ``s.grad`` via the post-accumulate-grad hook
     (see :func:`register_grad_offload_hooks`) or the manual
-    :func:`accumulate_grads_to_cpu`. :meth:`step` then sees
-    the accumulated grad already on CPU in ``m``.
+    :func:`accumulate_grads_to_cpu`. :meth:`step` then sees the
+    accumulated grad already on CPU in ``s.grad``.
     """
 
     def __init__(
@@ -67,14 +98,14 @@ class CPUAdamW:
 
         ``precision`` controls the storage dtypes of:
 
-        - ``s.m``       (1st moment + grad accumulator) ← ``precision.adamw_m``
-        - ``s.exp_avg_sq`` (2nd moment)                 ← ``precision.adamw_v``
+        - ``s.grad``       (per-step accumulator)  ← ``precision.adamw_m``
+        - ``s.exp_avg``    (first moment EMA)      ← ``precision.adamw_m``
+        - ``s.exp_avg_sq`` (second moment EMA)     ← ``precision.adamw_v``
 
         The grad accumulator dtype is implicit in ``adamw_m``
-        (m doubles as the accumulator; we don't have a separate
-        ``gradients`` accumulator anymore — saving 2 bytes/elt
-        per param). The cast target in the offload hook is
-        ``s.m.dtype`` (typically BF16).
+        (it shares storage with ``exp_avg``; both are BF16 by
+        default). The cast target in the offload hook is
+        ``s.grad.dtype`` (typically BF16).
 
         Defaults (when ``precision`` is ``None``) match the canonical
         yml: BF16 for both. The :meth:`step` algorithm is
@@ -106,8 +137,9 @@ class CPUAdamW:
             n = p.numel()
             self.state[id(p)] = _ParamState(
                 param=p,
+                grad=torch.zeros(n, dtype=m_dtype, device="cpu").pin_memory(),
+                exp_avg=torch.zeros(n, dtype=m_dtype, device="cpu").pin_memory(),
                 exp_avg_sq=torch.zeros(n, dtype=v_dtype, device="cpu").pin_memory(),
-                m=torch.zeros(n, dtype=m_dtype, device="cpu").pin_memory(),
                 kind="adamw",
                 shape=p.shape,
             )
@@ -123,19 +155,21 @@ class CPUAdamW:
             - autograd's bwd stashes ``grad_w`` on
               ``module._latest_grad_w`` (consumed per-step)
             - the optimizer computes its update using the same CPU
-              pinned m / v tensors it would for a Parameter-based
-              param, then routes the apply through
+              pinned grad / exp_avg / exp_avg_sq tensors it would
+              for a Parameter-based param, then routes the apply
+              through
               ``module.apply_chunk_update(start, end, grad_chunk, lr)``
 
-        CPU-pinned m / v are stored as BF16 (matches the legacy
-        CPUAdamW default precision). The user's prior sweep on
-        AdamW's v showed BF16 is fine — v stores squared grads
-        (1e-3 to 1e3 typical magnitude, well inside BF16's 8-bit
-        exponent range) and the FP32 promotion at sqrt time in
-        step() recovers all mantissa precision we need. Pinned
-        BF16 means half the CPU bandwidth on these D2H paths vs
-        FP32 (the default FP32 I had set initially was overly
-        conservative and unnecessarily expensive).
+        CPU-pinned grad / exp_avg / exp_avg_sq are stored as BF16
+        (matches the legacy CPUAdamW default precision). The
+        user's prior sweep on AdamW's v showed BF16 is fine —
+        v stores squared grads (1e-3 to 1e3 typical magnitude,
+        well inside BF16's 8-bit exponent range) and the FP32
+        promotion at sqrt time in step() recovers all mantissa
+        precision we need. Pinned BF16 means half the CPU
+        bandwidth on these D2H paths vs FP32 (the default FP32
+        I had set initially was overly conservative and
+        unnecessarily expensive).
         """
         assert getattr(module, "no_bf16_master", False), (
             f"register_nvfp4_module requires no_bf16_master=True; "
@@ -156,8 +190,9 @@ class CPUAdamW:
         # use the safe BF16 default that legacy AdamW uses.
         self.state[key] = _ParamState(
             param=None,
+            grad=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
+            exp_avg=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
             exp_avg_sq=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
-            m=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
             kind="adamw_nvfp4",
             shape=(rows, cols),
             nvfp4_module=module,
@@ -182,12 +217,11 @@ class CPUAdamW:
             if s.nvfp4_module is not None:
                 continue
             s.param.grad = None
-            # NOTE: do NOT zero ``m`` here — that would discard
-            # the user's gradient accumulation across micro-batches
-            # (``m`` doubles as the accumulator). The training
-            # loop is responsible for resetting ``m`` at the
-            # start of each accumulation cycle (via
-            # :func:`zero_cpu_grad_accum`).
+            # NOTE: do NOT zero ``grad`` here — that would discard
+            # the user's gradient accumulation across micro-batches.
+            # The training loop is responsible for resetting
+            # ``s.grad`` at the end of each accumulation cycle (via
+            # :meth:`step` or :func:`zero_cpu_grad_accum`).
 
     # Per-chunk size for the streaming factor / update path.
     # 4 M elements is the sweet spot on V100 / 5060Ti PCIe: 8 MB
@@ -197,7 +231,10 @@ class CPUAdamW:
     _STREAM_CHUNK_NUMEL = 4 * 1024 * 1024
 
     def step(self) -> None:
+        beta1 = self.beta1
         beta2 = self.beta2
+        one_minus_beta1 = 1.0 - beta1
+        one_minus_beta2 = 1.0 - beta2
         lr = self.lr
         eps = self.eps
         wd = self.weight_decay
@@ -207,7 +244,7 @@ class CPUAdamW:
         # bloat the inner loop.
         _fused_step = fused_adam_step_bf16
         for s in self.state.values():
-            g = s.m
+            g = s.grad
             if g.abs().sum().item() == 0:
                 # No accumulated grad (shouldn't happen if the
                 # training loop is correct, but guard against
@@ -215,33 +252,29 @@ class CPUAdamW:
                 continue
             s.step += 1
             step = s.step
+            exp_avg = s.exp_avg
             v = s.exp_avg_sq
-            # ``g`` (= s.m) is the sum of microbatch grads.
-            # No β1 EMA: in the merged-accumulator design, m IS
-            # the accumulator, so its value across steps is the
-            # raw sum of one accumulation cycle's grads. β1 was
-            # only ever smoothing the cross-step accumulator-to-
-            # accumulator transition; in this design the
-            # accumulator resets to zero at the end of every
-            # step, so β1 smoothing has nothing to smooth.
+            # ---- Update the first moment EMA from the per-step
+            # grad accumulator: ``exp_avg ← β1·exp_avg + (1-β1)·g``
+            # (BF16 in place; same storage dtype as ``g``). This
+            # is the explicit step that replaces the old
+            # "merged-accumulator" trick of treating the
+            # accumulator as the first moment with β1=1.
+            # ----
+            # We do the β1 update element-wise in BF16 via a
+            # Triton-friendly fused kernel path (see
+            # :func:`fused_adam_step_bf16` — it does the v update
+            # AND the factor compute in one OMP+AVX pass). The
+            # kernel reads ``m[i]`` (the post-EMA value, NOT the
+            # raw grad) and squares it for the v update.
             #
-            # v update + factor compute are now fused in C++
-            # (see :func:`fused_adam_step_bf16`): for each
-            # chunk the kernel does ``v ← β2·v + (1-β2)·m²``
-            # (BF16 in-place) AND writes the FP32 factor
-            # ``m / (sqrt(v/bc2) + eps)`` in one OMP+AVX pass.
-            # This eliminates the per-chunk Python chain of
-            # ``v.float() / sqrt() / add()`` calls (~1-2 ms per
-            # chunk at 4M elts on a Zen1 dev box) and replaces
-            # it with a single JIT C++ call per chunk.
-            #
-            # ``addcmul_`` semantics: BF16 has FP32 exponent
-            # range so ``g*g`` (for g ~ 1e-3) is ~1e-6, well
-            # above the BF16 smallest normal. The mantissa is
-            # 7 bits which is the precision bottleneck — but we
-            # recover precision in the per-element factor by
-            # promoting to FP32 inside the kernel before the
-            # sqrt.
+            # ``addcmul_`` semantics on the β1 EMA: BF16 has
+            # FP32 exponent range so ``g*g`` (for g ~ 1e-3) is
+            # ~1e-6, well above the BF16 smallest normal. The
+            # mantissa is 7 bits which is the precision
+            # bottleneck — but we recover precision in the
+            # per-element factor by promoting to FP32 inside the
+            # kernel before the sqrt.
             #
             # Numerics: do the divisor math in FP32 even though
             # ``g`` and ``v`` are both BF16. Promoting
@@ -254,9 +287,19 @@ class CPUAdamW:
             # apply — that final cast is the precision
             # bottleneck, not the v promotion.
             #
-            # No β1 division on the numerator (g is unbiased —
-            # it's the raw sum, not an EMA), but v still has
-            # its bias-correction bc2.
+            # No β1 division on the numerator (no bias
+            # correction on the EMA — ``bc1 = 1``). v still has
+            # its bias-correction bc2 inside the kernel.
+            # ---- In-place β1 EMA. Same BF16 storage dtype as
+            # ``g`` so the kernel signature doesn't change. We
+            # do ``exp_avg ← β1·exp_avg + (1-β1)·g`` in BF16
+            # directly; the (1-β1) factor is folded into the
+            # scale via ``addcmul`` semantics. BF16 precision
+            # is fine here: ``β1·exp_avg_prev`` is bounded by
+            # the magnitude of ``exp_avg_prev`` (well inside
+            # BF16 range) and ``(1-β1)·g`` is a single
+            # element-wise scaling.
+            exp_avg.mul_(beta1).add_(g, alpha=one_minus_beta1)
             # Decoupled weight decay: applied in place on the GPU
             # once, before the streaming factor / apply loop.
             # Folding it into the per-element factor would also
@@ -327,8 +370,14 @@ class CPUAdamW:
                     flat_start = r_start * cols
                     flat_end = r_end * cols
                     chunk_size = flat_end - flat_start
+                    # Kernel reads ``m[i]`` (= ``exp_avg[i]``
+                    # after the in-place β1 EMA above) and squares
+                    # it for the v update; v bias-correction uses
+                    # ``step``. Factor output is FP32, cast to
+                    # ``module.packed_weight.dtype`` (BF16) on
+                    # apply.
                     _fused_step(
-                        [g[flat_start:flat_end]],
+                        [exp_avg[flat_start:flat_end]],
                         [v[flat_start:flat_end]],
                         [factor_chunk[:chunk_size]],
                         [step],
@@ -349,7 +398,11 @@ class CPUAdamW:
                         r_start, r_end, factor, lr,
                         rebuild_scales_cache=(ci == n_chunks - 1),
                     )
-                s.m.zero_()
+                # Reset the per-step grad accumulator for the
+                # next cycle. ``exp_avg`` / ``exp_avg_sq`` are
+                # preserved across steps so the EMA / v
+                # smoothing has cross-step state.
+                g.zero_()
                 continue
             p_flat = s.param.data.view(-1)
             n = p_flat.numel()
@@ -357,7 +410,7 @@ class CPUAdamW:
                 end = min(start + CHUNK, n)
                 chunk_size = end - start
                 _fused_step(
-                    [g[start:end]],
+                    [exp_avg[start:end]],
                     [v[start:end]],
                     [factor_chunk[:chunk_size]],
                     [step],
@@ -372,13 +425,11 @@ class CPUAdamW:
                     ),
                     alpha=-lr,
                 )
-            # Reset m to zero for the next accumulation cycle.
-            # ``m`` doubles as the accumulator; this is the only
-            # point in the cycle where the accumulation result
-            # is consumed. End-of-cycle zero is batched across
-            # all states by :func:`zero_cpu_grad_accum` (see
-            # ``cpu_fused.fused_zero_many``).
-            s.m.zero_()
+            # Reset the per-step grad accumulator for the next
+            # cycle. ``exp_avg`` / ``exp_avg_sq`` are preserved
+            # across steps so the EMA / v smoothing has
+            # cross-step state.
+            g.zero_()
 
     # ------------------------------------------------------------------ #
     # Checkpoint save/load (resume).                                     #
@@ -400,6 +451,11 @@ class CPUAdamW:
     # copied in place — the per-param buffers already exist on the
     # freshly-constructed optimizer, only their contents are
     # restored.
+    #
+    # State_dict keys per entry: ``"grad"`` (per-step accumulator),
+    # ``"exp_avg"`` (β1 EMA), ``"exp_avg_sq"`` (β2 EMA). The keys
+    # changed on 2026-07-15 (was ``"m"`` for the merged accumulator);
+    # pre-change checkpoints cannot be loaded by the new code.
     def state_dict(self) -> dict:
         return {
             "lr": self.lr,
@@ -412,7 +468,8 @@ class CPUAdamW:
                     "shape": list(s.shape),
                     "step": s.step,
                     "kind": s.kind,
-                    "m": s.m,
+                    "grad": s.grad,
+                    "exp_avg": s.exp_avg,
                     "exp_avg_sq": s.exp_avg_sq,
                 }
                 for s in self.state.values()
@@ -446,7 +503,9 @@ class CPUAdamW:
                     f"{tuple(sav.get('shape', ()))} current="
                     f"{tuple(cur.shape)}."
                 )
-            if sav.get("m") is not None:
-                cur.m.copy_(sav["m"])
+            if sav.get("grad") is not None:
+                cur.grad.copy_(sav["grad"])
+            if sav.get("exp_avg") is not None:
+                cur.exp_avg.copy_(sav["exp_avg"])
             if sav.get("exp_avg_sq") is not None:
                 cur.exp_avg_sq.copy_(sav["exp_avg_sq"])

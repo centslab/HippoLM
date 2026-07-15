@@ -385,7 +385,13 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     fused_inf_nan_count_bf16,
                 )
                 _inf_nan_accums = [
-                    (s.m if s.kind == "adamw" else s.mom_buf)
+                    # Post-2026-07-15 explicit-accumulator layout:
+                    # ``s.grad`` is the per-step accumulator for
+                    # both AdamW and Muon. The old dispatch
+                    # ``s.m if s.kind == "adamw" else s.mom_buf``
+                    # was deleted along with the merged-accumulator
+                    # design.
+                    s.grad
                     for opt in (muon_opt, adamw_opt)
                     for s in opt.state.values()
                 ]

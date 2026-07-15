@@ -2,43 +2,54 @@
 
 Implements two optimizer variants used together via param groups:
 
-  - :class:`CPUAdamW`     — AdamW with BF16 m (which doubles as the
-    grad accumulator) and BF16 v state on CPU pinned memory. The
-    forward / backward happen on the GPU in the param's training
-    dtype (FP16 in this project). After each micro-batch's
-    backward, the per-param post-accumulate-grad hook DMA's the
-    GPU ``.grad`` (cast to ``m.dtype``) and folds it into ``m``
-    in place on the CPU (BF16, pinned). On ``step()`` ``m``
-    holds the sum of microbatch grads (``mu=1`` accumulation —
-    no cross-step β1 EMA), ``v`` is updated in place (BF16, with
-    β2 EMA), and the per-element update factor ``m / (sqrt(v) + eps)``
-    is computed in FP32 (to recover precision after the BF16 v
-    sqrt), then cast to FP16 and streamed chunk-wise to the GPU
-    param and applied in place. ``m`` is then reset to zero for
-    the next accumulation cycle.
+  - :class:`CPUAdamW`     — AdamW with explicit per-step ``grad``
+    accumulator (BF16) plus ``exp_avg`` (β1 EMA, BF16) and
+    ``exp_avg_sq`` (β2 EMA, BF16) state on CPU pinned memory.
+    The forward / backward happen on the GPU in the param's
+    training dtype (FP16 in this project). After each
+    micro-batch's backward, the per-param post-accumulate-grad
+    hook DMA's the GPU ``.grad`` (cast to ``grad.dtype``) and
+    folds it into ``grad`` in place on the CPU (BF16, pinned).
+    On ``step()``:
+      1. ``exp_avg ← β1·exp_avg + (1-β1)·grad``
+         (first moment EMA; BF16 in place).
+      2. ``exp_avg_sq ← β2·exp_avg_sq + (1-β2)·exp_avg²``
+         (second moment EMA; BF16 in place).
+      3. Factor ``exp_avg / (sqrt(exp_avg_sq/bc2) + eps)`` is
+         computed in FP32 (to recover precision after the BF16
+         sqrt), then cast to FP16 and streamed chunk-wise to
+         the GPU param and applied in place.
+      4. ``grad`` is zeroed for the next accumulation cycle
+         (the EMA ``exp_avg`` / ``exp_avg_sq`` are preserved
+         across steps so the smoothing has cross-step state).
     Grad dtype is BF16 throughout (matches the new 5060Ti
     hardware; BF16 has FP32-like dynamic range, so no overflow
-    on the grad transfer or the m update, and v can stay BF16
+    on the grad transfer or the EMA update, and v can stay BF16
     because BF16's 8-bit exponent is wide enough to keep
-    ``v = g²`` from underflowing at typical grad magnitudes
-    1e-4 to 1e-3 — 1e-8 is well above BF16's smallest normal
-    of ~1.18e-38).
+    ``exp_avg_sq = g²`` from underflowing at typical grad
+    magnitudes 1e-4 to 1e-3 — 1e-8 is well above BF16's
+    smallest normal of ~1.18e-38).
 
   - :class:`CPUMuon`      — Muon (Newton-Schulz orthogonalization
-    of the momentum matrix). ``mom_buf`` doubles as the grad
-    accumulator and the momentum feed for NS — ``mu=1``
-    accumulation (just ``mom_buf += g`` per microbatch). On
-    ``step()`` ``mom_buf`` is consumed (orthogonalized + applied
-    + reset to zero). Momentum storage is configurable via
+    of the momentum matrix). The per-step ``grad`` accumulator
+    is a dedicated BF16 / FP16 / FP32 pinned buffer; the SGD
+    momentum lives in ``exp_avg``. On ``step()``:
+      1. ``exp_avg ← β·exp_avg + grad`` (CPU, BF16 in place;
+         Keller Jordan's Muon reference formulation, no (1-β)
+         factor).
+      2. If nesterov: ``g_for_ns = grad + β·exp_avg``;
+         else: ``g_for_ns = exp_avg``. (CPU, in storage dtype.)
+      3. H2D ``g_for_ns``, cast to FP32, view as 2-D.
+      4. Stream NS over rows, apply the update to the GPU param.
+      5. ``grad`` is zeroed for the next cycle (the EMA
+         ``exp_avg`` is preserved across steps).
+    Momentum storage is configurable via
     ``precision.muon_momentum``:
-
       * ``bf16`` / ``fp16`` / ``fp32``: full-precision
-        momentum, no quantization. ``mom_buf`` is the
-        accumulator directly; the add is just a tensor add
-        in the storage dtype (no requant). The NS iteration
+        momentum, no quantization. Both ``grad`` and
+        ``exp_avg`` are at the storage dtype. The NS iteration
         is unaffected (it orthogonalizes the raw momentum in
         FP32 on the GPU regardless).
-
       Quantized storage (``int8`` per-row BF16 scale,
       ``mxfp8`` per-block E8M0 scale) was removed on
       2026-07-12 after long-training runs showed
@@ -53,8 +64,9 @@ the parameters and ``zero_grad()`` clears them.
 
 No gradient is stored on the GPU between steps. The training loop
 copies each micro-batch's ``.grad`` to CPU and adds it to the
-optimizer state's accumulator; only after ``gradient_accumulation_steps``
-micro-batches does ``step()`` actually run.
+optimizer state's ``grad`` accumulator; only after
+``gradient_accumulation_steps`` micro-batches does ``step()``
+actually run.
 
 Conventions
 -----------
@@ -63,21 +75,43 @@ Conventions
   immediately after, the training loop calls the per-param
   post-accumulate-grad hook (registered via
   :func:`register_grad_offload_hooks`) which copies ``.grad``
-  into the per-param CPU accumulator and frees the GPU copy.
-  So between micro-batches the GPU holds zero gradient memory.
+  into the per-param CPU ``grad`` accumulator and frees the
+  GPU copy. So between micro-batches the GPU holds zero gradient
+  memory.
 - Optimizer state on CPU pinned memory:
-    AdamW: m (BF16, numel) + v (BF16, numel)
-    Muon:  mom_buf (cfg.dtype, numel) — no scale, no
-           separate ``accum`` (merged-accumulator design).
-- For ~624 M params: AdamW ≈ 4 × 624 M = 2.5 GB CPU RAM
-  (m BF16 + v BF16, both 2 bytes/elt).
-  Muon: 0.6 GB (fp16/bf16) / 1.2 GB (fp32). The previous
-  ``int8``-with-per-row-BF16-scale path used 0.3 GB but
-  was removed on 2026-07-12 (long-training quantization
+    AdamW: grad (BF16, numel) + exp_avg (BF16, numel)
+           + exp_avg_sq (BF16, numel)
+    Muon:  grad (cfg.dtype, numel) + exp_avg (cfg.dtype, numel)
+           — both buffers share storage dtype; no scale, no
+           separate ``accum``.
+- For ~624 M params: AdamW ≈ 6 × 624 M = 3.7 GB CPU RAM
+  (grad BF16 + exp_avg BF16 + exp_avg_sq BF16, all 2 bytes/elt).
+  Muon: 1.2 GB (bf16/fp16 × 2 buffers) / 2.4 GB (fp32 × 2).
+  Quantized storage paths (``int8``, ``mxfp8``) used less RAM
+  but were removed on 2026-07-12 (long-training quantization
   error accumulation); pre-removal code lives on the
-  ``archive/int8-mxfp8-muon`` branch. The merged-accumulator
-  design saves 2 bytes/elt on every param vs the legacy
-  separate-accumulator design.
+  ``archive/int8-mxfp8-muon`` branch.
+
+Why this layout is intentional (the "CPU grad accumulator is
+unavoidable" note)
+-----------------------------------------------------------
+The per-step ``grad`` accumulator lives on CPU pinned memory,
+not on the GPU. This is NOT a missed optimization — it is a
+deliberate design choice driven by the requirement that grad
+clip (per the ``max_grad_norm`` setting) must work reliably for
+training stability. See :mod:`src.training.loop.grad_norm` for
+the full rationale; the short version is: the L2 norm is
+computed across all per-param ``grad`` tensors in one fused
+C++ pass (``fused_l2_norm_sq_bf16``), TP-all-reduced as a
+single FP64 scalar, and clipped in place via another fused
+C++ pass (``fused_scale_many_bf16``). Hoisting the accumulator
+back to the GPU just to clip would force N kernel launches
+instead of one fused pass and add an extra H2D per param +
+a second cross-op reduction — a clear loss on every metric
+that matters (per-step latency, dispatch overhead, sync
+stalls). The CPU accumulator is the minimum-cost substrate
+that makes the fused-norm + TP-reduce + in-place scale
+pipeline feasible at production scale.
 
 Package layout
 --------------

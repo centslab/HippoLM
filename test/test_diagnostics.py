@@ -53,8 +53,8 @@ from src.training.param_offload import _ParamState  # noqa: E402
 def _make_param_state(
     *,
     kind: str = "muon",
-    mom_buf: torch.Tensor | None = None,
-    m: torch.Tensor | None = None,
+    grad: torch.Tensor | None = None,
+    exp_avg: torch.Tensor | None = None,
     exp_avg_sq: torch.Tensor | None = None,
     param: torch.Tensor | None = None,
     nvfp4_module=None,
@@ -62,13 +62,17 @@ def _make_param_state(
     """Build a minimal ``OptimizerState`` with only the attrs a given
     test exercises. The dataclass fields default to None so unused
     ones don't need to be supplied.
+
+    Post-2026-07-15 field names (``grad`` / ``exp_avg`` /
+    ``exp_avg_sq``) replace the legacy merged-accumulator ``m`` /
+    ``mom_buf`` keyword arguments.
     """
     return _ParamState(
         param=param,
         kind=kind,
-        m=m,
+        grad=grad,
+        exp_avg=exp_avg,
         exp_avg_sq=exp_avg_sq,
-        mom_buf=mom_buf,
         nvfp4_module=nvfp4_module,
     )
 
@@ -134,14 +138,15 @@ def test_log_pre_step_diag_emits_required_fields(caplog):
     muon_state = {
         1: _make_param_state(
             kind="muon",
-            mom_buf=torch.tensor([1.0, 2.0, -3.0]),
+            grad=torch.tensor([1.0, 2.0, -3.0]),
             param=torch.tensor([0.5, 0.6]),
         ),
     }
     adamw_state = {
         1: _make_param_state(
             kind="adamw",
-            m=torch.tensor([0.1, 0.2]),
+            grad=torch.tensor([0.1, 0.2]),
+            exp_avg=torch.tensor([0.05, 0.10]),
             exp_avg_sq=torch.tensor([0.01, 0.04]),
             param=torch.tensor([0.5]),
         ),
@@ -160,8 +165,11 @@ def test_log_pre_step_diag_emits_required_fields(caplog):
     assert any("total_norm=1.230e+00" in m for m in msgs), msgs
     assert any("muon:" in m for m in msgs), msgs
     assert any("adamw:" in m for m in msgs), msgs
-    assert any("mom_max=3.000e+00" in m for m in msgs), msgs
-    assert any("m_max=2.000e-01" in m for m in msgs), msgs
+    # Post-2026-07-15 log format uses ``grad_max`` for the per-step
+    # accumulator (both optimizers; was ``mom_max`` for muon and
+    # ``m_max`` for adamw in the merged-accumulator design).
+    assert any("grad_max=3.000e+00" in m for m in msgs), msgs
+    assert any("exp_avg_max=1.000e-01" in m for m in msgs), msgs
     assert any("v_max=4.000e-02" in m for m in msgs), msgs
     assert any("pmax=" in m for m in msgs), msgs
 
@@ -177,8 +185,11 @@ def test_log_pre_step_diag_empty_states_yields_zero_magnitudes(caplog):
         muon_state={}, adamw_state={},
     )
     msgs = [rec.message for rec in caplog.records]
-    assert any("mom_max=0.000e+00" in m for m in msgs), msgs
-    assert any("m_max=0.000e+00" in m for m in msgs), msgs
+    # Post-2026-07-15 log format uses ``grad_max`` for both
+    # optimizers (was ``mom_max`` / ``m_max`` in the
+    # merged-accumulator design).
+    assert any("grad_max=0.000e+00" in m for m in msgs), msgs
+    assert any("exp_avg_max=0.000e+00" in m for m in msgs), msgs
     assert any("v_max=0.000e+00" in m for m in msgs), msgs
 
 
@@ -195,7 +206,7 @@ def test_log_pre_step_diag_nvfp4_module_falls_back_to_packed_weight(caplog):
         1: _ParamState(
             param=None,
             kind="muon_nvfp4",
-            mom_buf=torch.tensor([1.0, 2.0]),
+            grad=torch.tensor([1.0, 2.0]),
             nvfp4_module=nvfp4_stub,
         ),
     }
@@ -306,7 +317,7 @@ def test_log_post_opt_diag_nvfp4_proxy_branch_is_always_finite(caplog):
         1: _ParamState(
             param=None,
             kind="muon_nvfp4",
-            mom_buf=torch.tensor([1.0]),
+            grad=torch.tensor([1.0]),
             nvfp4_module=nvfp4_stub,
         ),
     }
@@ -335,7 +346,7 @@ def test_log_post_opt_diag_mixed_nvfp4_and_regular(caplog):
         2: _ParamState(
             param=None,
             kind="muon_nvfp4",
-            mom_buf=torch.tensor([0.1]),
+            grad=torch.tensor([0.1]),
             nvfp4_module=nvfp4_stub,
         ),
     }

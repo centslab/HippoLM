@@ -52,10 +52,12 @@ of total). Custom CUDA WMMA intra_solve kernel that fuses exp2 + mul +
 bmm is the only path forward — estimated savings ~10-15 ms but a
 multi-day kernel effort.
 
-ncu bottleneck analysis was blocked by driver incompatibility:
-  - ncu 2025.1.1.0 vs driver 580.76.05 (CUDA 13.0) — CUPTI LibraryNotLoaded
-  - torch.profiler also fails with CUPTI_ERROR_INVALID_DEVICE
-  - Manual CUDA-event stage breakdown used instead (results above).
+ncu bottleneck analysis is blocked by container permissions:
+  - ncu 2026.2.1 vs driver 580.76.05 (CUDA 13.0, host kernel) — ERR_NVGPUCTRPERM
+  - host kernel modparam RmProfilingAdminOnly=1; container lacks CAP_PERFMON
+  - torch.profiler also fails the same way (same code path)
+  - Use nsys 2026.1.3 (CUDA timeline trace works) for kernel-level attribution
+  - For per-kernel PM counters, run on a host with CAP_PERFMON or full caps
 """
 from __future__ import annotations
 

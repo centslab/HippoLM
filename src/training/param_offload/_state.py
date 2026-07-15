@@ -30,8 +30,31 @@ per-mb dequant-add-requant cycle) was removed on 2026-07-12
 after long-training runs showed quantization-error
 accumulation destabilizing optimization. The state fields
 that supported those paths (``mom_scale``, ``mxfp8_block_size``,
-``accum``) are gone; only full-precision ``mom_buf`` storage
-remains for Muon.
+``accum``) are gone.
+
+On 2026-07-15 the "merged-accumulator" / mu=1 trick was deleted
+in favour of explicit, separately-named buffers:
+
+  * ``s.grad``      — the per-step CPU grad accumulator (BF16,
+    one ``.add_()`` per microbatch, zeroed at the end of every
+    optimizer step). This is the buffer the post-accumulate-grad
+    hook folds each microbatch's grad into. *Why this MUST live
+    on CPU*: see the long note in
+    :mod:`src.training.loop.grad_norm` — the global L2 grad
+    norm is computed across all per-param ``s.grad`` tensors in
+    a single fused C++ pass (``fused_l2_norm_sq_bf16``) so that
+    grad-clip can be done in one TP all-reduce. Hoisting the
+    accumulator back to the GPU just to clip would require an
+    extra H2D pass per param + a second reduction; the CPU
+    accumulator is the natural single source of truth.
+
+  * ``s.exp_avg``   — AdamW's first moment EMA (β1) / Muon's
+    SGD momentum (``β·prev + grad``); preserved across
+    optimizer steps. The optimizer step reads ``s.grad`` to
+    update ``s.exp_avg``; ``s.grad`` is then zeroed.
+
+  * ``s.exp_avg_sq`` — AdamW's second moment EMA (β2); AdamW
+    only. Muon does not use a second moment.
 """
 from __future__ import annotations
 
@@ -47,46 +70,76 @@ import torch.nn as nn
 # --------------------------------------------------------------------------- #
 @dataclass
 class _ParamState:
-    """Per-parameter CPU-side state for either AdamW or Muon."""
+    """Per-parameter CPU-side state for either AdamW or Muon.
+
+    Field semantics
+    ---------------
+    - ``param``: the GPU-side trainable parameter the entry
+      belongs to. ``None`` for NVFP4-mode-3 entries (no leaf
+      Parameter — the weight lives on the module as FP4 packed
+      buffers).
+    - ``grad``: per-step CPU grad accumulator. Each microbatch's
+      ``.grad`` is ``.add_()``'d into this BF16 pinned buffer
+      via the post-accumulate-grad hook (or the manual
+      ``accumulate_grads_to_cpu`` path). Zeroed at the end of
+      every optimizer step (or by
+      :func:`zero_cpu_grad_accum` when ``found_inf`` skips the
+      step). The end-of-step grad-norm clip + TP all-reduce
+      operate on this tensor — see
+      :mod:`src.training.loop.grad_norm`.
+    - ``exp_avg``: AdamW's first moment EMA / Muon's SGD
+      momentum. Updated in-place by the optimizer step from
+      ``grad`` (AdamW: ``β1·prev + (1-β1)·grad``; Muon:
+      ``β·prev + grad``). **Preserved across steps** so the EMA
+      / momentum smoothing actually has cross-step state to
+      smooth. Initial value is zero.
+    - ``exp_avg_sq``: AdamW's second moment EMA. Updated in
+      place by the AdamW step kernel. ``None`` for Muon entries.
+    - ``nvfp4_module`` / ``nvfp4_n`` / ``nvfp4_chunk_ranges``
+      / ``nvfp4_grad``: NVFP4-mode-3 ("no BF16 master") plumbing.
+      Set when the optimizer's :meth:`register_nvfp4_module`
+      binds an :class:`NVFP4*Linear` (``no_bf16_master=True``)
+      to this entry. The optimizer step routes the apply
+      through ``module.apply_chunk_update``; ``param`` is
+      ``None`` on these entries.
+    - ``shape``: cached param shape (used by Muon's reshape on
+      GPU). For NVFP4 entries this is the module's
+      ``(out_features, in_features_per_partition)``.
+    - ``step``: per-param step counter (used for bias-correction
+      on ``exp_avg_sq``).
+    - ``kind``: ``"adamw"`` / ``"muon"`` / ``"adamw_nvfp4"`` /
+      ``"muon_nvfp4"``. The optimizer step + the diagnostics
+      branch on it.
+    - ``factor_chunk``: reusable FP32 pinned scratch for the
+      fused AdamW step kernel's per-chunk factor output.
+    """
 
     param: nn.Parameter
-    # AdamW-specific state (set when ``kind == 'adamw'``).
-    # m doubles as the grad accumulator and the optimizer's
-    # first moment: each microbatch's ``.grad`` is added to
-    # ``m`` in place (mu=1 accumulation — no cross-step β1
-    # EMA), and at ``step()`` time ``m`` is consumed as the
-    # "gradient" estimate in the AdamW update:
-    #     v = β2*v + (1-β2)*m²
-    #     update = m / (sqrt(v) + eps)
-    # (no β1 division; the bias-correction on m is unnecessary
-    # because m is unbiased — it's the raw sum of microbatch
-    # grads).
-    # ``m`` is BF16 by default: BF16's 8-bit exponent keeps
-    # ``v = g²`` from underflowing for typical grad magnitudes.
-    m: torch.Tensor | None = None
+    # Per-step CPU grad accumulator (BF16, numel). This is where
+    # the post-accumulate-grad hook (or the manual
+    # ``accumulate_grads_to_cpu`` path) folds each microbatch's
+    # ``.grad`` into. Zeroed at the end of every optimizer step.
+    # The end-of-step grad-norm clip + TP all-reduce operate on
+    # this tensor — see :mod:`src.training.loop.grad_norm`.
+    grad: torch.Tensor | None = None
+    # AdamW's first moment EMA / Muon's SGD momentum. Updated
+    # in place by the optimizer step from ``grad`` (AdamW:
+    # ``β1·prev + (1-β1)·grad``; Muon: ``β·prev + grad``);
+    # **preserved across steps** so the EMA / momentum
+    # smoothing has cross-step state. Initial value is zero.
+    exp_avg: torch.Tensor | None = None
+    # AdamW's second moment EMA (β2). ``None`` for Muon entries.
+    # Updated in place by the AdamW step kernel. Preserved
+    # across steps.
     exp_avg_sq: torch.Tensor | None = None
-    # Muon-specific state (set when ``kind == 'muon'``). The
-    # momentum matrix lives in ``mom_buf`` at the configured
-    # full-precision storage dtype (bf16 / fp16 / fp32). It
-    # doubles as the grad accumulator (mu=1 accumulation).
-    # At ``step()`` time ``mom_buf`` is read, orthogonalized
-    # via Newton-Schulz, applied to the GPU param, then reset
-    # to zero for the next accumulation cycle. Field names
-    # are dtype-agnostic so the ``step()`` and ``loop.py``
-    # byte-breakdown code works regardless of the configured
-    # storage dtype.
-    mom_buf: torch.Tensor | None = None
     # NVFP4-mode-3 ("no BF16 master") support. When this state entry
     # backs an :class:`NVFP4*Linear` (or its TP variants) constructed
     # with ``no_bf16_master=True``, ``param`` is ``None`` and the
     # storage lives on the module as FP4 packed buffers. The optimizer
-    # side keeps its CPU pinned m / v as BF16 (these are optimizer
-    # moments, NOT the weight — the user constraint was "no BF16 master
-    # weight"; the moments have always been CPU BF16 in this codebase).
-    # The optimizer computes the per-chunk update on the CPU pinned
-    # gradient slice, then calls ``module.apply_chunk_update(start,
-    # end, grad_chunk, lr)`` which materializes a temp BF16 view,
-    # applies the update in place, and re-quantizes to FP4.
+    # side keeps its CPU pinned grad / exp_avg / exp_avg_sq as BF16
+    # (these are optimizer moments, NOT the weight — the user
+    # constraint was "no BF16 master weight"; the moments have
+    # always been CPU BF16 in this codebase).
     nvfp4_module: object | None = None
     # Per-param shape preserved when ``param is None`` (used by the
     # chunk math in step()).
@@ -98,8 +151,8 @@ class _ParamState:
     # The side-channel grad the autograd Function stashes on the
     # module between forward/backward and the optimizer step. The
     # post-accumulate-grad hook (:func:`register_grad_offload_hooks`)
-    # reads ``module._latest_grad_w`` and folds it into ``s.m`` /
-    # ``s.mom_buf`` once per microbatch.
+    # reads ``module._latest_grad_w`` and folds it into ``s.grad``
+    # once per microbatch.
     nvfp4_grad: object | None = None
     # Cached for Muon: original param shape for reshape on GPU.
     shape: tuple = field(default_factory=tuple)
@@ -144,14 +197,14 @@ class OptimizerState(Protocol):
     - ``kind`` is ``"adamw"`` / ``"muon"`` / ``"muon_nvfp4"`` /
       ``"adamw_nvfp4"``; diagnostics branch on it to pick which
       state tensors to read.
-    - ``m`` / ``exp_avg_sq`` are AdamW's first / second moment
-      (both CPU pinned; ``m`` doubles as the grad accumulator
-      in the mu=1 accumulation scheme). For Muon both are
-      ``None``.
-    - ``mom_buf`` is Muon's momentum storage (which doubles as
-      the grad accumulator). At the configured full-precision
-      dtype (bf16 / fp16 / fp32 — quantized storage removed
-      2026-07-12). For AdamW it's ``None``.
+    - ``grad`` is the per-step CPU grad accumulator (BF16
+      pinned). The end-of-step grad-norm clip + TP all-reduce
+      operate on this tensor. Zeroed by the optimizer step (or
+      by :func:`zero_cpu_grad_accum`).
+    - ``exp_avg`` is AdamW's first moment EMA / Muon's SGD
+      momentum — preserved across steps.
+    - ``exp_avg_sq`` is AdamW's second moment EMA (AdamW only;
+      ``None`` for Muon).
     - ``shape`` is cached for Muon (the original param shape
       before flatten) so diagnostics can report the failing
       param's full shape on NaN/Inf.
@@ -161,9 +214,9 @@ class OptimizerState(Protocol):
 
     param: nn.Parameter
     kind: str
-    m: Optional[torch.Tensor]
+    grad: Optional[torch.Tensor]
+    exp_avg: Optional[torch.Tensor]
     exp_avg_sq: Optional[torch.Tensor]
-    mom_buf: Optional[torch.Tensor]
     shape: tuple
     step: int
 
@@ -175,43 +228,34 @@ def _accumulator_target(s: _ParamState) -> Tuple[torch.Tensor, torch.dtype]:
     """Return ``(target_tensor, cast_dtype)`` for the offload path.
 
     ``target_tensor`` is the CPU-side tensor that the
-    per-microbatch grad is folded into (mu=1 accumulation). For
-    AdamW and ``adamw_nvfp4`` it's ``s.m``; for Muon and
-    ``muon_nvfp4`` it's ``s.mom_buf`` directly (the
-    merged-accumulator design — quantised storage and the
-    separate ``accum`` buffer were removed 2026-07-12).
+    per-microbatch grad is folded into: ``s.grad`` (both AdamW
+    and Muon — the post-2026-07-15 layout; the old "merged
+    accumulator" design where ``s.m`` / ``s.mom_buf`` doubled
+    as the accumulator was removed).
 
     ``cast_dtype`` is the dtype to cast the GPU grad to before
     the DMA. It matches the accumulator's storage dtype for
-    both optimizers (BF16 for AdamW's ``m`` and for the
-    canonical Muon bf16 ``mom_buf``).
+    both optimizers (BF16 for AdamW's ``grad`` and for the
+    canonical Muon bf16 ``grad``).
     """
-    if s.kind in ("adamw", "adamw_nvfp4"):
-        return s.m, s.m.dtype
-    # Muon (and the nvfp4 variant): the merged-accumulator
-    # design is in effect — mom_buf is the cycle's accumulator.
-    return s.mom_buf, s.mom_buf.dtype
+    return s.grad, s.grad.dtype
 
 
 def _scale_accum(s: _ParamState, coef: float) -> None:
-    """In-place scale of the per-param accumulator (the cycle's
-    grad sum) by ``coef``. Used by
+    """In-place scale of the per-param grad accumulator by
+    ``coef``. Used by
     :func:`src.training.loop._compute_and_clip_grad_norm` to
     clip the global L2 grad norm.
 
     Resolves the right accumulator for the param:
-      - AdamW: ``s.m`` (BF16, the merged accumulator + first
-        moment).
-      - Muon: ``s.mom_buf`` (BF16 / FP16 / FP32, the merged
-        accumulator).
+      - AdamW: ``s.grad`` (BF16, the per-step accumulator).
+      - Muon:  ``s.grad`` (BF16 / FP16 / FP32, the per-step
+        accumulator; storage dtype is
+        ``precision.muon_momentum``).
 
     No-op when ``coef == 1.0`` (cheap guard so the grad-norm
     clip stays a no-op for well-behaved steps).
     """
     if coef == 1.0:
         return
-    if s.kind == "adamw":
-        s.m.mul_(coef)
-    else:
-        # Muon (and nvfp4 variants): merged-accumulator design.
-        s.mom_buf.mul_(coef)
+    s.grad.mul_(coef)
