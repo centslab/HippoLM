@@ -286,13 +286,23 @@ class _StubTokenizer:
         self._v = 30_000
 
     def __call__(self, text, max_length=None, truncation=False, return_tensors=None):
+        # Production calls ``StreamingDataset._flush_batch`` with a
+        # ``list[str]`` (batched path) and ``_tokenize_one`` with a
+        # single ``str`` (per-doc path). The stub must mirror the
+        # HuggingFace tokenizer contract on both shapes:
+        #   str       → ``{"input_ids": [int, ...]}``
+        #   list[str] → ``{"input_ids": [[int, ...], [int, ...], ...]}``
+        if isinstance(text, list):
+            return {"input_ids": [
+                self._encode_one(t, max_length, truncation) for t in text
+            ]}
+        return {"input_ids": self._encode_one(text, max_length, truncation)}
+
+    def _encode_one(self, text, max_length, truncation):
         ids = [(hash(w) % (self._v - 10)) + 10 for w in text.split()]
         if max_length and truncation:
             ids = ids[:max_length]
-        # ``apply_chat_template`` is a stub: format messages as
-        # "ROLE: content" joined by newlines so chat-template
-        # use is observable in the test.
-        return {"input_ids": ids}
+        return ids
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
         if not messages:
