@@ -133,8 +133,10 @@ description match) and `.claude/rules/` (auto-injected when their
 |---|---|---|
 | About to commit a model / loop / optimizer / data-path change | [`.claude/skills/run-smoke-test/SKILL.md`](.claude/skills/run-smoke-test/SKILL.md) | Smoke-test command + PASS/FAIL gate |
 | Sweeping a Triton / CUDA / Marlin kernel config for perf | [`.claude/skills/kda-correctness-sweep/SKILL.md`](.claude/skills/kda-correctness-sweep/SKILL.md) | Correctness gate before reporting speed |
+| After a perf change to fused kernel / layout / async worker / autograd callback | [`.claude/skills/step-perf-remeasure/SKILL.md`](.claude/skills/step-perf-remeasure/SKILL.md) | Per-component `[mb-time]` re-measure + HWM gate |
 | Editing `src/models/ops/cuda/**` or `configs/**` | [`.claude/rules/dont-target-v100.md`](.claude/rules/dont-target-v100.md) | sm_70 dropped 2026-07-08; don't reintroduce V100 paths |
 | Proposing a memory-saving change to a kernel or training path | [`.claude/rules/saved-tensors-not-hwm.md`](.claude/rules/saved-tensors-not-hwm.md) | `saved_tensors` from autograd hooks ≠ peak resident; use the HWM probe |
+| Editing `src/models/ops/**` (passing `stride_*` tensors to Triton kernels) | [`.claude/rules/einsum-noncontig-triton.md`](.claude/rules/einsum-noncontig-triton.md) | `torch.einsum` output stride ≠ obvious; `.contiguous()` before stride-indexed Triton |
 | Deleting a `_legacy` / shim / re-export file | [`.claude/rules/shim-deletion-protocol.md`](.claude/rules/shim-deletion-protocol.md) | Grep absolute + relative + smoke-import before deleting |
 
 For development workflow rules (test-first, smoke-test, autotune
