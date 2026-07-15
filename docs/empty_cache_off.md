@@ -1,3 +1,5 @@
+> **Skill**: [`step-perf-remeasure`](../.claude/skills/step-perf-remeasure/SKILL.md) — re-measure step time after any perf change to the loop path.
+
 # Why `empty_cache_between_mb` is off (2026-07-12)
 
 `configs/base.yml` sets `empty_cache_between_mb: false`. This

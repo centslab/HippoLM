@@ -253,23 +253,22 @@ applies; there is no separate `s.accum` / `s.mom_scale` /
   ~32 MiB of saved-tensor memory per KDA layer (~1 GB at 30
   layers).
 
-## FFN NVFP4 path
+## FFN NVFP4 path (mode-3 production, 2026-07-15)
 
-- `ffn_nvfp4` — W4A16 NVFP4 FFN (research path, disabled as
-  of 2026-07-06 — opt-5/2 VRAM initiative). When `True`, every
-  FFN linear stores its weight in NVFP4 packed format (E2M1 +
-  FP8-e4m3fn 1x16 microblock scales). Activation stays in BF16;
-  the matmul itself runs in BF16 (dequantize-on-fwd) since
-  PyTorch 2.9.1's `torch._scaled_mm` NVFP4 path requires both
-  A and B to be FP4. 2026-07-06: flipped to `False` — only
-  the BF16 master is held on GPU, saving the per-layer
-  packed_weight (uint8) + scales (fp8_e4m3fn) buffers. At
-  TP=1 / 32 layers / 3 NVFP4 modules per FFN, that drop is
-  ~324 MiB off the 5060 Ti 16G peak. The matmul becomes plain
-  `F.linear(x, weight, bias)` (BF16 GEMM, no dequant
-  round-trip). Training loss ratio BF16 / NVFP4 was 1.00x at
-  100 steps per `project_w4a16_nvfp4.md`, so this is a clean
-  VRAM win.
+The three flags below land NVFP4 mode-3 in production. The
+detailed design + the migration history from opt-5/2 → mode-3
+live in [`docs/nvfp4_ffn_design.md`](nvfp4_ffn_design.md); the
+Triton quantize-pack + in-backward D2H patterns live in
+[`docs/optimizer_kernel_design.md`](optimizer_kernel_design.md).
+
+- `ffn_nvfp4` — W4A16 NVFP4 FFN. When `True`, every FFN linear
+  stores its weight in NVFP4 packed format (E2M1 + FP8-e4m3fn
+  1x16 microblock scales). Activation stays in BF16; the matmul
+  itself runs in BF16 (dequantize-on-fwd) since torch 2.12's
+  `torch._scaled_mm` NVFP4 path still requires both A and B to
+  be FP4 (W4A4-only). **Production: `True`** (was briefly
+  `False` during opt-5/2 2026-07-06, then flipped back to `True`
+  2026-07-10 as part of mode-3 wiring fix).
 - `ffn_nvfp4_marlin` — when `True` (and `ffn_nvfp4` is also
   `True`), the FFN forward matmul uses vLLM's Marlin FP4 kernel
   (BF16 MMA + register dequant + `cp.async` double-buffered
@@ -278,5 +277,15 @@ applies; there is no separate `s.accum` / `s.mom_scale` /
   matmul (STE for the quantize noise). Requires the prebuilt
   Marlin .so at `src/models/ops/cuda/lib/` (shipped in this
   repo for the 5060 Ti dev box). No-op when `ffn_nvfp4` is
-  `False`. See `:mod:docs.marlin_build_pipeline` for the
-  build contract and the namespace wrap notes.
+  `False`. See [`docs/marlin_build_pipeline.md`](marlin_build_pipeline.md)
+  for the build contract and the namespace wrap notes.
+- `ffn_nvfp4_no_bf16_master` — when `True` (and `ffn_nvfp4` is
+  also `True`), the FP4 packed buffers ARE the source of truth;
+  no BF16 master copy is held on GPU/CPU. Mode-3. **Production:
+  `True`** (set 2026-07-10 as part of the wiring fix). Pre-mode-3
+  had a `weight` (BF16) buffer that was the optimizer's update
+  target and was quantized into `packed_weight` + `scales` at
+  each `repack_nvfp4_weights` call. Mode-3 drops that BF16
+  master; the optimizer writes to a CPU-pinned BF16 working copy
+  in optimizer state, and `repack_nvfp4_weights` quantizes back
+  to FP4 after each step.

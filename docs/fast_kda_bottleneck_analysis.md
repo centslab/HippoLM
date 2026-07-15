@@ -1,5 +1,19 @@
 > **Skill**: [`kda-correctness-sweep`](../.claude/skills/kda-correctness-sweep/SKILL.md) · **Rule**: [`dont-target-v100`](../.claude/rules/dont-target-v100.md)
 
+> **LEGACY (no skill pointer, retained for historical context):**
+> This document analyzes `src/models/ops/_triton/fast_kda/`, a
+> pure-Triton KDA path that was investigated in June 2026 and
+> **abandoned** in favor of the vendored FLA KDA at
+> `src/models/ops/_vendored/fla/ops/kda/` (the current production
+> path). The `fast_kda/` files are still on disk but **not
+> imported anywhere**. The CHUNK=16 conclusion (the only lasting
+> algorithmic takeaway) is captured in
+> [`docs/kda_kernel_structure.md`](kda_kernel_structure.md). The
+> hardware stack mentioned (CUDA 12.8 + Triton 3.5.1 + PyTorch
+> 2.9.1) is **out of date** — production is now torch 2.12 +
+> CUDA 13.0 + driver 580.x. Don't pick this doc up as the
+> current KDA source of truth.
+
 # Fast KDA — Bottleneck Analysis vs Theoretical Limit
 
 **Date:** 2026-06-29 (Round-6 update + bwd analysis)

@@ -1,3 +1,5 @@
+> **Skill**: [`step-perf-remeasure`](../.claude/skills/step-perf-remeasure/SKILL.md) — re-measure step time after any change to the opt-phase path. **Rule**: [`saved-tensors-not-hwm`](../.claude/rules/saved-tensors-not-hwm.md) — VRAM claims must cite `max_memory_allocated()`. **Doc**: [`optimizer_kernel_design.md`](optimizer_kernel_design.md) — fused-kernel design patterns.
+
 # Optimizer layout: which params go to AdamW, which to Muon
 
 The per-param optimizer split lives in

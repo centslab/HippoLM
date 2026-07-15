@@ -1,3 +1,5 @@
+> **Skill**: [`kda-correctness-sweep`](../.claude/skills/kda-correctness-sweep/SKILL.md) — correctness gate before reporting speed. **Rule**: [`einsum-noncontig-triton`](../.claude/rules/einsum-noncontig-triton.md) — `.contiguous()` on stride-args to Triton kernels (the vendored FLA KDA path uses raw stride arithmetic).
+
 # KDA (Kimi Delta Attention) kernel structure
 
 This document is a roadmap for new contributors. The KDA reference
