@@ -20,8 +20,9 @@ import torch
 import torch.nn as nn
 
 from ..precision_config import PrecisionConfig
-from ._state import _ParamState
+from ._state import _ParamState, _accumulator_target
 from .cpu_fused import fused_adam_step_bf16
+from .offload import _make_nvfp4_offload_cb
 
 
 class CPUAdamW:
@@ -162,6 +163,15 @@ class CPUAdamW:
             nvfp4_module=module,
             nvfp4_n=n,
             nvfp4_chunk_ranges=module.chunk_ranges(),
+        )
+        # Same in-backward D2H callback as the Muon path
+        # (production only uses Muon for NVFP4 today, but the
+        # AdamW + NVFP4 wiring exists for symmetry / future use).
+        # See :meth:`CPUMuon.register_nvfp4_module` for the why.
+        st = self.state[key]
+        target, cast_dtype = _accumulator_target(st)
+        module._nvfp4_offload_cb = _make_nvfp4_offload_cb(
+            module, target, cast_dtype,
         )
 
     def zero_grad(self, set_to_none: bool = True) -> None:

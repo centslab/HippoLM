@@ -362,6 +362,73 @@ def _decrement_inflight(n: int) -> None:
 _manual_flush_param_ids: set[int] = set()
 
 
+# --------------------------------------------------------------------------- #
+# Offload callback for NVFP4 mode-3 (zero-copy from backward into worker).     #
+# --------------------------------------------------------------------------- #
+# See :meth:`NVFP4Linear._stash_grad_w`. The optimizer (CPUMuon /
+# CPUAdamW) installs a closure built here on the module, so the
+# BF16 grad_w → cast → D2H → event-record → worker-enqueue pipeline
+# runs INSIDE the autograd backward call instead of waiting for
+# the post-backward :func:`accumulate_grads_to_cpu` sweep.
+# Cost on the dev shape: ~22ms/chunk (was the dominant per-chunk
+# GPU compute-stream idle source at the chunk boundary — see
+# auto-memory ``project_chunk_boundary_bubble_source.md``).
+def _make_nvfp4_offload_cb(
+    module: Any,
+    target: torch.Tensor,
+    cast_dtype: torch.dtype,
+):
+    """Build a closure that does cast + D2H + worker-enqueue for one
+    NVFP4 module. Called from the custom autograd Function's
+    backward via :meth:`NVFP4Linear._stash_grad_w`.
+
+    The closure is single-purpose: it captures ``target`` (the
+    CPU accumulator, e.g. ``s.mom_buf`` for Muon) and the cast
+    dtype, and pulls ``grad_w`` from the backward call.
+
+    Idempotent w.r.t. the async worker: each call enqueues one
+    entry; the worker drains in FIFO order with per-entry
+    ``event.wait()``.
+
+    Worker-status aware: if the async worker isn't running
+    (tests, unit-test paths without :func:`_start_cpu_add_worker`),
+    the closure falls back to stashing ``grad_w`` on
+    ``module._latest_grad_w`` so the legacy
+    :func:`accumulate_grads_to_cpu` path picks it up
+    post-backward. This keeps the unit tests that directly call
+    ``_stash_grad_w`` working unchanged.
+    """
+    def _cb(grad_w: torch.Tensor) -> None:
+        if _cpu_add_queue is None:
+            # Sync mode (no async worker — tests / manual
+            # path): stash on module for the post-backward
+            # sweep. The legacy ``accumulate_grads_to_cpu`` will
+            # read ``module._latest_grad_w`` and do the D2H + add.
+            module._latest_grad_w = grad_w.detach()
+            return
+        # Async mode (production): cast on the GPU so the DMA
+        # carries the cast dtype, then flatten to match the 1-D
+        # accumulator, then issue the async D2H. The .detach()
+        # drops autograd metadata — we never want to backprop
+        # through a grad-DMA.
+        src = (
+            grad_w.detach()
+            .to(cast_dtype)
+            .reshape(-1)
+            .to("cpu", non_blocking=True)
+        )
+        # Record an event on the current stream AFTER the DMA is
+        # enqueued. The worker uses this event to wait only for
+        # THIS src's transfer to land, not for unrelated GPU work.
+        # This is what enables the per-chunk overlap with the next
+        # chunk's fwd — a global ``cuda.synchronize()`` would
+        # block the main thread on the worker's batch and defeat
+        # the overlap.
+        event = torch.cuda.current_stream().record_event()
+        _enqueue_cpu_add(event, target, src)
+    return _cb
+
+
 def register_grad_offload_hooks(
     optimizers: List,
     manual_flush_params: Optional[List[nn.Parameter]] = None,
@@ -656,25 +723,37 @@ def accumulate_grads_to_cpu(
     for opt in optimizers:
         for s in opt.state.values():
             # NVFP4 mode-3: there is no Parameter.grad (no leaf in the
-            # autograd graph). The autograd Function stashed grad_w on
-            # ``module._latest_grad_w`` at backward time. We D2H that
-            # tensor instead and add it into the right accumulator.
+            # autograd graph). Two paths exist:
+            #
+            # 1. Callback path (production, post-2026-07-15): the
+            #    optimizer's :meth:`register_nvfp4_module` installed
+            #    ``module._nvfp4_offload_cb``. The custom autograd
+            #    Function fired the callback DURING ``backward()``
+            #    so the D2H + worker enqueue is already in flight
+            #    (or done) by the time we get here. We just skip —
+            #    UNLESS the callback fell back to stash (no async
+            #    worker running — test paths), in which case the
+            #    legacy path picks it up via ``_latest_grad_w``.
+            # 2. Legacy stash path (no callback installed, e.g.
+            #    older code paths or unit tests that explicitly
+            #    clear ``_nvfp4_offload_cb``): ``_stash_grad_w``
+            #    stashed grad_w on ``module._latest_grad_w``. We
+            #    do the D2H + enqueue here, same as before.
             if s.nvfp4_module is not None:
                 module = s.nvfp4_module
                 grad_w = module._latest_grad_w
                 if grad_w is None:
+                    # Callback already did the D2H + enqueue
+                    # inside backward() — nothing to do.
                     continue
+                # grad_w is stashed (either by legacy path or
+                # by the callback's worker-not-running fallback).
+                # Process it here.
                 # The merged-accumulator design (post-2026-07-12)
                 # applies to both mode-3 and mode-0: a single
                 # ``.add_()`` folds the microbatch grad into
                 # either ``s.m`` (AdamW) or ``s.mom_buf`` (Muon).
-                if s.kind == "muon_nvfp4":
-                    target = s.mom_buf
-                    cast_dtype = target.dtype
-                else:
-                    # adamw_nvfp4
-                    target = s.m
-                    cast_dtype = target.dtype
+                target, cast_dtype = _accumulator_target(s)
                 src_cpu = (
                     grad_w.detach()
                     .to(cast_dtype)

@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import ctypes
 import weakref
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -421,6 +421,9 @@ class NVFP4ColumnParallelLinear(nn.Module):
             self.register_parameter("bias", None)
         # Side-channel state (mode 3).
         self._latest_grad_w: Optional[torch.Tensor] = None
+        # See :attr:`NVFP4Linear._nvfp4_offload_cb`. Same
+        # semantics in this TP variant.
+        self._nvfp4_offload_cb: Optional[Callable[[torch.Tensor], None]] = None
         self.register_load_state_dict_post_hook(_nvfp4_post_load_repack_hook)
         self._init_weights()
 
@@ -520,6 +523,12 @@ class NVFP4ColumnParallelLinear(nn.Module):
         return ranges
 
     def _stash_grad_w(self, grad_w: torch.Tensor) -> None:
+        # See :meth:`NVFP4Linear._stash_grad_w` for the callback
+        # vs legacy stash semantics (same in this TP variant).
+        cb = getattr(self, "_nvfp4_offload_cb", None)
+        if cb is not None:
+            cb(grad_w)
+            return
         self._latest_grad_w = grad_w.detach()
 
     def _consume_grad_w(self) -> Optional[torch.Tensor]:
@@ -710,6 +719,9 @@ class NVFP4RowParallelLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
         self._latest_grad_w: Optional[torch.Tensor] = None
+        # See :attr:`NVFP4Linear._nvfp4_offload_cb`. Same
+        # semantics in this TP variant.
+        self._nvfp4_offload_cb: Optional[Callable[[torch.Tensor], None]] = None
         self.register_load_state_dict_post_hook(_nvfp4_post_load_repack_hook)
         self._init_weights()
 
@@ -806,6 +818,12 @@ class NVFP4RowParallelLinear(nn.Module):
         return ranges
 
     def _stash_grad_w(self, grad_w: torch.Tensor) -> None:
+        # See :meth:`NVFP4Linear._stash_grad_w` for the callback
+        # vs legacy stash semantics (same in this TP variant).
+        cb = getattr(self, "_nvfp4_offload_cb", None)
+        if cb is not None:
+            cb(grad_w)
+            return
         self._latest_grad_w = grad_w.detach()
 
     def _consume_grad_w(self) -> Optional[torch.Tensor]:

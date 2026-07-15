@@ -62,7 +62,7 @@ material/commit at chunk granularity).
 from __future__ import annotations
 
 import weakref
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -352,6 +352,12 @@ class NVFP4Linear(nn.Module):
         # grad_w on this attribute after each backward; the custom
         # optimizer step clears it on consumption.
         self._latest_grad_w: Optional[torch.Tensor] = None
+        # Optional callback installed by the optimizer's
+        # :meth:`register_nvfp4_module`. When set, ``_stash_grad_w``
+        # routes through the callback (which does D2H + worker
+        # enqueue) instead of stashing on ``_latest_grad_w``. See
+        # the docstring on :meth:`_stash_grad_w` for the why.
+        self._nvfp4_offload_cb: Optional[Callable[[torch.Tensor], None]] = None
 
         # Production-safe state-dict hook.
         self.register_load_state_dict_post_hook(
@@ -621,7 +627,24 @@ class NVFP4Linear(nn.Module):
     # Side-channel grad_w delivery (mode 3 only).
     # ------------------------------------------------------------------
     def _stash_grad_w(self, grad_w: torch.Tensor) -> None:
-        # Optimizer consumes-and-clears. We hold only the latest.
+        # Production path (CPUAdamW / CPUMuon with mode-3 modules
+        # registered via :meth:`register_nvfp4_module`): the
+        # optimizer installs ``_nvfp4_offload_cb`` so D2H + worker
+        # enqueue happens HERE, inside the autograd backward call.
+        # This lets the per-NVFP4 D2H overlap with subsequent
+        # layers' bwd kernels instead of waiting for the post-
+        # backward :func:`accumulate_grads_to_cpu` sweep
+        # (which costs ~22ms/chunk of pure-Python per-param
+        # work on the dev shape, ~hundreds of ms at prod shape).
+        #
+        # Legacy path (tests, unit-test paths without optimizer
+        # registration): fall back to stashing on
+        # ``self._latest_grad_w`` and let accumulate_grads_to_cpu
+        # pick it up post-backward.
+        cb = getattr(self, "_nvfp4_offload_cb", None)
+        if cb is not None:
+            cb(grad_w)
+            return
         self._latest_grad_w = grad_w.detach()
 
     def _consume_grad_w(self) -> Optional[torch.Tensor]:

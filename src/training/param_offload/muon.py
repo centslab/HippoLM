@@ -22,8 +22,9 @@ import torch
 import torch.nn as nn
 
 from ..precision_config import PrecisionConfig
-from ._state import _ParamState
+from ._state import _ParamState, _accumulator_target
 from .cpu_fused import fused_zero_many
+from .offload import _make_nvfp4_offload_cb
 
 
 class CPUMuon:
@@ -183,6 +184,21 @@ class CPUMuon:
             nvfp4_chunk_ranges=module.chunk_ranges(),
         )
         self.state[key] = st
+        # Install the in-backward D2H callback on the module.
+        # Routes BF16 grad_w → cast → D2H → event-record →
+        # worker-enqueue through the custom autograd Function's
+        # ``backward()`` (via :meth:`NVFP4Linear._stash_grad_w`)
+        # so the per-NVFP4 D2H overlaps with subsequent layers'
+        # bwd kernels instead of waiting for
+        # :func:`accumulate_grads_to_cpu` post-backward.
+        #
+        # Resolved at registration time so the closure holds
+        # only the target tensor + cast dtype (no per-call
+        # state-dict lookup on the hot path).
+        target, cast_dtype = _accumulator_target(st)
+        module._nvfp4_offload_cb = _make_nvfp4_offload_cb(
+            module, target, cast_dtype,
+        )
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for s in self.state.values():

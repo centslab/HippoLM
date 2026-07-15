@@ -176,8 +176,9 @@ def _accumulator_target(s: _ParamState) -> Tuple[torch.Tensor, torch.dtype]:
 
     ``target_tensor`` is the CPU-side tensor that the
     per-microbatch grad is folded into (mu=1 accumulation). For
-    AdamW it's ``s.m``; for Muon it's ``s.mom_buf`` directly
-    (the merged-accumulator design — quantised storage and the
+    AdamW and ``adamw_nvfp4`` it's ``s.m``; for Muon and
+    ``muon_nvfp4`` it's ``s.mom_buf`` directly (the
+    merged-accumulator design — quantised storage and the
     separate ``accum`` buffer were removed 2026-07-12).
 
     ``cast_dtype`` is the dtype to cast the GPU grad to before
@@ -185,9 +186,9 @@ def _accumulator_target(s: _ParamState) -> Tuple[torch.Tensor, torch.dtype]:
     both optimizers (BF16 for AdamW's ``m`` and for the
     canonical Muon bf16 ``mom_buf``).
     """
-    if s.kind == "adamw":
+    if s.kind in ("adamw", "adamw_nvfp4"):
         return s.m, s.m.dtype
-    # Muon (and the nvfp4 variants): the merged-accumulator
+    # Muon (and the nvfp4 variant): the merged-accumulator
     # design is in effect — mom_buf is the cycle's accumulator.
     return s.mom_buf, s.mom_buf.dtype
 
