@@ -362,10 +362,17 @@ class TPHippoModel(nn.Module):
                 config.hidden_size, config.vocab_size,
                 bias=config.use_bias,
                 ignore_index=-100,
-                # 64 chunks → C = next_pow2(ceil(4092/64)) = 64
+                # num_chunks=32 → C = next_pow2(ceil(16384/32)) = 512
                 # tokens per chunk → per-chunk peak logits
-                # 64 × 248320 × 2 B = ~32 MB at V=248k, H=1k.
-                num_chunks=64,
+                # 512 × 248320 × 2 B ≈ 242 MB at V=248320, H=1536
+                # (base.yml). The per-chunk dw GEMM is [V, C] @ [C, H]
+                # = [248320, 512] @ [512, 1536]; K=512 lifts cuBLAS BF16
+                # utilisation from 82% (K=256, NC=64) to 93% (K=512).
+                # In-model FLCE forward+backward at N=16384: NC=64 takes
+                # 1296 ms, NC=32 takes 1058 ms (−238 ms/mb). Projected to
+                # n_chunks=16 production: −3.8 s/step (−11.5% of 33 s).
+                # See auto-memory project_logit_gather_fold.md.
+                num_chunks=32,
                 device=d, dtype=dtype,
                 # Vocab-sharded embed: the local weight is the
                 # full [vp, H] shard, no narrow needed for the
