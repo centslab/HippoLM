@@ -104,6 +104,20 @@ class HippoConfig:
     # False for safety.
     ffn_nvfp4_no_bf16_master: bool = False
 
+    # KDA W8A8 FP8 (E4M3) projections. When True, the projection
+    # Linear layers inside KimiDeltaAttention (q_proj, k_proj, v_proj,
+    # o_proj, b_proj, f_proj[0..1], g_proj[0..1]) run their GEMM in
+    # FP8 E4M3 via ``torch._scaled_mm`` with per-row activation
+    # scaling + per-output-channel weight scaling. Backward uses
+    # STE (BF16 matmul against the BF16 leaf weight). The kernel
+    # itself (chunk_kda), the gating path (A_log / dt_bias /
+    # FusedRMSNormGated), and the rest of the model stay in BF16.
+    # See ``test_kda_w8a8_feasibility.py`` for the noise sweep
+    # (~3.7% sig_rel on Gaussian inputs, ~0.98% on b_proj+sigmoid)
+    # and ``src.models.ops.fp8_linear`` for the implementation.
+    # Default False for safety; flip on after smoke-test passes.
+    kda_fp8: bool = False
+
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
             f"num_layers ({self.num_layers}) must be divisible by num_blocks ({self.num_blocks})"
@@ -142,4 +156,7 @@ class HippoConfig:
         # is False.
         assert isinstance(self.ffn_nvfp4_marlin, bool), (
             f"ffn_nvfp4_marlin must be bool, got {type(self.ffn_nvfp4_marlin).__name__}"
+        )
+        assert isinstance(self.kda_fp8, bool), (
+            f"kda_fp8 must be bool, got {type(self.kda_fp8).__name__}"
         )

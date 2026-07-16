@@ -17,6 +17,45 @@ import torch.nn as nn
 from src.models.ops._vendored.fla.layers.kda import KimiDeltaAttention
 
 
+# Modules inside KimiDeltaAttention that should run their GEMM in FP8
+# E4M3 when ``config.kda_fp8`` is True. ``o_proj`` is included for
+# output projection; ``b_proj`` is the small (1536 -> 12) Linear that
+# produces the beta scalar (post-sigmoid; the test sweep showed this
+# path has 0.98% sig_rel — essentially noise-free).
+_DIRECT_FP8_LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj", "b_proj")
+# Sequential pairs (f_proj is the gate log-bottleneck, g_proj is the
+# value-side gate). Each pair has two Linears; both get FP8.
+_SEQUENTIAL_FP8_LINEARS = ("f_proj", "g_proj")
+
+
+def _replace_linear_with_fp8(old: nn.Linear) -> nn.Linear:
+    """Swap an ``nn.Linear`` for ``FP8Linear`` with copied weights.
+
+    Used by :meth:`KDA.__init__` to convert KimiDeltaAttention's
+    projection layers in place. State-dict keys are preserved
+    (``weight`` / ``bias`` have the same names + shapes), so BF16
+    checkpoints load without conversion.
+
+    The replacement keeps the *BF16 leaf* weight (FP8Linear stores
+    ``weight`` as ``nn.Parameter`` of dtype BF16). The optimizer
+    updates that leaf; the FP8 quantize happens on the fly in the
+    forward pass.
+    """
+    from src.models.ops.fp8_linear import FP8Linear
+
+    has_bias = old.bias is not None
+    new = FP8Linear(
+        old.in_features, old.out_features,
+        bias=has_bias,
+        device=old.weight.device,
+        dtype=old.weight.dtype,
+    )
+    new.weight.data.copy_(old.weight.data)
+    if has_bias:
+        new.bias.data.copy_(old.bias.data)
+    return new
+
+
 class KDA(nn.Module):
     """Kimi Delta Attention wrapper.
 
@@ -42,6 +81,21 @@ class KDA(nn.Module):
             layer_idx=layer_idx,
             norm_eps=config.rms_norm_eps,
         )
+
+        # FP8 W8A8 path for the projection layers (q/k/v/o/b_proj +
+        # f_proj[0..1] + g_proj[0..1]). The kernel itself, the
+        # gating path (A_log / dt_bias / FusedRMSNormGated), and the
+        # rest of the model stay in BF16.
+        # See ``src.models.ops.fp8_linear`` for the per-row-act +
+        # per-channel-weight E4M3 GEMM via ``torch._scaled_mm``.
+        if getattr(config, "kda_fp8", False):
+            for name in _DIRECT_FP8_LINEARS:
+                old = getattr(self.attn, name)
+                setattr(self.attn, name, _replace_linear_with_fp8(old))
+            for seq_name in _SEQUENTIAL_FP8_LINEARS:
+                seq = getattr(self.attn, seq_name)
+                for i in range(len(seq)):
+                    seq[i] = _replace_linear_with_fp8(seq[i])
 
     def forward(
         self,

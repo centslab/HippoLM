@@ -164,6 +164,7 @@ def _setup_worker(
         ffn_nvfp4=getattr(args, "ffn_nvfp4", False),
         ffn_nvfp4_marlin=getattr(args, "ffn_nvfp4_marlin", False),
         ffn_nvfp4_no_bf16_master=getattr(args, "ffn_nvfp4_no_bf16_master", False),
+        kda_fp8=getattr(args, "kda_fp8", False),
     )
     if rank == 0:
         logger.info(f"Model config: {config}")

@@ -133,3 +133,18 @@ ffn_nvfp4_marlin: true
 # cuBLAS no-leaf Function exists but isn't wired into the SwiGLU
 # pipeline yet).
 ffn_nvfp4_no_bf16_master: true
+
+# KDA W8A8 FP8 (E4M3) projections. The 9 projection Linears inside
+# KimiDeltaAttention (q/k/v/o_proj + b_proj + f_proj[0/1] + g_proj[0/1])
+# run their GEMM in FP8 E4M3 via ``torch._scaled_mm`` with per-row
+# activation + per-output-channel weight scaling. Backward is STE
+# (BF16 matmul against the BF16 leaf). The KDA kernel itself, the
+# gating path (A_log / dt_bias / FusedRMSNormGated), and the FFN
+# (NVFP4 above) stay in their native precisions. b_proj's output dim
+# is 12 (=num_v_heads) at prod H=12; this is NOT divisible by 16
+# (torch._scaled_mm requirement), so it silently falls back to BF16
+# via FP8Linear's shape-constraint guard. See test/test_kda_fp8.py
+# for the rollout regression test and test/_tmp/test_kda_w8a8_*.py
+# for the noise sweep (~3.7% per-Linear sig_rel, ~7-8% whole-KDA
+# after compounding across 9 layers).
+kda_fp8: true
