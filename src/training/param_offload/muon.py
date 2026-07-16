@@ -100,6 +100,8 @@ class CPUMuon:
         ns_steps: int = 5,
         weight_decay: float = 0.0,
         precision: Optional[PrecisionConfig] = None,
+        exp_avg_storage: str = "bf16",
+        block_size: int = 32,
     ) -> None:
         """CPU-offloaded Muon with configurable precision.
 
@@ -126,6 +128,31 @@ class CPUMuon:
         self.ns_steps = ns_steps
         self.weight_decay = weight_decay
         precision = precision or PrecisionConfig()
+
+        # Storage mode for the SGD momentum EMA ``exp_avg``.
+        # - ``"bf16"`` (default): full-precision BF16 buffer.
+        # - ``"fp8_2d_tight"``: E4M3 + per-(row × col-block) +
+        #   per-(col × row-block) FP32 scales (the
+        #   ``lowbit-Muon/quantize_2d`` fine-grained scheme);
+        #   dequant/re-quant per step. Brings NS output drift
+        #   from 14-21% down to ~1.45% on B/D regimes at the
+        #   prod shape (see
+        #   ``docs/auto-memory/project_2d_tight_scale.md``).
+        if exp_avg_storage not in ("bf16", "fp8_2d_tight"):
+            raise ValueError(
+                f"exp_avg_storage must be 'bf16' or 'fp8_2d_tight', "
+                f"got {exp_avg_storage!r}"
+            )
+        self.exp_avg_storage = exp_avg_storage
+        self.block_size = block_size
+        if exp_avg_storage == "fp8_2d_tight":
+            # Lazy import: this is the only site that needs the
+            # quant primitives, and keeping the import at use
+            # time avoids a hard import dependency from the
+            # default BF16 path.
+            from ..ops.fp8_2d_tight import quantize_2d, dequantize_2d
+            self._quantize_2d = quantize_2d
+            self._dequantize_2d = dequantize_2d
 
         # fp* muon: full-precision storage at the configured
         # dtype; no scale, no dequant/requant in step().
@@ -156,12 +183,74 @@ class CPUMuon:
                 grad=torch.zeros(
                     n, dtype=storage_dtype, device="cpu",
                 ).pin_memory(),
-                exp_avg=torch.zeros(
-                    n, dtype=storage_dtype, device="cpu",
-                ).pin_memory(),
                 kind="muon",
                 shape=shape,
             )
+            if exp_avg_storage == "bf16":
+                # Legacy BF16 storage; unchanged.
+                st.exp_avg = torch.zeros(
+                    n, dtype=storage_dtype, device="cpu",
+                ).pin_memory()
+            else:
+                # FP8 2D tight scale storage. See
+                # :mod:`src.training.ops.fp8_2d_tight` for the
+                # contract. All four buffers are pinned CPU so
+                # the per-step dequant+EMA+requant stays on the
+                # CPU side; the resulting H2D into NS is the
+                # same one copy as the BF16 path.
+                rows, cols = shape[0], shape[1]
+                # Fall back to the BF16 buffer for params whose
+                # shape isn't a multiple of ``block_size`` on
+                # both axes (matches the
+                # ``lowbit-Muon/quantize_2d`` reshape contract).
+                # In production the only such params are small:
+                # ``layers.X.kda.attn.b_proj.weight`` (12, 1536)
+                # — the KDA b-projection has 12 rows = num_heads
+                # — and ``attn_res.query`` (12, 128) — the
+                # AttnRes query has 12 rows = num_heads and 128
+                # cols = head_dim. Total BF16 fallback size:
+                # ~40 KB across the whole model. FP8 savings on
+                # these would be ~73 KB; adding padding support
+                # for that is not worth the code complexity. The
+                # step() path branches on ``s.exp_avg is not None``
+                # so the BF16 fallback runs without further changes.
+                if rows % block_size == 0 and cols % block_size == 0:
+                    n_row_blocks = rows // block_size
+                    n_col_blocks = cols // block_size
+                    # scale_dim1: per-(row × col-block) amax / E4M3_MAX,
+                    # shape (rows, cols // block_size).
+                    # scale_dim2: per-(col × row-block) amax / E4M3_MAX,
+                    # shape (cols, rows // block_size).
+                    # This is the fine-grained layout from
+                    # lowbit-Muon/src/quant.py::quantize_2d; the coarse
+                    # per-(row-block × all-cols) layout doesn't isolate
+                    # outliers to their col-block and gives ~10% NS
+                    # drift (vs 1.45% here).
+                    st.exp_avg_q = torch.zeros(
+                        n, dtype=torch.float8_e4m3fn, device="cpu",
+                    ).pin_memory()
+                    st.exp_avg_scale_dim1 = torch.zeros(
+                        rows, n_col_blocks, dtype=torch.float32, device="cpu",
+                    ).pin_memory()
+                    st.exp_avg_scale_dim2 = torch.zeros(
+                        cols, n_row_blocks, dtype=torch.float32, device="cpu",
+                    ).pin_memory()
+                    st.exp_avg_bf16 = torch.zeros(
+                        n, dtype=storage_dtype, device="cpu",
+                    ).pin_memory()
+                    st.exp_avg_2d_shape = shape
+                    st.exp_avg_block = block_size
+                    # exp_avg stays None in this mode; the BF16
+                    # scratch buffer is exp_avg_bf16.
+                    st.exp_avg = None
+                else:
+                    # Non-multiple-of-block param: keep the legacy
+                    # BF16 buffer. The FP8 storage savings on
+                    # these tiny params are negligible vs the
+                    # code complexity of padding support.
+                    st.exp_avg = torch.zeros(
+                        n, dtype=storage_dtype, device="cpu",
+                    ).pin_memory()
             self.state[id(p)] = st
 
     def register_nvfp4_module(self, module) -> None:
@@ -389,8 +478,38 @@ class CPUMuon:
             # step's momentum (or zero on step 0); after the
             # update, it holds the current step's momentum and
             # is preserved across steps for the next ``step()``.
-            exp_avg = s.exp_avg
+            #
+            # In FP8 2D tight scale mode, ``s.exp_avg`` is
+            # ``None`` and the BF16 working buffer is
+            # ``s.exp_avg_bf16``. We dequant the FP8 storage
+            # into that buffer at the start, run the same
+            # in-place ``β·prev + grad`` math on the BF16
+            # buffer, then requantize the result back into the
+            # FP8 + scales at the end. The actual storage on
+            # disk / CPU is FP8 + 2 × FP32 scale tensors; the
+            # BF16 buffer is per-step scratch that is
+            # overwritten each step.
+            if s.exp_avg is not None:
+                exp_avg = s.exp_avg
+            else:
+                # FP8 2D tight scale path.
+                rows, cols = s.exp_avg_2d_shape[0], s.exp_avg_2d_shape[1]
+                deq = self._dequantize_2d(
+                    s.exp_avg_q, s.exp_avg_scale_dim1, s.exp_avg_scale_dim2,
+                    rows=rows, cols=cols, block=s.exp_avg_block,
+                )
+                s.exp_avg_bf16.copy_(deq.reshape(-1))
+                exp_avg = s.exp_avg_bf16
             exp_avg.mul_(beta).add_(g_buf)
+            if s.exp_avg is None:
+                # FP8 2D tight scale: requantize BF16 back to FP8.
+                rows, cols = s.exp_avg_2d_shape[0], s.exp_avg_2d_shape[1]
+                q, s1, s2, _tight = self._quantize_2d(
+                    exp_avg.view(rows, cols), block=s.exp_avg_block,
+                )
+                s.exp_avg_q.copy_(q)
+                s.exp_avg_scale_dim1.copy_(s1)
+                s.exp_avg_scale_dim2.copy_(s2)
             # ---- Nesterov correction on CPU. The classical Muon
             # formulation (Keller Jordan): if nesterov, the
             # input to NS is ``g + β·buf`` (the "look-ahead"),
@@ -513,22 +632,34 @@ class CPUMuon:
     # the merged accumulator); pre-change checkpoints cannot be
     # loaded by the new code.
     def state_dict(self) -> dict:
+        sd_entries = []
+        for s in self.state.values():
+            entry = {
+                "shape": list(s.shape),
+                "step": s.step,
+                "kind": s.kind,
+                "grad": s.grad,
+            }
+            if s.exp_avg is not None:
+                entry["exp_avg"] = s.exp_avg
+            else:
+                # FP8 2D tight scale storage. All five fields are
+                # required for an exact load; shape + block_size
+                # allow the loader to sanity-check the layout
+                # matches.
+                entry["exp_avg_q"] = s.exp_avg_q
+                entry["exp_avg_scale_dim1"] = s.exp_avg_scale_dim1
+                entry["exp_avg_scale_dim2"] = s.exp_avg_scale_dim2
+                entry["exp_avg_2d_shape"] = list(s.exp_avg_2d_shape)
+                entry["exp_avg_block"] = s.exp_avg_block
+            sd_entries.append(entry)
         return {
             "lr": self.lr,
             "momentum": self.momentum,
             "nesterov": self.nesterov,
             "ns_steps": self.ns_steps,
             "weight_decay": self.weight_decay,
-            "state": [
-                {
-                    "shape": list(s.shape),
-                    "step": s.step,
-                    "kind": s.kind,
-                    "grad": s.grad,
-                    "exp_avg": s.exp_avg,
-                }
-                for s in self.state.values()
-            ],
+            "state": sd_entries,
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
@@ -549,13 +680,46 @@ class CPUMuon:
         for cur, sav in zip(current, saved):
             cur.step = int(sav.get("step", 0))
             if tuple(sav.get("shape", ())) != tuple(cur.shape):
+                idx = current.index(cur)
                 raise ValueError(
                     f"CPUMuon.load_state_dict: shape mismatch at "
-                    f"param index {current.index(cur)}: file="
-                    f"{tuple(sav.get('shape', ()))} current="
-                    f"{tuple(cur.shape)}."
+                    f"param index {idx}: file={tuple(sav.get('shape', ()))} "
+                    f"current={tuple(cur.shape)}."
                 )
             if sav.get("grad") is not None:
                 cur.grad.copy_(sav["grad"])
-            if sav.get("exp_avg") is not None:
-                cur.exp_avg.copy_(sav["exp_avg"])
+            if cur.exp_avg is not None:
+                if sav.get("exp_avg") is not None:
+                    cur.exp_avg.copy_(sav["exp_avg"])
+            else:
+                # FP8 2D tight scale path — restore all five
+                # fields. A saved entry without them is a hard
+                # error (no silent fallback to BF16; that would
+                # mask a storage-mode mismatch and the next
+                # step() would re-dequant a zero FP8 buffer).
+                for k in ("exp_avg_q", "exp_avg_scale_dim1",
+                         "exp_avg_scale_dim2", "exp_avg_2d_shape",
+                         "exp_avg_block"):
+                    if k not in sav:
+                        raise ValueError(
+                            f"CPUMuon.load_state_dict: FP8 2D tight "
+                            f"scale storage on the live optimizer "
+                            f"but saved entry missing key {k!r}"
+                        )
+                if tuple(sav["exp_avg_2d_shape"]) != tuple(cur.exp_avg_2d_shape):
+                    sav_shape = tuple(sav["exp_avg_2d_shape"])
+                    cur_shape = tuple(cur.exp_avg_2d_shape)
+                    raise ValueError(
+                        f"CPUMuon.load_state_dict: exp_avg_2d_shape "
+                        f"mismatch (file={sav_shape} current={cur_shape})"
+                    )
+                if int(sav["exp_avg_block"]) != int(cur.exp_avg_block):
+                    sav_block = int(sav["exp_avg_block"])
+                    cur_block = int(cur.exp_avg_block)
+                    raise ValueError(
+                        f"CPUMuon.load_state_dict: exp_avg_block "
+                        f"mismatch (file={sav_block} current={cur_block})"
+                    )
+                cur.exp_avg_q.copy_(sav["exp_avg_q"])
+                cur.exp_avg_scale_dim1.copy_(sav["exp_avg_scale_dim1"])
+                cur.exp_avg_scale_dim2.copy_(sav["exp_avg_scale_dim2"])

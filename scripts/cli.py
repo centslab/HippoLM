@@ -267,6 +267,22 @@ def build_parser() -> argparse.ArgumentParser:
                         " CLI.")
     p.add_argument("--muon_momentum", type=float, default=0.95,
                    help="SGD momentum for the Muon path.")
+    p.add_argument("--muon_exp_avg_storage", type=str, default="bf16",
+                   choices=("bf16", "fp8_2d_tight"),
+                   help="Storage format for CPUMuon's SGD momentum EMA."
+                        " 'bf16' = full-precision BF16 buffer (legacy)."
+                        " 'fp8_2d_tight' = E4M3 + per-(row × col-block) +"
+                        " per-(col × row-block) FP32 scales; dequant+requant"
+                        " per step. Brings NS output drift from 14-21%"
+                        " down to ~1.45%% on outlier regimes at prod shape."
+                        " Production rollout (2026-07-16): see"
+                        " project_2d_tight_scale.md for the empirical basis.")
+    p.add_argument("--muon_block_size", type=int, default=32,
+                   help="Block size for FP8 2D tight scale EMA storage."
+                        " 32 matches lowbit-Muon's tuned value; smaller"
+                        " blocks reduce NS drift at the cost of more"
+                        " scale storage. Only consulted when"
+                        " --muon_exp_avg_storage=fp8_2d_tight.")
     p.add_argument("--seed", type=int, default=42,
                    help="Init seed for replicated params on each device.")
 
@@ -366,6 +382,8 @@ def _flatten_optimizer_overrides(yml_dict: Dict[str, Any]) -> None:
         ("muon",  "lr",            "muon_lr"),
         ("muon",  "weight_decay",  "muon_weight_decay"),
         ("muon",  "momentum",      "muon_momentum"),
+        ("muon",  "exp_avg_storage", "muon_exp_avg_storage"),
+        ("muon",  "block_size",    "muon_block_size"),
     )
     for group, key, dest in mappings:
         if dest in yml_dict:

@@ -47,7 +47,15 @@ pack_buffer_size: 2048
 # Optimizer hparams
 optimizer:
   adamw: { lr: 0.004, weight_decay: 0.01, beta1: 0.9, beta2: 0.95, eps: 1e-8 }
-  muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95 }
+  # Muon SGD momentum EMA storage: fp8_2d_tight ships 2026-07-16
+  # (see auto-memory project_2d_tight_scale.md). E4M3 + per-(row ×
+  # col-block) + per-(col × row-block) FP32 scales; brings NS output
+  # drift from 14-21% (per-tensor baseline) to 1.45% on B/D regimes
+  # at the prod shape. The BF16 buffer at storage is
+  # precision.muon_momentum.dtype (BF16 in this base config); only
+  # the persistent storage layout changes.
+  muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95,
+           exp_avg_storage: fp8_2d_tight, block_size: 32 }
 max_grad_norm: 1.0
 seed: 42
 

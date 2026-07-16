@@ -167,6 +167,28 @@ class _ParamState:
     # the largest NVFP4 chunk otherwise). Keeps the streaming
     # factor + GPU apply loop from re-allocating per chunk.
     factor_chunk: torch.Tensor | None = None
+    # --- FP8 2D tight scale EMA storage (Muon-only) ---
+    # When ``exp_avg_storage="fp8_2d_tight"`` is set on
+    # :class:`CPUMuon`, the SGD momentum EMA ``exp_avg`` is
+    # stored as E4M3 + per-(row × col-block) + per-(col × row-block)
+    # FP32 scales (the ``lowbit-Muon/quantize_2d`` fine-grained
+    # scheme) instead of BF16. The CPUMuon step() dequants the
+    # FP8 view to BF16 in-place, runs the standard EMA
+    # ``β·prev + grad`` on the BF16 view, then requantizes.
+    # ``exp_avg`` stays ``None`` in this mode; the BF16
+    # dequant target is ``exp_avg_bf16`` (a CPU scratch
+    # buffer that's re-quantized at the end of every step).
+    # All four fields are ``None`` for the default BF16 path.
+    exp_avg_q: torch.Tensor | None = None
+    exp_avg_scale_dim1: torch.Tensor | None = None
+    exp_avg_scale_dim2: torch.Tensor | None = None
+    exp_avg_bf16: torch.Tensor | None = None
+    # Cached param shape (used for 2D reshape on dequant); separate
+    # from ``shape`` (which is also used for the GPU reshape) to
+    # avoid coupling the two codepaths.
+    exp_avg_2d_shape: tuple = field(default_factory=tuple)
+    # Cached block size (matches the quantize/dequantize block).
+    exp_avg_block: int = 0
 
 
 # --------------------------------------------------------------------------- #

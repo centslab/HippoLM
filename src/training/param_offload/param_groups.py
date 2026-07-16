@@ -35,6 +35,8 @@ def build_param_groups(
     adamw_eps: float = 1e-8,
     muon_momentum: float = 0.95,
     muon_weight_decay: float = 0.0,
+    muon_exp_avg_storage: str = "bf16",
+    muon_block_size: int = 32,
     precision: Optional[PrecisionConfig] = None,
 ) -> Tuple[List, List]:
     """Build a (muon_optimizer, adamw_optimizer) pair for a single
@@ -111,6 +113,8 @@ def build_param_groups(
         nesterov=True,
         ns_steps=5,
         weight_decay=muon_weight_decay,   # resolved per-config (default 0.0; was hardcoded)
+        exp_avg_storage=muon_exp_avg_storage,
+        block_size=muon_block_size,
         precision=precision,
     )
     adamw_opt = CPUAdamW(

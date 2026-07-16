@@ -380,6 +380,8 @@ def _setup_worker(
         adamw_eps=args.adamw_eps,
         muon_momentum=args.muon_momentum,
         muon_weight_decay=args.muon_weight_decay,
+        muon_exp_avg_storage=args.muon_exp_avg_storage,
+        muon_block_size=args.muon_block_size,
         precision=precision,
     )
     # Install the per-param post-accumulate-grad hooks so each
