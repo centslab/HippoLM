@@ -70,7 +70,7 @@ def _fp32_dequant_ref(
 
 
 # ---------------------------------------------------------------------------
-# Forward correctness
+# Forward correctness — distribution-level
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("M,K,N", [
     (128, 1024, 1024),
@@ -80,7 +80,16 @@ def _fp32_dequant_ref(
 ])
 def test_w4a8_forward_close_to_fp32_ref(M, K, N):
     """W4A8 forward matches fp32-dequantized reference within the
-    E4M3 B rounding floor (~2-4% median rel).
+    E4M3 B rounding floor.
+
+    Correctness here is checked at the **distribution level** — not
+    per-element relative error. The per-element rel p95 is high
+    (~30%) because the matmul output's bottom 5% has small magnitude
+    (~0.2 abs) and the FP8 cast noise floor (~0.05 abs) dominates
+    the rel. The median rel is ~2.5% (the actual E4M3-B noise floor
+    uniform across shapes); the mean / std / RMSE are bounded and
+    SNR is well above 0 dB. A per-element rel test alone would
+    false-fail on this artifact.
     """
     torch.manual_seed(0)
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
@@ -91,16 +100,52 @@ def test_w4a8_forward_close_to_fp32_ref(M, K, N):
         layer.weight.data.copy_(w)
 
     with torch.no_grad():
-        y_w4a8 = layer(x)
-        y_ref = _fp32_dequant_ref(x, w).bfloat16()
+        y_w4a8 = layer(x).float()
+        y_ref = _fp32_dequant_ref(x, w).bfloat16().float()
 
-    rel = (y_w4a8.float() - y_ref.float()).abs() / (y_ref.float().abs() + 1e-3)
+    # ---- 1. median per-element rel (the E4M3-B rounding floor) ----
+    rel = (y_w4a8 - y_ref).abs() / (y_ref.abs() + 1e-3)
     rel_median = rel.median().item()
     # E4M3 B noise floor: 2-4% median across shapes; allow 5%.
     assert rel_median < 0.05, (
         f"W4A8 fwd diverges from fp32 ref: median_rel={rel_median*100:.2f}%, "
         f"max_rel={rel.max().item()*100:.2f}%"
     )
+
+    # ---- 2. distribution-level: mean and std preserved ----
+    # The noise is zero-mean (per-block random rounding) so the
+    # output mean and std should match the FP32 ref within 5%.
+    mean_diff = abs(y_w4a8.mean().item() - y_ref.mean().item())
+    std_diff = abs(y_w4a8.std().item() - y_ref.std().item())
+    mean_rel = mean_diff / (y_ref.mean().abs().item() + 1e-3)
+    std_rel = std_diff / y_ref.std().item()
+    assert mean_rel < 0.05, f"output mean diverges: {mean_rel*100:.2f}%"
+    assert std_rel < 0.05, f"output std diverges: {std_rel*100:.2f}%"
+
+    # ---- 3. RMSE is bounded (no runaway noise) ----
+    rmse = (y_w4a8 - y_ref).pow(2).mean().sqrt().item()
+    # RMSE scales as sqrt(K) * per-element noise. For K=4096 and
+    # ~5% per-element noise on the dequant, RMSE is ~0.3 abs. The
+    # typical output magnitude is 3-4 abs, so RMSE/output_std
+    # should be < 25%.
+    rmse_rel = rmse / y_ref.std().item()
+    assert rmse_rel < 0.25, f"RMSE too high: {rmse:.4f} abs ({rmse_rel*100:.1f}% of std)"
+
+    # ---- 4. SNR is positive (signal dominates noise) ----
+    signal = y_ref.pow(2).mean()
+    noise = (y_w4a8 - y_ref).pow(2).mean()
+    snr_db = 10 * (signal / noise).log10().item()
+    # Even the worst FP8 matmul should have SNR > 15 dB (the W4A16
+    # Marlin path on this shape gets ~40 dB; W4A8 ~32 dB; the BF16
+    # path is ~55 dB). 15 dB is the floor where the noise would
+    # start to dominate training.
+    assert snr_db > 15.0, f"SNR too low: {snr_db:.2f} dB"
+
+    # ---- 5. max abs err is bounded ----
+    max_abs = (y_w4a8 - y_ref).abs().max().item()
+    # No single output should be off by more than 2x the per-element
+    # FP8 cast noise times sqrt(K). For K=4096, ~0.3 abs.
+    assert max_abs < 1.0, f"max abs err too high: {max_abs:.4f}"
 
 
 # ---------------------------------------------------------------------------
