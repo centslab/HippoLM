@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: Apache-2.0
+// Per-config kernel entry point. The build pipeline instantiates this
+// once per (BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE)
+// combination and the runtime loader dispatches via the gemm_run
+// symbol.
+
+#include "fp8_gemm.cuh"
+
+extern "C" void gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const float *a_scale, const float *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;  // unused for the no-split-K path
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        a_scale, b_scale,
+        reinterpret_cast<bf16 *>(Y),
+        stream);
+}

@@ -276,3 +276,50 @@ def test_extra_repr_reflects_mode():
     layer_w4a8 = NVFP4LinearW4A8(1024, 1024, bias=False, block_size=16)
     assert "NVFP4 W4A8" in layer_w4a8.extra_repr()
     assert "block=16" in layer_w4a8.extra_repr()
+    assert "custom GEMM" not in layer_w4a8.extra_repr()
+
+
+# ---------------------------------------------------------------------------
+# Custom CUDA C++ FP8 GEMM backend (opt-in via use_custom_gemm=True)
+# ---------------------------------------------------------------------------
+try:
+    from src.models.ops.cuda.fp8_gemm import is_available as _fp8_gemm_available
+except ImportError:
+    _fp8_gemm_available = lambda: False  # noqa: E731
+
+
+@pytest.mark.skipif(
+    not _fp8_gemm_available(),
+    reason="custom fp8_gemm .so not built for this SM (run scripts/build_fp8_gemm.py)",
+)
+def test_custom_gemm_backend_matches_default():
+    """W4A8 with ``use_custom_gemm=True`` produces the same output as
+    the default ``_scaled_mm`` backend (within FP8 cast noise), and
+    the ``extra_repr`` reports the right mode.
+    """
+    torch.manual_seed(0)
+    K, N = 1024, 1024
+    M = 2048
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    layer_default = NVFP4LinearW4A8(K, N, bias=False, block_size=16, use_custom_gemm=False).cuda()
+    layer_custom = NVFP4LinearW4A8(K, N, bias=False, block_size=16, use_custom_gemm=True).cuda()
+    with torch.no_grad():
+        layer_default.weight.data.copy_(w)
+        layer_custom.weight.data.copy_(w)
+
+    with torch.no_grad():
+        y_default = layer_default(x).float()
+        y_custom = layer_custom(x).float()
+
+    # Both go through the same fp8 quant + same dequant → same cast noise.
+    # Allow small drift from differing reduction order in the two GEMM
+    # backends (TMA+warp-spec vs cuBLAS nvjet).
+    diff = (y_default - y_custom).abs()
+    max_diff = diff.max().item()
+    assert max_diff < 0.5, f"custom vs default GEMM diverged: max abs diff = {max_diff}"
+
+    # The custom backend should be enabled in the repr.
+    assert "custom GEMM" in layer_custom.extra_repr()
+    assert "custom GEMM" not in layer_default.extra_repr()

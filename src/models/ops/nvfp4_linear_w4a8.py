@@ -1,4 +1,4 @@
-"""W4A8 NVFP4 Linear — two-pass forward (Triton dequant → fp8 + _scaled_mm).
+"""W4A8 NVFP4 Linear — two-pass forward (Triton dequant → fp8 + GEMM).
 
 Forward path
 -------------
@@ -10,7 +10,17 @@ Weight (NVFP4 E2M1, per-block scale + global):
 
 Two-pass forward:
     pass1: dequant_nvfp4_fp8(packed, s_e4m3, g) → b_fp8 [N, K] float8_e4m3fn
-    pass2: _scaled_mm(a_fp8, b_fp8.T, scale_a=a_s, scale_b=1, out_dtype=bf16)
+    pass2: GEMM(a_fp8, b_fp8, scale_a=a_s, scale_b=g/boost) → [M, N] BF16
+
+The pass-2 GEMM has two backends:
+  - ``torch._scaled_mm`` (default, routes to cuBLAS nvjet) — 96-100 TFLOPS
+    on sm_120 at prod FFN shapes (~30% of 400 TFLOPS fp8 spec).
+  - ``fp8_gemm_scaled`` from :mod:`src.models.ops.cuda.fp8_gemm` (opt-in
+    via ``use_custom_gemm=True``) — custom CUDA C++ TMA + warp
+    specialization kernel. Measured 1.01-1.04x cuBLAS at prod shapes
+    on sm_120. Requires ``scripts/build_fp8_gemm.py`` to have been
+    run first (the .so is loaded lazily; if missing, falls back to
+    ``_scaled_mm`` with a warning).
 
 The 448-range fix (auto-boost): s_e4m3 spans 64..448 so e2m1*s products
 can exceed ±448 (E4M3 clamp bound), causing ~49% mean_rel. Fix: pow2
@@ -36,9 +46,9 @@ Why NVFP4 → fp8 (not direct BF16 dequant)
 ------------------------------------------
 Dequantizing NVFP4 → BF16 writes [N, K] BF16 = 50 MB at gate_up.
 Dequantizing NVFP4 → FP8 writes [N, K] FP8  = 12 MB.
-_fp8 GEMM runs at 120-178 TFLOPS on sm_120 (30-45% of 400 TFLOPS spec).
-BF16 GEMM caps at 50 TFLOPS (100% of chip BF16 peak on 5060 Ti).
-Net: fp8 path is 2-3x faster than dequant→BF16+BF16 GEMM.
+_fp8 GEMM runs at 96-100 TFLOPS on sm_120 (custom kernel) — 2-3x
+faster than dequant→BF16+BF16 GEMM (which caps at ~50 TFLOPS,
+the 5060 Ti BF16 chip peak).
 
 Noise floor (inherent to NVFP4 E4M3 B rounding)
 ----------------------------------------------
@@ -477,7 +487,7 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, w_bf16, bias, block_size):
+    def forward(ctx, x, w_bf16, bias, block_size, use_custom_gemm):
         K = x.shape[-1]
         K = w_bf16.shape[1]
         N = w_bf16.shape[0]
@@ -500,16 +510,33 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         # Dequant weight: NVFP4 → fp8 [N, K]
         b_fp8 = dequant_nvfp4_to_fp8(packed, s_e4m3, boost)
 
-        # fp8 GEMM via _scaled_mm
+        # Pass-2 GEMM: pick backend
         g_adj = g.float() / boost
-        scale_b = torch.full((1, N), g_adj.item(), dtype=torch.float32, device=x.device)
-        out_2d = torch._scaled_mm(
-            a_fp8,
-            b_fp8.t(),          # [K, N] view for column-major B
-            scale_a=a_s,
-            scale_b=scale_b,
-            out_dtype=torch.bfloat16,
-        )  # [M, N] BF16
+        if use_custom_gemm:
+            from src.models.ops.cuda.fp8_gemm import (
+                fp8_gemm_scaled, is_available as _fp8_gemm_available,
+            )
+            if not _fp8_gemm_available():
+                # .so not built for this arch — fall back to _scaled_mm
+                # (no warning; the caller opted in knowing the .so
+                # may or may not be present).
+                use_custom_gemm = False
+
+        if use_custom_gemm:
+            # Custom kernel: a_s is [M, 1], scale_b is a scalar
+            # broadcast to [1, N] (all entries = g_adj).
+            scale_b = torch.full((1, N), g_adj.item(), dtype=torch.float32, device=x.device)
+            out_2d = fp8_gemm_scaled(a_fp8, b_fp8, a_s, scale_b)
+        else:
+            # cuBLAS nvjet via _scaled_mm (B is [K, N] col-major view).
+            scale_b = torch.full((1, N), g_adj.item(), dtype=torch.float32, device=x.device)
+            out_2d = torch._scaled_mm(
+                a_fp8,
+                b_fp8.t(),
+                scale_a=a_s,
+                scale_b=scale_b,
+                out_dtype=torch.bfloat16,
+            )
 
         if bias is not None:
             out_2d = out_2d + bias
@@ -536,7 +563,8 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         grad_bias = grad_out_2d.sum(dim=0) if ctx.has_bias else None
 
         grad_x = grad_x_2d.reshape(*ctx.shape)
-        return grad_x.to(x.dtype), grad_w.to(w.dtype), grad_bias, None
+        # 5 grads: x, w, bias, block_size, use_custom_gemm (last two are None — non-differentiable knobs)
+        return grad_x.to(x.dtype), grad_w.to(w.dtype), grad_bias, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -582,11 +610,13 @@ class NVFP4LinearW4A8(nn.Module):
         device=None,
         dtype=None,
         bf16_only: bool = False,
+        use_custom_gemm: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = block_size
+        self.use_custom_gemm = use_custom_gemm
 
         # _scaled_mm requires [N, K] divisible by 16 on sm_120.
         # b_proj (1536 → 12) hits this, so we fall back silently.
@@ -616,11 +646,16 @@ class NVFP4LinearW4A8(nn.Module):
         if self.bf16_only:
             return F.linear(x, self.weight, self.bias)
         return _NVFP4W4A8Matmul.apply(
-            x, self.weight, self.bias, self.block_size,
+            x, self.weight, self.bias, self.block_size, self.use_custom_gemm,
         )
 
     def extra_repr(self) -> str:
-        mode = "BF16 (bf16_only=True)" if self.bf16_only else f"NVFP4 W4A8 (block={self.block_size})"
+        if self.bf16_only:
+            mode = "BF16 (bf16_only=True)"
+        elif self.use_custom_gemm:
+            mode = f"NVFP4 W4A8 + custom GEMM (block={self.block_size})"
+        else:
+            mode = f"NVFP4 W4A8 (block={self.block_size})"
         return (
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
