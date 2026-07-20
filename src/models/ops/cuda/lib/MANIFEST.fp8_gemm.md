@@ -28,8 +28,6 @@ paying a ~30 s `nvcc` compile cost per config.
 | `fp8_gemm_sm_120_bm64_bn64_bk128_s2_cwg1_wm32_wn32.so`      | reference                                       | `gemm_run`     |
 | `fp8_gemm_sm_120_bm128_bn64_bk128_s3_cwg1_wm32_wn64_ds.so`  | reference                                       | `gemm_run`     |
 | `fp8_gemm_sm_120_bm64_bn128_bk128_s3_cwg1_wm32_wn64_ds.so`  | reference                                       | `gemm_run`     |
-| `fp8_gemm_sm_120_bm64_bn128_bk128_s2_cwg1_wm32_wn64_ds.so`  | reference (2 blocks/SM, 48 KB)                   | `gemm_run`     |
-| `fp8_gemm_sm_120_bm128_bn64_bk128_s2_cwg1_wm32_wn64_ds.so`  | reference (2 blocks/SM, 48 KB)                   | `gemm_run`     |
 
 Naming: `{sm}_{tile-config}` where the tile config encodes the warp
 specialization layout. The `_ds` suffix means DIRECT_STORE epilogue
@@ -64,21 +62,22 @@ The committed .so set was built with CUDA 13.0 + nvcc, on a 5060 Ti
 | `bm128_bn128_bk128_s3_cwg2_wm32_wn64_ds` (PROD) | **4.12 ms (1.04x)**    | **2.06 ms (1.01x)** |
 | `bm64_bn64_bk128_s3_cwg1_wm32_wn32_ds`          | 5.30 ms (0.81x)        | 2.40 ms (0.87x)     |
 | `bm128_bn128_bk128_s2_cwg2_wm32_wn64`           | 4.34 ms (0.99x)        | 2.20 ms (0.95x)     |
-| `bm64_bn128_bk128_s2_cwg1_wm32_wn64_ds` (2 blk) | 4.67 ms (0.92x)        | 2.24 ms (0.93x)     |
-| `bm128_bn64_bk128_s2_cwg1_wm32_wn64_ds` (2 blk) | 4.66 ms (0.92x)        | 2.25 ms (0.93x)     |
 
 cuBLAS (`torch._scaled_mm`) reaches ~96-100 TFLOPS at these shapes
-(24-25% of the 400 TFLOPS fp8 spec on sm_120). The custom kernel
-matches cuBLAS at the same shapes; the +1-4% win comes from
-avoiding nvjet's small-K tail.
+(~103% of the 97 TFLOPS fp8 dense peak on sm_120 — i.e. at peak).
+The custom kernel matches cuBLAS at the same shapes; the +1-4%
+win comes from avoiding nvjet's small-K tail.
 
 ## Bottleneck analysis (2026-07-20, see auto-memory `project_fp8_gemm_bottleneck.md`)
 
-At the prod FFN shape, the kernel reaches ~25% of the 400 TFLOPS
-fp8 spec (100 TFLOPS) — this is the same ceiling as cuBLAS CUTLASS
-RowWise on sm_120 (forced to CUTLASS path because cuBLASLt
-RowWise returns 0 algos on Blackwell consumer, see
-`cublaslt_no_rowwise_sm120.md`).
+At the prod FFN shape, the kernel reaches ~100 TFLOPS = ~103% of the
+97 TFLOPS fp8 dense peak on sm_120 (re-baselined 2026-07-20 — the
+prior "25% of 400 TF" framing was based on a wrong 400 TFLOPS fp8
+spec). This matches cuBLAS CUTLASS RowWise on sm_120 (forced to
+CUTLASS path because cuBLASLt RowWise returns 0 algos on Blackwell
+consumer, see `cublaslt_no_rowwise_sm120.md`). The 100 TF = at peak
+result holds for `_scaled_mm`, the PROD TMA kernel, and `_scaled_mm`
+across all K dimensions (1536/2048/4096).
 
 **Occupancy is NOT the bottleneck.** All 2-blocks/SM candidates
 (both `bm64_bn128_s2` and `bm128_bn64_s2` at 48 KB smem) measure
@@ -87,11 +86,18 @@ launch_bounds (384, 1) is intentional: smem 96 KB at PROD
 already forces 1 block/SM, and a 2-block attempt trades
 pipeline depth for occupancy (NUM_STAGES=2 vs 3) and loses.
 
-**Per-block compute pipeline is the limit.** The kernel is
-launch-bound at ~8 consumer warps/SM doing m16n8k32 E4M3 MMA.
-Hitting more of the 400 TF spec likely requires a structural
-change (2 producer threads for parallel TMA, m16n8k64 mma if
-available on sm_120, or split-K) — all TODO, see
-`project_fp8_gemm_bottleneck.md` for the next-up optimization
-candidates.
+**At peak; 3 structural levers all dead-ended.** Three potential
+levers were probed empirically (2026-07-20):
+Split-K (2-pass simulation 0.66-0.98x of 1-pass — kernel
+launch + add overhead exceeds any parallelism win at prod
+tile counts), `m16n8k64` E4M3 MMA (`ptxas` rejects —
+"Incorrect instruction type" — not supported on sm_120), and
+2 producer lanes for parallel TMA (TMA unit issues 1 per
+warp-cycle anyway, and the `expect_tx` ordering across lanes
+is racy → deadlock). All three are dead ends on sm_120 for
+this kernel; PROD at 1.04x _scaled_mm = ~100 TFLOPS saturates
+the 97 TF dense fp8 peak (= at peak). To go further would
+need either B200 (sm_100 datacenter, ~3x fp8 throughput per
+SM) or non-fp8 numeric paths. See auto-memory
+`project_fp8_gemm_bottleneck.md` for full analysis.
 
