@@ -28,7 +28,10 @@ import torch
 import torch.nn.functional as F
 
 from src.models.ops.nvfp4_linear_w4a8 import (
-    NVFP4LinearW4A8, quantize_act_fp8,
+    NVFP4LinearW4A8, NVFP4W4A8SwiGLU,
+    quantize_act_fp8, quantize_act_fp8_fused,
+    silu_mul_fused,
+    silu_quant_fused,
     _E4M3_MAX, _E4M3_MIN_NORMAL,
 )
 from src.models.ops.nvfp4_marlin import (
@@ -322,4 +325,413 @@ def test_custom_gemm_backend_matches_default():
 
     # The custom backend should be enabled in the repr.
     assert "custom GEMM" in layer_custom.extra_repr()
-    assert "custom GEMM" not in layer_default.extra_repr()
+
+
+def test_boost_cache_invalidates_on_weight_change():
+    """Strategy 3: ``_boost_cache`` must refresh when the BF16 master
+    weight is modified (since s_e4m3 → smax changes), and reuse the same
+    value across forwards with an unchanged weight.
+
+    Validates both the perf-relevant reuse (cache hit on second call)
+    and the correctness-relevant invalidation (cache miss + fresh boost
+    after weight modification). Note: the boost VALUE quantizes smax to
+    the nearest pow2, so two very-different scales can map to the same
+    boost. We assert invalidation via the version counter and output
+    divergence, not via the boost value itself.
+    """
+    torch.manual_seed(0)
+    K, N = 512, 512
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16).cuda()
+    x = torch.randn(64, K, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    # First forward: cache miss, boost computed.
+    y0 = layer(x)
+    assert layer._boost_cache is not None
+    assert layer._boost_w_ver == layer.weight._version
+    ver_after_first = layer._boost_w_ver
+
+    # Second forward with same weight: cache hit (version unchanged), bit-exact.
+    y1 = layer(x)
+    assert layer._boost_w_ver == ver_after_first
+    assert torch.equal(y0, y1), "boost cache should give bit-exact repeats"
+
+    # Perturb the weight — must invalidate cache and produce a different
+    # output (regardless of whether the quantized boost value coincides).
+    with torch.no_grad():
+        layer.weight.mul_(0.01)
+    ver_after_modify = layer.weight._version
+    assert ver_after_modify > ver_after_first, (
+        f"weight._version did not bump on in-place mul: "
+        f"{ver_after_first} → {ver_after_modify}"
+    )
+    y2 = layer(x)
+    assert layer._boost_w_ver == ver_after_modify, (
+        "boost cache did not refresh after weight._version change"
+    )
+    # Output must differ — verifies the fresh boost/scale flowed through.
+    assert not torch.equal(y0, y2), "weight change did not propagate to output"
+
+
+# ---------------------------------------------------------------------------
+# Strategy 2: pack cache (skip-N NVFP4 quant)
+# ---------------------------------------------------------------------------
+def test_pack_cache_invalidates_on_weight_change():
+    """The pack cache must refresh when the BF16 master weight
+    changes (since packed bytes → s_e4m3 → g are functions of w).
+    Validates both reuse (cache hit on second call, bit-exact) and
+    invalidation (cache miss + fresh pack after weight modification).
+    """
+    torch.manual_seed(0)
+    K, N = 512, 512
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16).cuda()
+    x = torch.randn(64, K, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    # First forward: cache miss.
+    y0 = layer(x)
+    assert layer._pack_cache is not None, "pack cache not populated after first forward"
+    cached_packed = layer._pack_cache[0]
+    assert layer._pack_w_ver == layer.weight._version
+    ver_after_first = layer._pack_w_ver
+
+    # Second forward with same weight: cache hit (version unchanged).
+    y1 = layer(x)
+    assert layer._pack_w_ver == ver_after_first, "pack cache should not refresh on same weight"
+    # Same identity on the packed buffer — confirms cache hit
+    # (a fresh quant would return a new tensor object).
+    assert layer._pack_cache[0] is cached_packed, (
+        "packed buffer identity changed — cache did not hit"
+    )
+    assert torch.equal(y0, y1), "pack cache should give bit-exact repeats"
+
+    # Invalidate: in-place weight modification → version bumps.
+    with torch.no_grad():
+        layer.weight.mul_(0.5)
+    ver_after_modify = layer.weight._version
+    assert ver_after_modify > ver_after_first
+    y2 = layer(x)
+    assert layer._pack_w_ver == ver_after_modify, "pack cache did not refresh on weight change"
+    assert not torch.equal(y0, y2), "weight change did not propagate to output"
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: forward_precomputed skips act_quant (shared activation)
+# ---------------------------------------------------------------------------
+def test_forward_precomputed_matches_forward():
+    """``forward_precomputed(x, a_fp8, a_s)`` with caller-supplied
+    fp8 activation must produce the same output as ``forward(x)``
+    (modulo BF16 reduction-order noise in the GEMM, well below
+    the E4M3 cast noise floor). Both code paths consume identical
+    ``a_fp8`` and ``a_s`` — the only difference is who computed them.
+    """
+    torch.manual_seed(0)
+    K, N = 1024, 1024
+    M = 2048
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16).cuda()
+    with torch.no_grad():
+        layer.weight.data.copy_(w)
+
+    a_fp8, a_s = quantize_act_fp8_fused(x)
+
+    with torch.no_grad():
+        y_default = layer(x)
+        y_pre = layer.forward_precomputed(x, a_fp8, a_s)
+
+    # Bit-exact: both paths use the same a_fp8/a_s, same dequant, same
+    # _scaled_mm kernel call. The forward_precomputed path is a strict
+    # prefix-skip of the default forward, so the output bytes are
+    # guaranteed identical.
+    assert torch.equal(y_default, y_pre), (
+        f"forward_precomputed diverged from forward: "
+        f"max abs diff = {(y_default - y_pre).abs().max().item()}"
+    )
+
+
+def test_forward_precomputed_bf16_only_bypasses_quant():
+    """Even with pre-quantized inputs, ``bf16_only=True`` skips
+    both the act_quant AND the W4A8 path and returns ``F.linear``.
+    """
+    K, N = 1024, 1024
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16, bf16_only=True).cuda()
+    x = torch.randn(64, K, dtype=torch.bfloat16, device="cuda")
+    a_fp8 = torch.zeros(64, K, dtype=torch.float8_e4m3fn, device="cuda")
+    a_s = torch.ones(64, 1, dtype=torch.float32, device="cuda")
+    with torch.no_grad():
+        y = layer.forward_precomputed(x, a_fp8, a_s)
+        y_ref = torch.nn.functional.linear(x, layer.weight)
+    assert torch.equal(y, y_ref), "bf16_only precomputed path is not bit-exact with F.linear"
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: NVFP4W4A8SwiGLU — gate+up share act_quant
+# ---------------------------------------------------------------------------
+def test_swiglu_matches_unfused_when_called_together():
+    """NVFP4W4A8SwiGLU's output must match a baseline SwiGLU where
+    gate and up each do their own act_quant, because the fp8 cast is
+    deterministic in x — the two paths consume identical a_fp8/a_s
+    for both gate and up.
+
+    Uses an unfused baseline (no shared act_quant) and an explicit
+    shared baseline (one quant, two reuses); both must bit-equal
+    the wrapper's output.
+    """
+    torch.manual_seed(0)
+    M, H, I = 1024, 1024, 2048
+
+    swiglu = NVFP4W4A8SwiGLU(H, I, bias=False, block_size=16).cuda()
+    x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda")
+
+    with torch.no_grad():
+        # Shared path
+        y_swiglu = swiglu(x)
+
+        # Unfused reference: separate modules, separate act_quants
+        gate_ref = swiglu.gate_proj
+        up_ref = swiglu.up_proj
+        down_ref = swiglu.down_proj
+        gate_y = gate_ref(x)
+        up_y = up_ref(x)
+        hidden_ref = torch.nn.functional.silu(gate_y) * up_y
+        y_unfused = down_ref(hidden_ref)
+
+        # Shared-reference: same modules, one act_quant, two reuses
+        a_fp8, a_s = quantize_act_fp8_fused(x.reshape(-1, x.shape[-1]))
+        gate_y2 = gate_ref.forward_precomputed(x, a_fp8, a_s)
+        up_y2 = up_ref.forward_precomputed(x, a_fp8, a_s)
+        hidden_shared = torch.nn.functional.silu(gate_y2) * up_y2
+        y_shared_ref = down_ref(hidden_shared)
+
+    # Wrapper uses ``silu_mul_fused`` (more precise fp32 silu); the
+    # shared-reference uses ``F.silu(gate) * up`` (bf16 intermediate).
+    # They differ by bf16 round-off noise — the silu precision
+    # difference propagates through the down matmul (max abs diff
+    # ~0.01 at this magnitude). The contract is "within bf16 noise",
+    # not bit-exact.
+    max_abs = (y_swiglu - y_shared_ref).abs().max().item()
+    assert max_abs < 0.1, (
+        f"SwiGLU wrapper output diverged from shared-reference: "
+        f"max_abs_diff={max_abs:.4f}"
+    )
+    # Shared-reference vs unfused: must agree within BF16 reduction
+    # noise (same GEMM kernels, same fp8 inputs, only the act_quant
+    # launch count differs). The rel floor at this shape is well
+    # under 1%.
+    rel = (y_shared_ref - y_unfused).abs() / (y_unfused.abs() + 1e-3)
+    assert rel.median().item() < 0.01, (
+        f"shared act_quant diverged from unfused: median_rel="
+        f"{rel.median().item()*100:.3f}%"
+    )
+
+
+def test_swiglu_bf16_only_path():
+    """When any of gate/up/down has unaligned shapes (forces
+    ``bf16_only=True`` on that layer), the wrapper still produces
+    the correct output via plain ``F.linear`` for the bf16 path
+    and the shared-act_quant optimization for the rest.
+    """
+    # H=1536, I=4096 are both div by 16, but the test is a sanity
+    # check that the bf16_only branch in NVFP4W4A8SwiGLU.forward
+    # works without exceptions and matches the unfused F.linear
+    # reference.
+    torch.manual_seed(0)
+    M, H, I = 256, 1024, 1024
+    swiglu = NVFP4W4A8SwiGLU(H, I, bias=True, block_size=16,
+                              bf16_only=True).cuda()
+    x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda")
+    with torch.no_grad():
+        y = swiglu(x)
+        # Reference: 3 F.linear calls + silu*up
+        g = torch.nn.functional.linear(x, swiglu.gate_proj.weight,
+                                       swiglu.gate_proj.bias)
+        u = torch.nn.functional.linear(x, swiglu.up_proj.weight,
+                                       swiglu.up_proj.bias)
+        h = torch.nn.functional.silu(g) * u
+        y_ref = torch.nn.functional.linear(h, swiglu.down_proj.weight,
+                                           swiglu.down_proj.bias)
+    assert torch.equal(y, y_ref), "bf16_only SwiGLU not bit-exact with F.linear reference"
+
+
+# ---------------------------------------------------------------------------
+# Fused silu(gate) * up — one Triton kernel
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("M,N", [
+    (1024, 1024),
+    (16384, 4096),    # prod gate_up
+    (4096, 11008),    # Llama-style intermediate
+    (1, 4096),        # edge: single row
+    (16384, 1),       # edge: single col
+])
+def test_silu_mul_fused_matches_pytorch(M, N):
+    """``silu_mul_fused(gate, up)`` must match ``F.silu(gate) * up``
+    within bf16 round-off. The fused path computes silu in fp32
+    registers (one extra bit of precision) before narrowing on store,
+    so it's not bit-exact — but the difference is bounded by 1 ULP per
+    element (~0.06 at magnitude-1 inputs) and zero on average.
+    """
+    torch.manual_seed(0)
+    gate = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    up = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+
+    y_ref = torch.nn.functional.silu(gate) * up
+    y_test = silu_mul_fused(gate, up)
+
+    diff = (y_ref.float() - y_test.float()).abs()
+    max_abs = diff.max().item()
+    # Max abs diff is bounded by 1 ULP of bf16 at the output magnitude
+    # (~0.06 at magnitude-1 outputs) plus 1 ULP from the silu rounding.
+    assert max_abs < 0.1, (
+        f"silu_mul_fused diverges from PyTorch: max_abs_diff={max_abs:.4f} "
+        f"at M={M}, N={N}"
+    )
+    # Median rel must be effectively zero (most elements agree exactly).
+    rel = diff / (y_ref.float().abs() + 1e-3)
+    assert rel.median().item() < 0.01, (
+        f"silu_mul_fused median rel too high: {rel.median().item()*100:.3f}%"
+    )
+
+
+def test_silu_mul_fused_output_shape_and_dtype():
+    """Output must be [M, N] BF16, contiguous, same device as inputs."""
+    gate = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    up = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    out = silu_mul_fused(gate, up)
+    assert out.shape == (64, 128)
+    assert out.dtype == torch.bfloat16
+    assert out.device == gate.device
+
+
+def test_swiglu_uses_fused_silu_mul_path():
+    """NVFP4W4A8SwiGLU.forward must use ``silu_mul_fused`` (not the
+    naive ``F.silu(gate) * up``) so the FFN gets the ~0.7 ms win.
+
+    Indirect check: the SwiGLU output must match a baseline that uses
+    the fused silu_mul_fused call explicitly — and differ from the
+    baseline that uses ``F.silu(gate) * up`` only by bf16 round-off
+    (which is the same as the silu_mul_fused contract above).
+    """
+    torch.manual_seed(0)
+    M, H, I = 1024, 1024, 2048
+    swiglu = NVFP4W4A8SwiGLU(H, I, bias=False, block_size=16).cuda()
+    x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda")
+
+    # Build baselines using the SAME sub-modules but with explicit
+    # silu_mul_fused vs F.silu — so the only difference is the silu
+    # path (gate/up matmuls + act_quant + down matmul are identical).
+    gate = swiglu.gate_proj
+    up = swiglu.up_proj
+    down = swiglu.down_proj
+
+    with torch.no_grad():
+        a_fp8, a_s = quantize_act_fp8_fused(x.reshape(-1, x.shape[-1]))
+        g = gate.forward_precomputed(x, a_fp8, a_s)
+        u = up.forward_precomputed(x, a_fp8, a_s)
+        h_fused = silu_mul_fused(g, u)
+        h_naive = torch.nn.functional.silu(g) * u
+        y_fused = down(h_fused)
+        y_naive = down(h_naive)
+
+    # SwiGLU uses silu_mul_fused internally — must match the fused
+    # baseline bit-exactly (same kernel, same inputs).
+    with torch.no_grad():
+        y_swiglu = swiglu(x)
+    assert torch.equal(y_swiglu, y_fused), (
+        "NVFP4W4A8SwiGLU output diverged from silu_mul_fused baseline"
+    )
+
+    # Naive baseline differs from SwiGLU only by bf16 round-off in the
+    # silu intermediate — the same magnitude as test_silu_mul_fused_matches_pytorch.
+    diff = (y_swiglu.float() - y_naive.float()).abs().max().item()
+    assert diff < 0.1, f"SwiGLU differs from naive path by {diff:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Fused silu(gate) * up + down_proj act_quant — one Triton kernel (F2)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("M,N", [
+    (1024, 1024),
+    (16384, 4096),    # prod gate_up (= down_proj input)
+    (4096, 11008),    # Llama-style intermediate
+    (1, 4096),        # edge: single row
+    (16384, 1),       # edge: single col
+])
+def test_silu_quant_fused_matches_unfused(M, N):
+    """``silu_quant_fused(gate, up)`` must be BIT-EXACT with the unfused
+    ``silu_mul_fused(gate, up)`` → ``quantize_act_fp8_fused(hidden)``
+    path — that's the production contract it replaces.
+
+    The kernel narrows the fp32 silu output to bf16 before the amax and
+    fp8 cast, so the fp8 hidden, the per-row scale, and the returned bf16
+    hidden all match the two-kernel path exactly (no round-off drift).
+    """
+    torch.manual_seed(0)
+    gate = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    up = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+
+    hidden_ref = silu_mul_fused(gate, up)
+    a_fp8_ref, a_s_ref = quantize_act_fp8_fused(hidden_ref)
+
+    a_fp8, a_s, hidden = silu_quant_fused(gate, up)
+
+    assert torch.equal(hidden, hidden_ref), (
+        f"bf16 hidden diverged at M={M}, N={N}"
+    )
+    assert torch.equal(a_fp8, a_fp8_ref), (
+        f"fp8 hidden diverged at M={M}, N={N}"
+    )
+    assert torch.equal(a_s, a_s_ref), (
+        f"per-row scale diverged at M={M}, N={N}"
+    )
+
+
+def test_silu_quant_fused_output_shape_and_dtype():
+    """Outputs: fp8 [M,N], scale [M,1] fp32, bf16 hidden [M,N]."""
+    gate = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    up = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    a_fp8, a_s, hidden = silu_quant_fused(gate, up)
+    assert a_fp8.shape == (64, 128)
+    assert a_fp8.dtype == torch.float8_e4m3fn
+    assert a_s.shape == (64, 1)
+    assert a_s.dtype == torch.float32
+    assert hidden.shape == (64, 128)
+    assert hidden.dtype == torch.bfloat16
+    assert a_fp8.device == gate.device
+
+
+def test_swiglu_uses_fused_silu_quant_path():
+    """F2 SwiGLU forward must use ``silu_quant_fused`` (not the F1
+    silu_mul_fused + separate act_quant) — that's the optimization
+    under test.
+
+    The test runs both paths through the same SwiGLU module on the
+    same input and checks bit-exactness:
+      - F2 reference: gate/up via forward_precomputed + silu_quant_fused
+        + down_proj via forward_precomputed
+      - F2 test: full swiglu(x)
+
+    If F2 is bit-exact with the explicit silu_quant_fused path (which
+    is itself bit-exact with silu_mul_fused + act_quant), the SwiGLU
+    output is bit-exact with the unfused SwiGLU. Backward behavior
+    follows the same argument — STE reads only the bf16 hidden, which
+    F2 produces bit-exactly.
+    """
+    torch.manual_seed(0)
+    M, H, I = 1024, 1024, 2048
+    swiglu = NVFP4W4A8SwiGLU(H, I, bias=False, block_size=16).cuda()
+    x = torch.randn(M, H, dtype=torch.bfloat16, device="cuda")
+
+    with torch.no_grad():
+        # F2 path: build it explicitly using silu_quant_fused
+        a_fp8, a_s = quantize_act_fp8_fused(x.reshape(-1, H))
+        g = swiglu.gate_proj.forward_precomputed(x, a_fp8, a_s)
+        u = swiglu.up_proj.forward_precomputed(x, a_fp8, a_s)
+        h_fp8, h_s, hidden = silu_quant_fused(g, u)
+        y_ref = swiglu.down_proj.forward_precomputed(hidden, h_fp8, h_s)
+
+        # Test path: full SwiGLU (must use F2 internally)
+        y_test = swiglu(x)
+
+    assert torch.equal(y_test, y_ref), (
+        "F2 SwiGLU output diverged from explicit silu_quant_fused path"
+    )

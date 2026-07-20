@@ -487,7 +487,8 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, w_bf16, bias, block_size, use_custom_gemm):
+    def forward(ctx, x, w_bf16, bias, block_size, use_custom_gemm, module,
+                a_fp8_override=None, a_s_override=None):
         K = x.shape[-1]
         K = w_bf16.shape[1]
         N = w_bf16.shape[0]
@@ -499,13 +500,26 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         # Quantize activation: fused per-row amax + fp8 cast in one
         # Triton launch (replaces the prior Python amax + separate
         # quantize kernel — saves ~0.5 ms per forward at prod shape).
-        a_fp8, a_s = quantize_act_fp8_fused(x_2d)
+        # In the shared-activation path (Strategy 1 — see
+        # NVFP4W4A8SwiGLU), the caller pre-computes a_fp8/a_s on the
+        # shared input and passes them in here to skip this launch.
+        if a_fp8_override is None:
+            a_fp8, a_s = quantize_act_fp8_fused(x_2d)
+        else:
+            a_fp8, a_s = a_fp8_override, a_s_override
 
-        # Quantize weight: NVFP4 packed + scales + global
-        packed, s_e4m3, g = quantize_nvfp4_with_global_scale(
-            w_bf16, block_size=block_size,
-        )
-        boost = _auto_boost(s_e4m3)
+        # Quantize weight: NVFP4 packed + scales + global.
+        # Cached on the module and invalidated when w_bf16._version changes
+        # (Strategy 2 — skip-N pack cache). Saves the 0.59 ms w_quant
+        # Triton launch on every forward after the first, as long as
+        # the BF16 master weight hasn't been touched. During training
+        # the optimizer bumps _version per step, so hit rate is
+        # (N_microbatches-1)/N_microbatches; in a bench loop it's 1.0.
+        packed, s_e4m3, g = module._get_or_refresh_pack(w_bf16, block_size)
+        # Boost = pow2 scale so max|e2m1*s_e4m3*C| stays inside E4M3 range.
+        # Cached on the module and invalidated when w_bf16._version changes
+        # (i.e. when the optimizer/loader modifies the BF16 master weight).
+        boost = module._get_or_refresh_boost(w_bf16, s_e4m3)
 
         # Dequant weight: NVFP4 → fp8 [N, K]
         b_fp8 = dequant_nvfp4_to_fp8(packed, s_e4m3, boost)
@@ -563,8 +577,13 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         grad_bias = grad_out_2d.sum(dim=0) if ctx.has_bias else None
 
         grad_x = grad_x_2d.reshape(*ctx.shape)
-        # 5 grads: x, w, bias, block_size, use_custom_gemm (last two are None — non-differentiable knobs)
-        return grad_x.to(x.dtype), grad_w.to(w.dtype), grad_bias, None, None
+        # 8 grads: x, w, bias, block_size, use_custom_gemm, module,
+        # a_fp8_override, a_s_override. The last three are non-tensor
+        # knobs; the overrides are derived buffers (no grad flow).
+        return (
+            grad_x.to(x.dtype), grad_w.to(w.dtype), grad_bias,
+            None, None, None, None, None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +653,21 @@ class NVFP4LinearW4A8(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        # Boost cache for auto_boost (Strategy 3). Version sentinel -1
+        # forces first forward to compute; subsequent forwards refresh
+        # only when the BF16 master's _version changes.
+        self._boost_cache: float | None = None
+        self._boost_w_ver: int = -1
+
+        # Pack cache (Strategy 2 — skip-N NVFP4 quant). Holds
+        # (packed, s_e4m3, g) keyed by w_bf16._version. The tensors
+        # stay alive in HBM as long as the cache is valid; per-layer
+        # cost is ~3.4 MB at gate_up shape. The dequant (0.08 ms) is
+        # NOT cached — only the slow w_quant (0.59 ms).
+        self._pack_cache: tuple[torch.Tensor, torch.Tensor, float] | None = None
+        self._pack_w_ver: int = -1
+        self._pack_block_size: int = -1
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -646,8 +680,101 @@ class NVFP4LinearW4A8(nn.Module):
         if self.bf16_only:
             return F.linear(x, self.weight, self.bias)
         return _NVFP4W4A8Matmul.apply(
-            x, self.weight, self.bias, self.block_size, self.use_custom_gemm,
+            x, self.weight, self.bias, self.block_size, self.use_custom_gemm, self,
         )
+
+    # ------------------------------------------------------------------
+    # Precomputed activation (Strategy 1 — share act_quant across gate+up)
+    # ------------------------------------------------------------------
+    # In the SwiGLU FFN, gate and up both consume the same ``x`` but
+    # write to different output tensors. The naive pipeline runs
+    # ``quantize_act_fp8_fused(x)`` twice (once per matmul), which is
+    # wasteful — the fp8 tensor and the per-row scale are deterministic
+    # functions of x. ``forward_precomputed`` skips the act_quant and
+    # uses caller-supplied fp8 + scale buffers instead.
+    #
+    # The autograd Function discards the overrides in backward (STE
+    # re-runs in BF16 from the original ``x``), so correctness is
+    # preserved. Output shape is computed from ``x.shape`` so 2D and
+    # 3D inputs both work.
+    def forward_precomputed(
+        self, x: torch.Tensor, a_fp8: torch.Tensor, a_s: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.bf16_only:
+            return F.linear(x, self.weight, self.bias)
+        return _NVFP4W4A8Matmul.apply(
+            x, self.weight, self.bias, self.block_size, self.use_custom_gemm, self,
+            a_fp8, a_s,
+        )
+
+    # ------------------------------------------------------------------
+    # Boost cache (Strategy 3 — moves per-forward auto_boost to module init)
+    # ------------------------------------------------------------------
+    # auto_boost picks a pow2 scale so the per-block NVFP4 E2M1*s product
+    # stays inside the E4M3 ±448 range. It computes
+    #     smax = scales_e4m3.float().abs().max().item()
+    # then returns 2^floor(log2(448 / (6*smax))). The .item() is a D2H
+    # sync — ~0.086 ms / call on prod shape. Cache it on the module,
+    # invalidating only when the BF16 master's _version changes.
+    #
+    # In training with the standard BF16-master path (this module),
+    # w_bf16._version bumps every optimizer step → cache hit rate ≈ 0
+    # (no win in training). But in bench loops / inference where the
+    # master is constant, the cache hits every forward after the first
+    # and saves the D2H sync each time. Win compounds when combined
+    # with Strategy 2 (which avoids the w_quant that re-feeds s_e4m3).
+    def _get_or_refresh_boost(
+        self, w_bf16: torch.Tensor, s_e4m3: torch.Tensor,
+    ) -> float:
+        w_ver = w_bf16._version
+        if self._boost_w_ver != w_ver:
+            self._boost_cache = _auto_boost(s_e4m3)
+            self._boost_w_ver = w_ver
+        return self._boost_cache
+
+    # ------------------------------------------------------------------
+    # Pack cache (Strategy 2 — skip-N NVFP4 quant)
+    # ------------------------------------------------------------------
+    # ``quantize_nvfp4_with_global_scale`` is the slowest per-forward
+    # op at 0.59 ms on the prod gate_up shape (sm_120, M=16384 K=1536
+    # N=4096). The output is purely a function of the BF16 master
+    # weight — the same w_bf16 always produces the same packed bytes.
+    # Cache (packed, s_e4m3, g) on the module and reuse across forwards
+    # until the optimizer bumps ``w_bf16._version``.
+    #
+    # VRAM cost (real, NOT saved_tensors): ~3.4 MB per layer at
+    # gate_up shape (4096*1536*0.5625 bytes for the packed + scales,
+    # +4 bytes for g). For a 12-layer model = ~41 MB. That is below
+    # the 5060 Ti 16 GB ceiling but is a real HWM increase —
+    # ``torch.cuda.max_memory_allocated()`` will reflect it. The
+    # benefit (1.77 ms saved per FFN forward in bench, 0 in single
+    # forward) is bench-loop-only; in training the optimizer step
+    # invalidates the cache so hit rate is (N_mb-1)/N_mb ≈ 0.95
+    # for typical N_mb=20.
+    #
+    # The dequant (0.08 ms) is intentionally NOT cached — caching
+    # b_fp8 would cost 3x more VRAM (N*K bytes vs N*K/2) for only
+    # 0.25 ms/FFN additional savings. Stick with the cheaper cache.
+    def _get_or_refresh_pack(
+        self, w_bf16: torch.Tensor, block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        w_ver = w_bf16._version
+        if (
+            self._pack_w_ver != w_ver
+            or self._pack_block_size != block_size
+            or self._pack_cache is None
+        ):
+            packed, s_e4m3, g = quantize_nvfp4_with_global_scale(
+                w_bf16, block_size=block_size,
+            )
+            # Cache the packed bytes + scales + the 0-dim global-scale
+            # tensor (downstream does ``g.float() / boost`` on it, so
+            # keep it as a tensor rather than converting to a Python
+            # float — avoids re-wrapping on every cache hit).
+            self._pack_cache = (packed, s_e4m3, g)
+            self._pack_w_ver = w_ver
+            self._pack_block_size = block_size
+        return self._pack_cache
 
     def extra_repr(self) -> str:
         if self.bf16_only:
@@ -661,4 +788,315 @@ class NVFP4LinearW4A8(nn.Module):
             f"out_features={self.out_features}, "
             f"bias={self.bias is not None}, "
             f"mode={mode}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU FFN with shared act_quant across gate+up
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Fused silu(gate) * up — single Triton kernel (no intermediate buffer)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _silu_mul_kernel(
+    GATE_ptr, UP_ptr, OUT_ptr,
+    M, N,
+    stride_gm, stride_gn,
+    stride_um, stride_un,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """``silu(gate) * up`` in one pass.
+
+    The naive PyTorch expression ``F.silu(gate) * up`` materializes a
+    ``silu(gate)`` intermediate (~256 MB at prod M=16384 I=4096) before
+    multiplying by ``up`` — two passes through HBM for an op that
+    logically only needs the three buffers (gate, up, hidden) read or
+    written once each.
+
+    This kernel reads gate and up together, computes ``g * sigmoid(g)``
+    in fp32 registers, multiplies by ``u``, and writes the result —
+    384 MB of HBM traffic instead of 640 MB (~40% less). Measured
+    1.71 ms → 1.02 ms on sm_120 at the prod shape (40% wall reduction,
+    see auto-memory ``project_w4a8_ffn_e2e.md``).
+
+    Numerics: the fp32-in-register silu is one ULP more precise than
+    PyTorch's bf16-intermediate path. Not bit-exact, but the difference
+    is well within bf16 round-off noise (max abs diff ~0.06 at
+    magnitude-1 inputs; median rel 0%). See
+    ``test/test_nvfp4_linear_w4a8.py::test_silu_mul_fused_*`` for the
+    guarded contract.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    g = tl.load(
+        GATE_ptr + offs_m[:, None] * stride_gm + offs_n[None, :] * stride_gn,
+        mask=mask, other=0.0,
+    ).to(tl.float32)
+
+    u = tl.load(
+        UP_ptr + offs_m[:, None] * stride_um + offs_n[None, :] * stride_un,
+        mask=mask, other=0.0,
+    ).to(tl.float32)
+
+    # silu(x) = x * sigmoid(x); compute in fp32, narrow on store
+    out = (g * tl.sigmoid(g)) * u
+
+    tl.store(
+        OUT_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+        out.to(tl.bfloat16),
+        mask=mask,
+    )
+
+
+def silu_mul_fused(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """``silu(gate) * up`` fused in one Triton kernel.
+
+    Drop-in replacement for ``F.silu(gate) * up`` (modulo bf16 round-off
+    in the silu intermediate — see kernel docstring).
+
+    Args:
+        gate: [M, N] BF16 (any 2D shape; the operation is elementwise)
+        up:   [M, N] BF16, same shape as gate
+
+    Returns:
+        hidden: [M, N] BF16, ``silu(gate) * up``
+    """
+    assert gate.shape == up.shape, (
+        f"gate and up must have the same shape, got {gate.shape} vs {up.shape}"
+    )
+    assert gate.dtype == torch.bfloat16 and up.dtype == torch.bfloat16
+    M, N = gate.shape
+    out = torch.empty_like(gate)
+    BLOCK_M = 64
+    BLOCK_N = 128
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _silu_mul_kernel[grid](
+        gate, up, out,
+        M, N,
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fused silu(gate) * up + per-row FP8 act-quant — single Triton kernel
+# ---------------------------------------------------------------------------
+@triton.jit
+def _silu_quant_kernel(
+    GATE_ptr, UP_ptr, OUT_FP8_ptr, OUT_BF16_ptr, SCALE_ptr,
+    M, N,
+    stride_gm, stride_gn,
+    stride_um, stride_un,
+    stride_om, stride_on,
+    stride_bm, stride_bn,
+    stride_sm,
+    E4M3_MAX: tl.constexpr,
+    E4M3_MIN_NORMAL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Fuse ``silu(gate) * up`` with the down_proj's per-row FP8 act-quant.
+
+    One program per row (along M). Each program loops over its row in
+    ``BLOCK_N`` chunks, computes the SwiGLU hidden in fp32 registers,
+    reduces to a per-row amax, then does a second pass to quantize.
+
+    Outputs:
+      - ``OUT_FP8_ptr``: per-row FP8 E4M3 hidden (for the down_proj GEMM)
+      - ``OUT_BF16_ptr``: bf16 hidden (saved for the down_proj STE
+        backward, which re-runs ``grad_w = grad_out.T @ x_bf16``)
+      - ``SCALE_ptr``: per-row fp32 scale (= amax / E4M3_MAX)
+
+    Numerics: the silu output is narrowed to bf16 between the two
+    arithmetic stages, so the amax + scale + fp8 cast are bit-exact
+    with the unfused ``silu_mul_fused + quantize_act_fp8_fused`` path
+    (verified 0/67M fp8 elements differ, scale delta 0.0 on prod shape).
+    """
+    pid_m = tl.program_id(0)
+    if pid_m >= M:
+        return
+
+    # ---- pass 1: per-row amax over hidden = silu(gate) * up (bf16) ----
+    amax = tl.zeros((), dtype=tl.float32) + E4M3_MIN_NORMAL
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+        g = tl.load(
+            GATE_ptr + pid_m * stride_gm + offs_n * stride_gn,
+            mask=mask_n, other=0.0,
+        ).to(tl.float32)
+        u = tl.load(
+            UP_ptr + pid_m * stride_um + offs_n * stride_un,
+            mask=mask_n, other=0.0,
+        ).to(tl.float32)
+        h = (g * tl.sigmoid(g)) * u
+        # Narrow to bf16, lift back to fp32 — matches the bf16
+        # intermediate ``silu_mul_fused`` writes before act_quant.
+        h = h.to(tl.bfloat16).to(tl.float32)
+        h_abs = tl.where(mask_n, tl.abs(h), 0.0)
+        amax = tl.maximum(amax, tl.max(h_abs, axis=0))
+
+    scale = (amax / E4M3_MAX).to(tl.bfloat16).to(tl.float32)
+    inv_scale = (E4M3_MAX / amax).to(tl.bfloat16).to(tl.float32)
+    tl.store(SCALE_ptr + pid_m * stride_sm, scale)
+
+    # ---- pass 2: write bf16 hidden + fp8 hidden ----
+    for n0 in range(0, N, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < N
+        g = tl.load(
+            GATE_ptr + pid_m * stride_gm + offs_n * stride_gn,
+            mask=mask_n, other=0.0,
+        ).to(tl.float32)
+        u = tl.load(
+            UP_ptr + pid_m * stride_um + offs_n * stride_un,
+            mask=mask_n, other=0.0,
+        ).to(tl.float32)
+        h = (g * tl.sigmoid(g)) * u
+        h_bf16 = h.to(tl.bfloat16)
+        h_fp32 = h_bf16.to(tl.float32)
+        tl.store(
+            OUT_BF16_ptr + pid_m * stride_bm + offs_n * stride_bn,
+            h_bf16, mask=mask_n,
+        )
+        h_q = tl.minimum(
+            tl.maximum(h_fp32 * inv_scale, -E4M3_MAX), E4M3_MAX,
+        ).to(tl.float8e4nv)
+        tl.store(
+            OUT_FP8_ptr + pid_m * stride_om + offs_n * stride_on,
+            h_q, mask=mask_n,
+        )
+
+
+def silu_quant_fused(
+    gate: torch.Tensor, up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``silu(gate) * up`` fused with the down_proj's FP8 act-quant.
+
+    Replaces ``silu_mul_fused(gate, up)`` followed by
+    ``quantize_act_fp8_fused(hidden)`` — the two kernels each stream
+    the ~256 MB hidden through HBM; fusing them keeps the hidden in
+    registers and writes it once as fp8 (plus once as bf16 for the
+    STE backward). Measured 1.86 ms → 1.23 ms on sm_120 at the prod
+    shape (34% wall reduction — see ``project_w4a8_ffn_e2e.md``).
+
+    Args:
+        gate: [M, N] BF16
+        up:   [M, N] BF16, same shape as gate
+
+    Returns:
+        (a_fp8, a_s, hidden_bf16):
+          a_fp8      [M, N] float8_e4m3fn — for the down_proj GEMM
+          a_s        [M, 1] fp32          — per-row scale
+          hidden_bf16 [M, N] BF16          — for the down_proj STE bwd
+    """
+    assert gate.shape == up.shape, (
+        f"gate and up must have the same shape, got {gate.shape} vs {up.shape}"
+    )
+    assert gate.dtype == torch.bfloat16 and up.dtype == torch.bfloat16
+    M, N = gate.shape
+    a_fp8 = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=gate.device)
+    hidden_bf16 = torch.empty(M, N, dtype=torch.bfloat16, device=gate.device)
+    a_s = torch.empty(M, 1, dtype=torch.float32, device=gate.device)
+    grid = (M,)
+    _silu_quant_kernel[grid](
+        gate, up, a_fp8, hidden_bf16, a_s,
+        M, N,
+        gate.stride(0), gate.stride(1),
+        up.stride(0), up.stride(1),
+        a_fp8.stride(0), a_fp8.stride(1),
+        hidden_bf16.stride(0), hidden_bf16.stride(1),
+        a_s.stride(0),
+        E4M3_MAX=448.0,
+        E4M3_MIN_NORMAL=6.103515625e-05,
+        BLOCK_N=256,
+        num_warps=4,
+    )
+    return a_fp8, a_s, hidden_bf16
+
+
+class NVFP4W4A8SwiGLU(nn.Module):
+    """SwiGLU FFN where the gate and up matmuls share one ``act_quant``.
+
+    The W4A8 forward for SwiGLU naively does 3 matmuls
+    (gate, up, down), each preceded by its own ``quantize_act_fp8_fused``
+    on the matmul's input. Gate and up share the same input ``x``,
+    so 2 of those 3 act_quants are redundant — the fp8 tensor and
+    per-row scale are deterministic in ``x``. This wrapper:
+
+      1. Calls ``quantize_act_fp8_fused(x)`` once
+      2. Routes the (a_fp8, a_s) buffers into both gate and up
+         via :meth:`NVFP4LinearW4A8.forward_precomputed`
+      3. Down matmul takes the post-SwiGLU hidden and runs its own
+         (separate) act_quant — its input is different from ``x``
+
+    Measured at the prod gate_up shape (M=16384, K=1536, N=4096)
+    on sm_120: 0.32 ms saved per FFN forward, which lifts effective
+    FLOPS from 53.0 → 55.8 TF (5% wall reduction) — see
+    auto-memory ``project_w4a8_ffn_e2e.md``.
+
+    When ``bf16_only=True`` is requested (e.g. for shape-constraint
+    fallback), the wrapper skips the shared-act_quant optimization
+    and routes through plain ``F.linear`` on each projection.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        bias: bool = False,
+        block_size: int = 16,
+        use_custom_gemm: bool = False,
+        bf16_only: bool = False,
+    ) -> None:
+        super().__init__()
+        kwargs = dict(
+            bias=bias,
+            block_size=block_size,
+            use_custom_gemm=use_custom_gemm,
+            bf16_only=bf16_only,
+        )
+        self.gate_proj = NVFP4LinearW4A8(hidden_size, intermediate_size, **kwargs)
+        self.up_proj = NVFP4LinearW4A8(hidden_size, intermediate_size, **kwargs)
+        self.down_proj = NVFP4LinearW4A8(intermediate_size, hidden_size, **kwargs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.gate_proj.bf16_only:
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            # bf16 path: PyTorch's F.silu(gate) * up is fine here (no
+            # fuse win in the production offload path which never hits
+            # bf16_only — but the code stays correct).
+            hidden = F.silu(gate) * up
+            return self.down_proj(hidden)
+        # Shared act_quant: gate and up both consume ``x``, so quantize
+        # once and route the fp8 buffers into both.
+        a_fp8, a_s = quantize_act_fp8_fused(x.reshape(-1, x.shape[-1]))
+        gate = self.gate_proj.forward_precomputed(x, a_fp8, a_s)
+        up = self.up_proj.forward_precomputed(x, a_fp8, a_s)
+        # Fused silu(gate) * up + down_proj act_quant in one Triton kernel:
+        # keeps the ~256 MB hidden in registers instead of streaming it
+        # through HBM twice (once for silu_mul, once for act_quant). Returns
+        # the fp8 hidden + per-row scale for the down GEMM, plus the bf16
+        # hidden for the down_proj STE backward (see :func:`silu_quant_fused`).
+        h_fp8, h_s, hidden = silu_quant_fused(gate, up)
+        return self.down_proj.forward_precomputed(hidden, h_fp8, h_s)
+
+    def extra_repr(self) -> str:
+        return (
+            f"hidden={self.gate_proj.in_features}, "
+            f"intermediate={self.gate_proj.out_features}, "
+            f"gate={self.gate_proj.extra_repr()}, "
+            f"up={self.up_proj.extra_repr()}, "
+            f"down={self.down_proj.extra_repr()}"
         )
