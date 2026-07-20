@@ -81,6 +81,11 @@ KNOWN_CONFIGS: list[tuple[int, int, int, int, int, int, int, bool]] = [
                                   128,  64, 128, 3, 1, 32, 64, True),   # 72KB
     ("bm64_bn128_bk128_s3_cwg1_wm32_wn64_ds",
                                    64, 128, 128, 3, 1, 32, 64, True),   # 72KB
+    # 2-blocks/SM candidates (smem 48KB each, 2 blocks = 96KB fits 99KB cap):
+    ("bm64_bn128_bk128_s2_cwg1_wm32_wn64_ds",
+                                   64, 128, 128, 2, 1, 32, 64, True),   # 48KB → 2 blocks/SM
+    ("bm128_bn64_bk128_s2_cwg1_wm32_wn64_ds",
+                                  128,  64, 128, 2, 1, 32, 64, True),   # 48KB → 2 blocks/SM
 ]
 
 
