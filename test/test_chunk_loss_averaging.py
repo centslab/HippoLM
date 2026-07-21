@@ -318,7 +318,7 @@ def test_real_pack_step_loss_matches_token_weighted_mean():
         kda_mode="chunk", use_short_conv=True, allow_neg_eigval=False,
         safe_gate=True, lower_bound=-5.0, conv_size=4, conv_bias=False,
         num_layers=4, num_blocks=1, intermediate_size=1280,
-        rms_norm_eps=1e-6, ffn_nvfp4=False,
+        rms_norm_eps=1e-6,
     )
     torch.manual_seed(42)
     model = TPHippoModel(cfg, devices=[0], dtype=torch.bfloat16)

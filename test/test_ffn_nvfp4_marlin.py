@@ -1,24 +1,19 @@
-"""Correctness test for NVFP4 SwiGLU with Marlin FP4 fwd path.
+"""Class-level correctness / perf tests for the NVFP4 Marlin FP4 path.
 
-This test verifies the W4A16 NVFP4 path with the Marlin fused kernel
-(BF16 MMA + register dequant + cp.async double-buffered prefetch)
-produces a forward close to the BF16 baseline within FP4 quant noise
-+ Marlin MMA precision.
+Historical note (2026-07-21): this file used to hold "NVFP4-Marlin
+SwiGLU vs BF16" integration tests built via ``ffn_nvfp4=True,
+ffn_nvfp4_marlin=True`` — i.e. Marlin *mode-2* (a BF16 master
+``.weight`` present, seeded + repacked, SGD applied to ``.weight``).
+The 5-scheme migration made ``ffn_precision="w4a16"`` always build
+Marlin *mode-3* (FP4 packed buffers are the source of truth; there
+is no ``.weight`` Parameter), so those mode-2 SwiGLU tests exercised
+a config->SwiGLU path that no longer exists and were deleted. The
+live w4a16 mode-3 SwiGLU integration (fwd/bwd finite + optimizer
+wiring) is covered by ``test_nvfp4_no_bf16_master.py::TestSwiGLUMode3``
+and ``TestBuildParamGroupsWiring``.
 
-Contract:
-
-  - Build two SwiGLU modules with identical random init (seed-fixed).
-    One uses BF16 linears, the other uses NVFP4 + Marlin linears.
-  - Same input -> forward outputs should agree up to FP4 quant noise
-    (~5% mean relative, p99 ~91% — the MMA precision floor, not the
-    FP4 quant loss).
-  - Same grad output -> backward grad on the BF16 master weight must
-    be finite and non-zero (STE: gradient flows through the kernel's
-    BF16 dequant view unchanged).
-  - Optimizer step + repack works correctly across multiple steps
-    (the Marlin path uses ``quantize_nvfp4_with_global_scale`` which
-    produces a global_scale scalar in addition to the standard
-    packed/scales buffers).
+The class-level tests below construct ``NVFP4Linear(use_marlin=True)``
+directly and guard the Marlin kernel + packed-state_dict behavior.
 
 Run:
     python -m pytest test/test_ffn_nvfp4_marlin.py -v
@@ -28,160 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from src.models.config import HippoConfig
-from src.models.activation import SwiGLU
-from src.models.ops.nvfp4_linear import NVFP4Linear, repack_nvfp4_weights
-
-
-def _build_matched_swiglu(
-    hidden_size: int,
-    intermediate_size: int,
-    use_marlin: bool,
-    seed: int = 42,
-) -> SwiGLU:
-    """Build a SwiGLU with either BF16 or NVFP4-Marlin linears, seeded
-    identically across the two calls.
-    """
-    g = torch.Generator().manual_seed(seed)
-    cfg = HippoConfig(
-        vocab_size=8,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_layers=1,
-        num_blocks=1,
-        num_heads=1,
-        head_dim=hidden_size,
-        safe_gate=True,
-        lower_bound=-5.0,
-        use_short_conv=False,
-        ffn_nvfp4=use_marlin,            # required for use_marlin to take effect
-        ffn_nvfp4_marlin=use_marlin,
-    )
-    ffn = SwiGLU(cfg).cuda()
-    # Cast BF16 baseline to BF16 (NN.Linear defaults to FP32).
-    if not use_marlin:
-        for proj in (ffn.gate_proj, ffn.up_proj, ffn.down_proj):
-            proj.to(dtype=torch.bfloat16)
-    # Manually seed every linear so the BF16 master is shared between
-    # the two paths — isolates quant noise from init noise.
-    for proj in (ffn.gate_proj, ffn.up_proj, ffn.down_proj):
-        w_cpu = torch.empty(proj.weight.shape, dtype=torch.float32).normal_(0.0, 0.5, generator=g)
-        proj.weight.data.copy_(w_cpu.to(proj.weight.dtype))
-        if proj.bias is not None:
-            b_cpu = torch.empty(proj.bias.shape, dtype=torch.float32).normal_(0.0, 0.25, generator=g)
-            proj.bias.data.copy_(b_cpu.to(proj.bias.dtype))
-        # NVFP4 layers cache the FP4 buffers at __init__ end; re-pack
-        # so the FP4 view tracks the manually-seeded BF16 master.
-        if use_marlin:
-            proj.repack_weights()
-    return ffn
-
-
-@pytest.mark.parametrize("H,I", [(128, 256), (1536, 4096)])
-def test_nvfp4_marlin_swiglu_forward_close_to_bf16(H, I):
-    """NVFP4-Marlin SwiGLU forward should match BF16 within MMA-precision floor.
-
-    Marlin's MMA order differs from cuBLAS, so even with a noise-free
-    weight we'd see ~5% mean-relative drift (cos ~0.95, the kernel
-    floor documented in :mod:`docs.marlin_standalone_29`). On top of
-    that, FP4 quant adds ~22% per-element weight noise. The combined
-    error at FFN output scale is dominated by the per-element weight
-    noise × sqrt(I), bounded at ~80% rel-rms in the worst case.
-    """
-    torch.manual_seed(0)
-    bf16 = _build_matched_swiglu(H, I, use_marlin=False, seed=42)
-    nvfp4_marlin = _build_matched_swiglu(H, I, use_marlin=True, seed=42)
-    bf16.eval()
-    nvfp4_marlin.eval()
-
-    x = torch.randn(2, 16, H, device="cuda", dtype=torch.bfloat16)
-
-    with torch.no_grad():
-        y_bf16 = bf16(x)
-        y_nvfp4 = nvfp4_marlin(x)
-
-    # All outputs finite (kernel must not NaN).
-    assert torch.isfinite(y_nvfp4).all().item(), "Marlin forward produced NaN/Inf"
-
-    max_abs = (y_bf16 - y_nvfp4).abs().max().item()
-    rms_abs = ((y_bf16 - y_nvfp4) ** 2).mean().sqrt().item()
-    rel_rms = rms_abs / (y_bf16.abs().mean().item() + 1e-9)
-    # Same bound as the dequant+cuBLAS path test: FP4 quant noise +
-    # Marlin MMA drift gives ~5-30% rel_rms depending on H/I.
-    assert rel_rms < 0.80, (
-        f"NVFP4-Marlin SwiGLU forward diverges from BF16: "
-        f"max_abs={max_abs:.4f}, rms_rel={rel_rms:.4f}, "
-        f"y_bf16_max={y_bf16.abs().max().item():.4f}"
-    )
-
-
-@pytest.mark.parametrize("H,I", [(128, 256), (1536, 4096)])
-def test_nvfp4_marlin_swiglu_backward_grads_finite(H, I):
-    """NVFP4-Marlin SwiGLU backward grads must be finite and non-zero.
-
-    The bwd path is a standard BF16 matmul bwd on the BF16 master
-    weight (STE for the quantize noise + Marlin MMA reordering).
-    """
-    torch.manual_seed(0)
-    nvfp4 = _build_matched_swiglu(H, I, use_marlin=True, seed=42)
-
-    x = torch.randn(2, 16, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    y = nvfp4(x)
-    y.sum().backward()
-
-    assert torch.isfinite(x.grad).all().item(), "x.grad has NaN/Inf"
-    for proj_name in ("gate_proj", "up_proj", "down_proj"):
-        proj = getattr(nvfp4, proj_name)
-        assert proj.weight.grad is not None, f"{proj_name}.weight.grad is None"
-        assert torch.isfinite(proj.weight.grad).all().item(), (
-            f"{proj_name}.weight.grad has NaN/Inf"
-        )
-        assert proj.weight.grad.abs().sum().item() > 0, (
-            f"{proj_name}.weight.grad is all-zero"
-        )
-        if proj.bias is not None:
-            assert torch.isfinite(proj.bias.grad).all().item(), (
-                f"{proj_name}.bias.grad has NaN/Inf"
-            )
-
-
-def test_nvfp4_marlin_swiglu_training_step_decreases_loss():
-    """A few SGD steps with NVFP4-Marlin SwiGLU should decrease the loss.
-
-    Mirrors the dequant+cuBLAS test but exercises the Marlin forward +
-    the repack-after-step hook (which clears the repack cache so the
-    next forward re-quantizes + re-repacks with the freshly-updated
-    BF16 master).
-    """
-    H, I = 128, 256
-    torch.manual_seed(0)
-    nvfp4_marlin = _build_matched_swiglu(H, I, use_marlin=True, seed=42)
-
-    params = [
-        nvfp4_marlin.gate_proj.weight,
-        nvfp4_marlin.up_proj.weight,
-        nvfp4_marlin.down_proj.weight,
-    ]
-    opt = torch.optim.SGD(params, lr=0.01)
-
-    x = torch.randn(4, 16, H, device="cuda", dtype=torch.bfloat16)
-    y_target = torch.randn(4, 16, H, device="cuda", dtype=torch.bfloat16)
-
-    losses = []
-    for step in range(50):
-        opt.zero_grad()
-        y = nvfp4_marlin(x)
-        loss = ((y - y_target) ** 2).mean()
-        loss.backward()
-        opt.step()
-        repack_nvfp4_weights(nvfp4_marlin)  # mirror the training loop's hook
-        losses.append(loss.item())
-
-    assert losses[-1] < losses[0] * 0.8, (
-        f"NVFP4-Marlin SwiGLU training didn't reduce loss: "
-        f"first={losses[0]:.4f}, last={losses[-1]:.4f}, "
-        f"ratio={losses[-1] / losses[0]:.4f}"
-    )
+from src.models.ops.nvfp4_linear import NVFP4Linear
 
 
 def test_nvfp4_marlin_packed_state_dict_roundtrip():

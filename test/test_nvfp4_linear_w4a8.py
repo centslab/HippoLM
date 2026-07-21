@@ -735,3 +735,129 @@ def test_swiglu_uses_fused_silu_quant_path():
     assert torch.equal(y_test, y_ref), (
         "F2 SwiGLU output diverged from explicit silu_quant_fused path"
     )
+
+
+# ===========================================================================
+# Scheme integration: activation.SwiGLU + ffn_precision="w4a8"
+# ===========================================================================
+# The class-level tests above exercise ``NVFP4LinearW4A8`` /
+# ``NVFP4W4A8SwiGLU`` directly. These tests exercise the config-driven
+# wiring: ``HippoConfig(ffn_precision="w4a8")`` -> ``activation.SwiGLU``
+# must build three ``NVFP4LinearW4A8`` projections (the same
+# integration the deleted mode-2 ``test_ffn_nvfp4*`` tests used to
+# guard, but for the live w4a8 scheme).
+class TestSwiGLUSchemeW4A8:
+    @staticmethod
+    def _build_swiglu(H, I, bias=False, seed=42):
+        from src.models.config import HippoConfig
+        from src.models.activation import SwiGLU
+        cfg = HippoConfig(
+            vocab_size=8, hidden_size=H, intermediate_size=I,
+            num_layers=1, num_blocks=1, num_heads=1, head_dim=H,
+            safe_gate=True, lower_bound=-5.0, use_short_conv=False,
+            use_bias=bias, ffn_precision="w4a8",
+        )
+        torch.manual_seed(seed)
+        return SwiGLU(cfg).cuda()
+
+    def test_swiglu_scheme_w4a8_wires_nvfp4linearw4a8(self):
+        """``ffn_precision="w4a8"`` builds three NVFP4LinearW4A8
+        projections on the real fp8 path (not the bf16_only
+        fallback — H/I are divisible by 16)."""
+        ffn = self._build_swiglu(128, 256)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            proj = getattr(ffn, name)
+            assert isinstance(proj, NVFP4LinearW4A8), (
+                f"{name} is {type(proj).__name__}, expected NVFP4LinearW4A8"
+            )
+            assert not proj.bf16_only, (
+                f"{name} silently fell back to bf16_only — the fp8 W4A8 "
+                f"path is not being exercised"
+            )
+
+    def test_swiglu_scheme_w4a8_forward_finite_and_close_to_bf16(self):
+        """W4A8 SwiGLU forward is finite and stays within the fp8
+        noise floor of a BF16 SwiGLU sharing the same master
+        weights."""
+        import torch.nn as nn
+        H, I = 128, 256
+        ffn = self._build_swiglu(H, I)
+
+        # BF16 baseline sharing the same master weights (W4A8 keeps a
+        # BF16 ``.weight`` leaf, so we can copy it into plain Linears).
+        bf16 = {}
+        for name, in_f, out_f in (
+            ("gate_proj", H, I), ("up_proj", H, I), ("down_proj", I, H),
+        ):
+            lin = nn.Linear(in_f, out_f, bias=False).cuda().to(torch.bfloat16)
+            lin.weight.data.copy_(getattr(ffn, name).weight.data)
+            bf16[name] = lin
+
+        x = torch.randn(4, 16, H, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            y = ffn(x)
+            g = nn.functional.silu(bf16["gate_proj"](x))
+            u = bf16["up_proj"](x)
+            y_ref = bf16["down_proj"](g * u)
+
+        assert torch.isfinite(y).all().item(), "W4A8 SwiGLU forward is non-finite"
+        rms = ((y - y_ref) ** 2).mean().sqrt().item()
+        rel = rms / (y_ref.abs().mean().item() + 1e-9)
+        # fp8-A + NVFP4-B noise compounds across 3 matmuls + silu; the
+        # median per-op floor is ~2.5% (see file header). Allow 0.30
+        # rms-relative for the composed SwiGLU output.
+        assert rel < 0.30, (
+            f"W4A8 SwiGLU forward diverges from BF16: rms_rel={rel:.4f}"
+        )
+
+    def test_swiglu_scheme_w4a8_backward_grads_finite(self):
+        """W4A8 SwiGLU backward produces finite, non-zero grads on
+        each projection's BF16 master weight (STE bwd)."""
+        H, I = 128, 256
+        ffn = self._build_swiglu(H, I)
+        x = torch.randn(2, 16, H, device="cuda", dtype=torch.bfloat16,
+                        requires_grad=True)
+        y = ffn(x)
+        y.sum().backward()
+
+        assert torch.isfinite(x.grad).all().item(), "x.grad has NaN/Inf"
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            w = getattr(ffn, name).weight
+            assert w.grad is not None, f"{name}.weight.grad is None"
+            assert torch.isfinite(w.grad).all().item(), f"{name}.weight.grad NaN/Inf"
+            assert w.grad.abs().sum().item() > 0.0, f"{name}.weight.grad all-zero"
+
+    def test_swiglu_scheme_w4a8_training_step_decreases_loss(self):
+        """A few SGD steps on the W4A8 SwiGLU master weights reduce a
+        tiny synthetic loss (STE grad is usable).
+
+        Objective is ``mean(y**2)`` (drive the output toward zero) —
+        a guaranteed-reducible target that the optimizer can lower by
+        shrinking the master weights, so the check doesn't depend on
+        an unlearnable random regression target (whose irreducible
+        MSE ~1.0 stays inside the bf16 loss-resolution floor)."""
+        H, I = 128, 256
+        ffn = self._build_swiglu(H, I)
+        # Scale the (small) default init up so the output magnitude is
+        # well above the fp8 quant-noise floor — otherwise mean(y**2)
+        # starts near the floor (~0.01) and the reducible signal is
+        # swallowed by the bf16 loss resolution.
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            getattr(ffn, name).weight.data.mul_(4.0)
+        params = [ffn.gate_proj.weight, ffn.up_proj.weight, ffn.down_proj.weight]
+        opt = torch.optim.SGD(params, lr=0.05)
+
+        x = torch.randn(4, 16, H, device="cuda", dtype=torch.bfloat16)
+
+        losses = []
+        for _ in range(60):
+            opt.zero_grad()
+            loss = (ffn(x) ** 2).mean()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0] * 0.8, (
+            f"W4A8 SwiGLU training didn't reduce loss: "
+            f"first={losses[0]:.4f}, last={losses[-1]:.4f}"
+        )

@@ -1,11 +1,14 @@
 """Correctness test for NVFP4 ``no_bf16_master=True`` mode.
 
-When ``config.ffn_nvfp4_no_bf16_master=True``, the FFN linear modules
-store ONLY NVFP4 packed buffers (uint8 + fp8_e4m3fn + fp32 global_scale)
-on CPU and GPU — no BF16 master weight exists. The autograd Function
-returns ``grad_x`` only and stashes ``grad_w`` on the owning module via
-weakref; the custom CPU optimizer step consumes the stashed grad and
-applies the update at the FP4 level (material / commit per chunk).
+This is the storage model behind ``ffn_precision="w4a16"`` (the FFN
+NVFP4 Marlin mode-3 scheme; the legacy ``ffn_nvfp4_no_bf16_master=True``
+flag was removed in the 2026-07-21 5-scheme migration). The FFN linear
+modules store ONLY NVFP4 packed buffers (uint8 + fp8_e4m3fn + fp32
+global_scale) on CPU and GPU — no BF16 master weight exists. The
+autograd Function returns ``grad_x`` only and stashes ``grad_w`` on the
+owning module via weakref; the custom CPU optimizer step consumes the
+stashed grad and applies the update at the FP4 level (material / commit
+per chunk).
 
 This test pins that contract end-to-end:
 
@@ -412,9 +415,7 @@ class TestSwiGLUMode3:
             safe_gate=True,
             lower_bound=-5.0,
             use_short_conv=False,
-            ffn_nvfp4=True,
-            ffn_nvfp4_marlin=True,
-            ffn_nvfp4_no_bf16_master=True,
+            ffn_precision="w4a16",  # NVFP4 Marlin mode-3 (no BF16 master)
         )
         ffn = SwiGLU(cfg).cuda()
         x = torch.randn(2, 16, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -431,66 +432,10 @@ class TestSwiGLUMode3:
                 f"unexpected Parameter {name}"
             )
 
-    def test_swiglu_mode3_vs_mode2_finite_and_close(self):
-        """A SwiGLU built in mode-3 produces forward outputs close
-        to a mode-2 SwiGLU when both are seeded identically.
-
-        Two seeds' worth of random inputs → pairwise relative error
-        on the output. The bound is the FP4 quant noise floor
-        (cos ~ 0.95, mean_rel ~ 5%) — we use 0.15 to be conservative.
-        """
-        from src.models.config import HippoConfig
-        from src.models.activation import SwiGLU
-
-        torch.manual_seed(0)
-        H, I = 128, 256
-        cfg_m2 = HippoConfig(
-            vocab_size=8, hidden_size=H, intermediate_size=I,
-            num_layers=1, num_blocks=1, num_heads=1, head_dim=H,
-            safe_gate=True, lower_bound=-5.0, use_short_conv=False,
-            ffn_nvfp4=True, ffn_nvfp4_marlin=True,
-            ffn_nvfp4_no_bf16_master=False,
-        )
-        cfg_m3 = HippoConfig(
-            vocab_size=8, hidden_size=H, intermediate_size=I,
-            num_layers=1, num_blocks=1, num_heads=1, head_dim=H,
-            safe_gate=True, lower_bound=-5.0, use_short_conv=False,
-            ffn_nvfp4=True, ffn_nvfp4_marlin=True,
-            ffn_nvfp4_no_bf16_master=True,
-        )
-        # The two modules have separate random inits (the second
-        # to construct overwrites the seed). To compare apples-to-
-        # apples we copy the mode-2 module's FP4 packed buffers
-        # into the mode-3 module's, then forward both.
-        torch.manual_seed(0)
-        ffn_m2 = SwiGLU(cfg_m2).cuda()
-        torch.manual_seed(0)
-        ffn_m3 = SwiGLU(cfg_m3).cuda()
-        # Copy packed buffers from m2 -> m3 for matching math.
-        from src.models.ops.nvfp4_marlin import _build_marlin_scales_caches
-        for m2, m3 in zip(
-            [ffn_m2.gate_proj, ffn_m2.up_proj, ffn_m2.down_proj],
-            [ffn_m3.gate_proj, ffn_m3.up_proj, ffn_m3.down_proj],
-        ):
-            m3.packed_weight.copy_(m2.packed_weight)
-            m3.scales.copy_(m2.scales)
-            m3.global_scale.copy_(m2.global_scale)
-            # Refresh m3's Marlin cache (it's derived from the
-            # current scales/global_scale, which we just overwrote).
-            _build_marlin_scales_caches(
-                m3, m3.scales, m3.global_scale,
-                size_k=m3.in_features, size_n=m3.out_features,
-                block_size=m3.block_size,
-            )
-
-        x = torch.randn(2, 16, H, device="cuda", dtype=torch.bfloat16)
-        y_m2 = ffn_m2(x)
-        y_m3 = ffn_m3(x)
-        rdiff = _rel_err(y_m3, y_m2)
-        assert rdiff < 0.15, (
-            f"SwiGLU mode-3 vs mode-2 forward disagree: "
-            f"rel_err={rdiff:.4f}, expected <0.15"
-        )
+    # REMOVED (2026-07-21): ``test_swiglu_mode3_vs_mode2_finite_and_close``
+    # compared a mode-2 SwiGLU (BF16 master) against mode-3. The 5-scheme
+    # migration deleted the mode-2 FFN config path (``ffn_precision="w4a16"``
+    # always builds mode-3), so the comparison has no live counterpart.
 
 
 # ===========================================================================
@@ -656,8 +601,7 @@ class TestBuildParamGroupsWiring:
             vocab_size=8, hidden_size=128, intermediate_size=256,
             num_layers=1, num_blocks=1, num_heads=1, head_dim=128,
             safe_gate=True, lower_bound=-5.0, use_short_conv=False,
-            ffn_nvfp4=True, ffn_nvfp4_marlin=True,
-            ffn_nvfp4_no_bf16_master=True,
+            ffn_precision="w4a16",  # NVFP4 Marlin mode-3 (no BF16 master)
         )
         ffn = SwiGLU(cfg).cuda()
 
@@ -708,51 +652,10 @@ class TestBuildParamGroupsWiring:
             f"unexpected module types in optimizer state: {registered_names}"
         )
 
-    def test_build_param_groups_skips_legacy_nvfp4_modules(self):
-        """Modules WITHOUT ``no_bf16_master=True`` (legacy
-        mode-2, with a BF16 leaf parameter) are routed through the
-        normal per-Parameter muon group, NOT through
-        ``register_nvfp4_module``. The NVFP4 module walk must skip
-        them."""
-        from src.models.config import HippoConfig
-        from src.models.activation import SwiGLU
-        from src.models.ops.nvfp4_linear import NVFP4Linear
-        from src.training.param_offload import build_param_groups
-
-        torch.manual_seed(0)
-        cfg = HippoConfig(
-            vocab_size=8, hidden_size=64, intermediate_size=64,
-            num_layers=1, num_blocks=1, num_heads=1, head_dim=64,
-            safe_gate=True, lower_bound=-5.0, use_short_conv=False,
-            ffn_nvfp4=True, ffn_nvfp4_marlin=True,
-            ffn_nvfp4_no_bf16_master=False,  # legacy mode-2
-        )
-        ffn = SwiGLU(cfg).cuda()
-
-        class _ParamlessWrapper(torch.nn.Module):
-            def __init__(self, inner):
-                super().__init__()
-                self.inner = inner
-
-            def named_parameters_per_device(self, device):
-                if False:  # pragma: no cover
-                    yield None, None
-
-        wrapped = _ParamlessWrapper(ffn)
-        muon_opt, _ = build_param_groups(
-            wrapped, device=0,
-            lr_muon=0.02, lr_adamw=0.004,
-            weight_decay=0.01, adamw_beta1=0.9, adamw_beta2=0.95,
-            adamw_eps=1e-8, muon_momentum=0.95, muon_weight_decay=0.0,
-        )
-        # No NVFP4 mode-3 entries should exist in the optimizer state.
-        nvfp4_module_states = [
-            s for s in muon_opt.state.values()
-            if getattr(s, "nvfp4_module", None) is not None
-        ]
-        assert len(nvfp4_module_states) == 0, (
-            f"build_param_groups registered legacy NVFP4 modules in "
-            f"the no-leaf walker — they should only be tracked via "
-            f"their leaf Parameter. Got: "
-            f"{[type(s.nvfp4_module).__name__ for s in nvfp4_module_states]}"
-        )
+    # REMOVED (2026-07-21): ``test_build_param_groups_skips_legacy_nvfp4_modules``
+    # built a legacy mode-2 NVFP4 FFN (``ffn_nvfp4_no_bf16_master=False``) to
+    # assert ``build_param_groups`` does NOT route it through the mode-3
+    # no-leaf walker. The 5-scheme migration deleted the mode-2 FFN config
+    # path, so a mode-2 SwiGLU is no longer constructible and there is
+    # nothing to skip. The positive case is covered by
+    # ``test_build_param_groups_registers_all_nvfp4_modules`` above.

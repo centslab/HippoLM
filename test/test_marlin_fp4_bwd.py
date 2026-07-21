@@ -280,48 +280,13 @@ def test_marlin_nvfp4_matmul_bwd_falls_back_to_bf16(tiny_marlin_quant_ffn):
     assert cos >= 0.99, f"BF16 fallback grad_x cos={cos:.6f} (expected ~1.0)"
 
 
-def test_swiglu_bwd_grads_finite_via_marlin_path(tiny_marlin_quant_ffn):
-    """FFN SwiGLU fwd + bwd via the integrated NVFP4-Marlin path:
-    all three linears (gate/up/down) receive finite grad_x and
-    grad_w. Catches "bwd_packed_w / bwd_scales_e4m3 missing for one
-    of the three linears" wiring bugs in the production module
-    wrappers.
-    """
-    from src.models.config import HippoConfig
-    from src.models.activation import SwiGLU
-
-    H, I = 128, 256  # tiny SwiGLU (matches test_ffn_nvfp4_marlin tiny param)
-    cfg = HippoConfig(
-        vocab_size=8,
-        hidden_size=H,
-        intermediate_size=I,
-        num_layers=1,
-        num_blocks=1,
-        num_heads=1,
-        head_dim=H,
-        safe_gate=True,
-        lower_bound=-5.0,
-        use_short_conv=False,
-        ffn_nvfp4=True,
-        ffn_nvfp4_marlin=True,
-    )
-    ffn = SwiGLU(cfg).cuda()
-
-    x = torch.randn(2, 16, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    out = ffn(x)
-    assert torch.isfinite(out).all().item()
-
-    grad_out = torch.randn_like(out)
-    out.backward(grad_out)
-
-    for proj in (ffn.gate_proj, ffn.up_proj, ffn.down_proj):
-        assert proj.weight.grad is not None, (
-            f"{type(proj).__name__}.weight.grad is None"
-        )
-        assert torch.isfinite(proj.weight.grad).all().item(), (
-            f"{type(proj).__name__}.weight.grad has NaN/Inf"
-        )
-        assert proj.weight.grad.abs().sum().item() > 0.0
-
-    if x.grad is not None:
-        assert torch.isfinite(x.grad).all().item()
+# NOTE (2026-07-21): ``test_swiglu_bwd_grads_finite_via_marlin_path``
+# was removed here. It built the FFN via the legacy
+# ``ffn_nvfp4=True, ffn_nvfp4_marlin=True`` flags (Marlin *mode-2*,
+# with a BF16 master ``.weight`` and ``proj.weight.grad``). The
+# 5-scheme migration made ``ffn_precision="w4a16"`` build Marlin
+# *mode-3* (no ``.weight`` Parameter; grad flows via the
+# ``_latest_grad_w`` side channel), so that test's ``proj.weight.grad``
+# assertions no longer apply. Mode-3 SwiGLU fwd/bwd-finite is covered
+# by ``test_nvfp4_no_bf16_master.py::TestSwiGLUMode3``; the kernel-level
+# Marlin bwd is covered by the ``tiny_marlin_quant_ffn`` tests above.
