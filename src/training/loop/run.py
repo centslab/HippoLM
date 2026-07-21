@@ -458,7 +458,7 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
                     # for the first _DIAG_STEPS so steady-state cost
                     # is zero.
                     _mb_t_opt_end = _mb_t_zero_end
-                    if getattr(args, "ffn_nvfp4", False):
+                    if getattr(args, "ffn_precision", "w16a16") in ("w4a8", "w4a16"):
                         from src.models.ops.nvfp4_linear import repack_nvfp4_weights
                         n_repacked = repack_nvfp4_weights(model)
                         if global_step < _DIAG_STEPS and rank == 0:

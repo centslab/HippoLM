@@ -5,22 +5,38 @@ output = ``2 * intermediate_size``) + row-parallel down projection
 with all-reduce. Saves 1 kernel launch per SwiGLU vs the unfused
 3-projection baseline.
 
-When ``config.ffn_nvfp4`` is True, the projections use
-:class:`NVFP4ColumnParallelLinear` / :class:`NVFP4RowParallelLinear`
-instead of the BF16 versions. Weight storage is NVFP4 packed; the
-matmul still runs in BF16 (dequant-on-fwd). The optimizer updates
-the BF16 master weight; :func:`repack_nvfp4_weights` re-quantizes
-it after each step.
+Precision is scheme-driven via ``config.ffn_precision``
+(``HippoConfig``, see the 2026-07-21 5-scheme migration):
 
-When ``config.ffn_nvfp4_no_bf16_master`` is True (and ``ffn_nvfp4``
-AND ``ffn_nvfp4_marlin`` are both True), the BF16 master weight is
-not allocated on any rank — the FP4 packed buffers are the only
-persistent state, the optimizer streams BF16 views through the
-module's ``material/commit/apply_chunk_update`` API during the step.
-This is the storage mode that scales to MoE (each expert would
-otherwise need its own BF16 master = linear scaling in N_experts).
+  * ``"w16a16"`` (default) — plain ``ColumnParallelLinear`` /
+                             ``RowParallelLinear`` (BF16 GEMM).
+  * ``"w8a16"``  — no W8A16 FFN kernel on sm_120 today; falls
+                   back to plain BF16 TP with a logged warning.
+                   Listed for completeness; not used by the
+                   canonical ``base.yml`` config.
+  * ``"w8a8"``   — no per-rank FP8 column/row-parallel Linear on
+                   sm_120 today (the W8A8 path is single-GPU only
+                   via ``FP8Linear``); falls back to plain BF16
+                   TP with a logged warning.
+  * ``"w4a8"``   — NVFP4 W4A8 two-pass, no TP variant implemented
+                   on sm_120 today (``NVFP4ColumnParallelLinear``
+                   and ``NVFP4RowParallelLinear`` are the W4A16
+                   Marlin variants). Falls back to plain BF16 TP
+                   with a logged warning until the W4A8 TP
+                   variants ship.
+  * ``"w4a16"``  — ``NVFP4ColumnParallelLinear`` /
+                   ``NVFP4RowParallelLinear`` with Marlin mode-3
+                   (``use_marlin=True, no_bf16_master=True`` —
+                   hardcoded in the wrapper, not user-
+                   controllable). The canonical prod FFN scheme.
+
+The legacy boolean flags ``ffn_nvfp4`` / ``ffn_nvfp4_marlin`` /
+``ffn_nvfp4_no_bf16_master`` were removed on 2026-07-21; the
+scheme is the single source of truth.
 """
 from __future__ import annotations
+
+import warnings
 
 import torch
 import torch.nn as nn
@@ -40,33 +56,8 @@ class TPSwiGLU(nn.Module):
 
     def __init__(self, config, device=None, dtype=None) -> None:
         super().__init__()
-        # ``ffn_nvfp4_bf16_only`` toggles the W4A16 FFN linears to a
-        # plain-BF16 mode: the BF16 master is the only GPU storage, no
-        # ``packed_weight`` / ``scales`` buffers are allocated. Saves
-        # the per-layer packed/scales VRAM at the cost of losing the
-        # FP4 round-trip in the forward (the matmul is plain BF16 GEMM).
-        # Useful on small-VRAM boxes where the packed buffer footprint
-        # outweighs the dequant-on-fwd benefit.
-        #
-        # ``ffn_nvfp4_marlin`` flips the forward matmul to vLLM's
-        # Marlin FP4 kernel (~3.5x speedup at FFN shapes on sm_120).
-        # Backward stays as BF16 matmul (STE for quantize noise).
-        if (
-            getattr(config, "ffn_nvfp4", False)
-            and not getattr(config, "ffn_nvfp4_bf16_only", False)
-        ):
-            ColCls, RowCls = NVFP4ColumnParallelLinear, NVFP4RowParallelLinear
-            use_marlin = getattr(config, "ffn_nvfp4_marlin", False)
-            # Mode (3) requires Marlin — see NVFP4ColumnParallelLinear.
-            no_bf16_master = (
-                use_marlin
-                and getattr(config, "ffn_nvfp4_no_bf16_master", False)
-            )
-        else:
-            ColCls, RowCls = ColumnParallelLinear, RowParallelLinear
-            use_marlin = False
-            no_bf16_master = False
-
+        scheme = getattr(config, "ffn_precision", "w16a16")
+        ColCls, RowCls, extra = self._resolve_classes(scheme)
         # Fused gate+up projection: one ColumnParallelLinear with
         # output = 2 * intermediate_size. The first ``intermediate``
         # output channels are the gate, the next ``intermediate``
@@ -76,22 +67,84 @@ class TPSwiGLU(nn.Module):
         # is one tensor of size ``2 * intermediate_per_partition``
         # on this rank (gate half then up half); we expose it as
         # ``self.gate_up_bias`` so the forward can split it.
-        # ``use_marlin`` propagates the ffn_nvfp4_marlin flag into
-        # the NVFP4 layer constructors; the plain BF16 TP classes
-        # don't accept it (no NVFP4 buffers to allocate).
         col_kwargs = {"bias": config.use_bias, "device": device, "dtype": dtype}
         row_kwargs = {"bias": config.use_bias, "device": device, "dtype": dtype}
-        if use_marlin:
-            col_kwargs["use_marlin"] = True
-            row_kwargs["use_marlin"] = True
-            if no_bf16_master:
-                col_kwargs["no_bf16_master"] = True
-                row_kwargs["no_bf16_master"] = True
+        col_kwargs.update(extra.get("col", {}))
+        row_kwargs.update(extra.get("row", {}))
         self.gate_up_proj = ColCls(
             config.hidden_size, 2 * config.intermediate_size, **col_kwargs,
         )
         self.down_proj = RowCls(
             config.intermediate_size, config.hidden_size, **row_kwargs,
+        )
+
+    @staticmethod
+    def _resolve_classes(scheme: str):
+        """Map the FFN precision scheme to (ColCls, RowCls, extra kwargs).
+
+        Each scheme's kernel choice is hardcoded — no per-config
+        knobs. Per-rank FP8 / NVFP4 Column/Row-Parallel on sm_120
+        is not implemented today, so w8a8 / w4a8 fall back to
+        plain BF16 TP with a logged warning.
+        """
+        if scheme == "w16a16":
+            return (
+                ColumnParallelLinear, RowParallelLinear,
+                {"col": {}, "row": {}},
+            )
+        if scheme == "w8a16":
+            # No W8A16 FFN kernel on sm_120 today. Fall back to
+            # BF16 TP with warning.
+            warnings.warn(
+                "ffn_precision='w8a16' is not supported on the TP path "
+                "(no W8A16 FFN kernel); falling back to 'w16a16' (BF16 TP).",
+                RuntimeWarning, stacklevel=2,
+            )
+            return (
+                ColumnParallelLinear, RowParallelLinear,
+                {"col": {}, "row": {}},
+            )
+        if scheme == "w8a8":
+            # No per-rank FP8 Column/Row-Parallel on sm_120 today.
+            warnings.warn(
+                "ffn_precision='w8a8' is not supported on the TP path "
+                "(no FP8 Column/Row-Parallel on sm_120); falling back to "
+                "'w16a16' (BF16 TP).",
+                RuntimeWarning, stacklevel=2,
+            )
+            return (
+                ColumnParallelLinear, RowParallelLinear,
+                {"col": {}, "row": {}},
+            )
+        if scheme == "w4a8":
+            # No W4A8 NVFP4 Column/Row-Parallel on sm_120 today.
+            # (NVFP4ColumnParallelLinear is the W4A16 Marlin
+            # variant — not the W4A8 two-pass.) Fall back to BF16
+            # TP until the W4A8 TP variants ship.
+            warnings.warn(
+                "ffn_precision='w4a8' is not supported on the TP path "
+                "(no NVFP4 W4A8 Column/Row-Parallel on sm_120); falling "
+                "back to 'w16a16' (BF16 TP).",
+                RuntimeWarning, stacklevel=2,
+            )
+            return (
+                ColumnParallelLinear, RowParallelLinear,
+                {"col": {}, "row": {}},
+            )
+        if scheme == "w4a16":
+            # NVFP4 mode-3 Marlin. ``use_marlin`` and
+            # ``no_bf16_master`` are hardcoded — the kernel
+            # choice IS the scheme.
+            return (
+                NVFP4ColumnParallelLinear, NVFP4RowParallelLinear,
+                {
+                    "col": {"use_marlin": True, "no_bf16_master": True},
+                    "row": {"use_marlin": True, "no_bf16_master": True},
+                },
+            )
+        raise AssertionError(
+            f"ffn_precision must be one of 'w16a16', 'w8a16', 'w8a8', "
+            f"'w4a16', 'w4a8'; got {scheme!r}"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

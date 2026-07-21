@@ -6,8 +6,17 @@ Originally lived in :mod:`configs.base_config`; moved to
 in the YAML config directory which is reserved for the YAML
 files driving a run).
 """
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Literal, Optional
+
+
+# The 5 quantization schemes supported by HippoConfig (2026-07-21).
+# See the long comment block above the precision fields below for
+# the per-scheme spec (weight storage + GEMM precision + grad
+# precision + kernel choice). Listed once at module scope so the
+# KDA / FFN / embedding wrappers can iterate over it (e.g. for
+# the "all schemes except the default produce a warning" test).
+SCHEMES: tuple[str, ...] = ("w16a16", "w8a16", "w8a8", "w4a16", "w4a8")
 
 
 @dataclass
@@ -69,54 +78,100 @@ class HippoConfig:
     # of bwd wall-clock. Default False (legacy behavior).
     kda_skip_aqk_akk_saved: bool = False
 
-    # W4A16 NVFP4 FFN (research path). When True, every FFN
-    # linear (``gate_proj``, ``up_proj``, ``down_proj`` in the
-    # single-GPU path; the column-/row-parallel equivalents in the
-    # TP path) stores its weight in NVFP4 packed format
-    # (E2M1 + FP8-e4m3fn 1x16 microblock scales). The forward
-    # dequantizes to BF16 and runs a BF16 matmul (since PyTorch
-    # 2.9.1's ``torch._scaled_mm`` NVFP4 path requires BOTH A
-    # and B to be FP4-packed). The optimizer updates the BF16
-    # master weight; ``repack_weights`` re-quantizes it after each
-    # step. Memory saving on FFN weights alone: ~3.5x.
-    # Default False (legacy BF16 path).
-    ffn_nvfp4: bool = False
-
-    # When ``ffn_nvfp4`` is True, use vLLM's Marlin FP4 kernel for
-    # the forward matmul (BF16 MMA + register dequant + cp.async
-    # double-buffered prefetch). ~3.5x speedup over the
-    # dequant+cuBLAS path at FFN shapes on sm_120 (47-49 TFLOPS).
-    # Backward stays as BF16 matmul (STE for the quantize noise).
-    # Requires the prebuilt Marlin .so to be present at
-    # ``src/models/ops/cuda/lib/`` (true on the 5060 Ti dev box).
-    # Ignored when ``ffn_nvfp4`` is False. Default False (use the
-    # safer dequant+cuBLAS path until the Marlin flow has been
-    # smoke-tested on this config).
-    ffn_nvfp4_marlin: bool = False
-    # When ``ffn_nvfp4_marlin`` is True, drop the BF16 master weight
-    # from the autograd leaf set entirely. The FP4 packed buffers
-    # ARE the source of truth; the optimizer applies updates at the
-    # FP4 level via chunked material/commit (per-tensor BF16 peak
-    # bounded). Saves ~24 MiB per NVFP4 module (12 MiB on each of
-    # CPU pinned and GPU H2D staging at base.yml). Ignored when
-    # ``ffn_nvfp4_marlin`` is False. Requires the optimizer-side
-    # ``register_nvfp4_module`` path (CPUAdamW / CPUMuon). Default
-    # False for safety.
-    ffn_nvfp4_no_bf16_master: bool = False
-
-    # KDA W8A8 FP8 (E4M3) projections. When True, the projection
-    # Linear layers inside KimiDeltaAttention (q_proj, k_proj, v_proj,
-    # o_proj, b_proj, f_proj[0..1], g_proj[0..1]) run their GEMM in
-    # FP8 E4M3 via ``torch._scaled_mm`` with per-row activation
-    # scaling + per-output-channel weight scaling. Backward uses
-    # STE (BF16 matmul against the BF16 leaf weight). The kernel
-    # itself (chunk_kda), the gating path (A_log / dt_bias /
-    # FusedRMSNormGated), and the rest of the model stay in BF16.
-    # See ``test_kda_w8a8_feasibility.py`` for the noise sweep
-    # (~3.7% sig_rel on Gaussian inputs, ~0.98% on b_proj+sigmoid)
-    # and ``src.models.ops.fp8_linear`` for the implementation.
-    # Default False for safety; flip on after smoke-test passes.
-    kda_fp8: bool = False
+    # ---------------------------------------------------------------------
+    # Scheme-driven precision config (2026-07-21).
+    # ---------------------------------------------------------------------
+    # Each module is assigned one of FIVE quantization schemes. The
+    # scheme uniquely determines:
+    #
+    #   1. The persistent weight-storage format (BF16 / FP8 / NVFP4).
+    #   2. The forward GEMM precision (BF16 / FP8 tensor cores).
+    #   3. The backward GEMM precision (BF16 / FP8 tensor cores).
+    #   4. The gradient-storage precision (BF16 / FP8 E4M3).
+    #   5. The kernel choice (the kernel is fixed per scheme; no per-
+    #      config knobs).
+    #
+    # The five schemes (W = weight storage, a = activation/GEMM/grad
+    # precision):
+    #
+    #   * ``w16a16`` — pure BF16. No quantization anywhere. Default.
+    #                  Kernel: ``nn.Linear`` (cuBLAS BF16 GEMM).
+    #                  Storage: BF16 master weight. Bwd: BF16 STE.
+    #                  Grad: BF16.
+    #
+    #   * ``w8a16``  — weights stored as FP8 (per-output-channel E4M3
+    #                  with FP32 scale), forward AND backward use BF16
+    #                  tensor cores (dequant-to-BF16 on the fly), grads
+    #                  BF16. **No kernel on sm_120 today** — for now
+    #                  this scheme falls back to ``w16a16`` (pure BF16)
+    #                  with a logged warning in the wrapper. Listed in
+    #                  the enum for completeness; the canonical
+    #                  ``base.yml`` config does not use it.
+    #
+    #   * ``w8a8``   — W8A8. Weights stored as FP8 (per-row act +
+    #                  per-output-channel weight E4M3 with FP32
+    #                  scales), forward AND backward use FP8 tensor
+    #                  cores via ``torch._scaled_mm``, grads FP8
+    #                  E4M3. Kernel: ``FP8Linear(fp8_bwd=True)``
+    #                  (``_FP8E4M3MatmulFP8Bwd``). The same scheme as
+    #                  the FFN W4A8 autograd contract.
+    #
+    #   * ``w4a8``   — W4A8. Weights stored as NVFP4 packed (E2M1 +
+    #                  FP8-e4m3fn 1x16 microblock scales + global_scale
+    #                  scalar), forward dequant-to-FP8 + FP8 GEMM
+    #                  (``torch._scaled_mm``), backward BF16 STE
+    #                  (re-runs BF16 matmul against the BF16 leaf).
+    #                  **Spec gap**: the w4a8 contract says "FP8 bwd +
+    #                  FP8 grads" but the current implementation uses
+    #                  BF16 STE bwd (BF16 grads). Tracked as TODO.
+    #                  Kernel: ``NVFP4LinearW4A8`` (two-pass Triton
+    #                  dequant + ``_scaled_mm``). MXFP4 is NOT
+    #                  supported (different GEMM kernel — not
+    #                  maintained).
+    #
+    #   * ``w4a16``  — W4A16. Weights stored as NVFP4 packed, forward
+    #                  AND backward use BF16 tensor cores, grads BF16.
+    #                  Kernel: ``NVFP4Linear`` with Marlin mode-3
+    #                  (``use_marlin=True, no_bf16_master=True`` —
+    #                  these are HARD-CODED in the wrapper, not user-
+    #                  controllable). FP4 packed buffers are the
+    #                  source of truth; the optimizer updates at the
+    #                  FP4 level via chunked material/commit. MXFP4
+    #                  is NOT supported.
+    #
+    # Module × scheme support matrix
+    # -------------------------------
+    #   embedding_precision: only ``w16a16`` is wired today. The other
+    #                         four fall back to ``w16a16`` with a
+    #                         warning (storage-only Linear layers
+    #                         don't need quantization; the embed is
+    #                         typically the biggest single buffer and
+    #                         quantization of it isn't on the perf
+    #                         critical path).
+    #   attention_precision: ``w16a16`` ✓, ``w8a8`` ✓. ``w8a16``,
+    #                         ``w4a8``, ``w4a16`` fall back: ``w8a16``
+    #                         → ``w16a16`` (no BF16-GEMM W8A16 KDA
+    #                         kernel), ``w4a8`` → ``w8a8`` (no NVFP4
+    #                         KDA kernel), ``w4a16`` → ``w8a16``
+    #                         (no NVFP4 KDA kernel). All fall-backs
+    #                         emit a RuntimeWarning.
+    #   ffn_precision:       all five wired:
+    #                           w16a16 → nn.Linear
+    #                           w8a8   → FP8Linear(fp8_bwd=True)
+    #                           w8a16  → nn.Linear (no W8A16 FFN
+    #                                    kernel; falls back with
+    #                                    warning)
+    #                           w4a8   → NVFP4LinearW4A8 (two-pass)
+    #                           w4a16  → NVFP4Linear (Marlin mode-3)
+    #
+    # The legacy boolean flags (``kda_fp8``, ``kda_mxfp8``,
+    # ``ffn_nvfp4``, ``ffn_nvfp4_marlin``, ``ffn_nvfp4_no_bf16_master``)
+    # were removed on 2026-07-21; the scheme system is the single
+    # source of truth.
+    # ---------------------------------------------------------------------
+    embedding_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
+    attention_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
+    ffn_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
 
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
@@ -146,17 +201,13 @@ class HippoConfig:
         assert self.pack_buffer_size >= 1, (
             f"pack_buffer_size must be >= 1, got {self.pack_buffer_size}"
         )
-        # NVFP4 FFN: currently supports only block_size=16 (the NVFP4
-        # spec). The block_size is hardcoded in NVFP4Linear; the only
-        # constraint here is a sanity check that the flag is a bool.
-        assert isinstance(self.ffn_nvfp4, bool), (
-            f"ffn_nvfp4 must be bool, got {type(self.ffn_nvfp4).__name__}"
-        )
-        # ffn_nvfp4_marlin must be bool, and is a no-op if ffn_nvfp4
-        # is False.
-        assert isinstance(self.ffn_nvfp4_marlin, bool), (
-            f"ffn_nvfp4_marlin must be bool, got {type(self.ffn_nvfp4_marlin).__name__}"
-        )
-        assert isinstance(self.kda_fp8, bool), (
-            f"kda_fp8 must be bool, got {type(self.kda_fp8).__name__}"
-        )
+        # ---- Scheme-driven precision (2026-07-21, 5-scheme spec) ----
+        for field_name in (
+            "embedding_precision",
+            "attention_precision",
+            "ffn_precision",
+        ):
+            value = getattr(self, field_name)
+            assert value in SCHEMES, (
+                f"{field_name} must be one of {SCHEMES!r}; got {value!r}"
+            )

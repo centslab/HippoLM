@@ -12,19 +12,18 @@
 extends: ../base.yml
 
 # Diff vs base.yml:
-#   * ffn_nvfp4=true — every FFN linear uses the NVFP4 storage path
-#     (packed uint8 + fp8_e4m3fn scales + global_scale scalar).
-#   * ffn_nvfp4_marlin=true — the forward matmul uses vLLM's Marlin
-#     FP4 kernel instead of dequant+cuBLAS.
+#   * ffn_precision="w4a16" — every FFN linear uses the W4A16 NVFP4
+#     path (Marlin mode-3, hardcoded use_marlin=True +
+#     no_bf16_master=True). FP4 packed buffers are the source of
+#     truth; the optimizer updates at the FP4 level.
 #   * Smaller dims + dummy data + tp_size=1 — same shape as tp1.yml
 #     so we exercise the NVFP4 layer construction in the single-GPU
-#     ``SwiGLU`` path (the TP variants are exercised via nvfp4_vram_probe
-#     and the production configs/test/tp2.yml variant).
+#     ``SwiGLU`` path (the TP variants are exercised via
+#     nvfp4_marlin_tp2 and the production configs/test/tp2.yml
+#     variant).
 #   * No checkpoint save — we just want to verify the fwd/bwd/opt
 #     loop completes without NaN/Inf and the loss decreases.
-ffn_nvfp4: true
-ffn_nvfp4_marlin: true
-ffn_nvfp4_no_bf16_master: true
+ffn_precision: w4a16
 
 tp_size: 1
 

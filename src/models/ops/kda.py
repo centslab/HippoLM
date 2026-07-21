@@ -10,7 +10,43 @@ import from the local vendored namespace. This keeps the
 implementation tuneable in-tree without forking fla.
 
 Reference: Kimi Linear (https://arxiv.org/abs/2510.26692)
+
+Precision is scheme-driven via ``config.attention_precision``
+(``HippoConfig``, see the 2026-07-21 5-scheme migration):
+
+  * ``"w16a16"`` (default) — no FP8 swap; plain ``nn.Linear``.
+  * ``"w8a8"``   — ``FP8Linear(fp8_bwd=True)`` (per-row act +
+                   per-channel weight E4M3; FP8 forward AND
+                   backward via ``_scaled_mm``). Same scheme as
+                   the FFN W4A8 autograd contract.
+  * ``"w8a16"``  — no BF16-GEMM W8A16 KDA kernel on sm_120 today
+                   (FP8 storage + BF16 GEMM requires a dequant-to-
+                   BF16 path). Falls back to ``w16a16`` (plain
+                   ``nn.Linear``) with a logged warning.
+  * ``"w4a8"``   — no NVFP4 KDA kernel on sm_120 today; falls
+                   back to ``w8a8`` (``FP8Linear(fp8_bwd=True)``)
+                   with a logged warning. NVFP4 → FP8 GEMM is the
+                   closest available match for the spec's
+                   "NVFP4 storage + FP8 GEMM".
+  * ``"w4a16"``  — no NVFP4 KDA kernel on sm_120 today; falls
+                   back to ``w16a16`` (plain ``nn.Linear``) with
+                   a logged warning. NVFP4 → BF16 GEMM is the
+                   closest available match for the spec's
+                   "NVFP4 storage + BF16 GEMM".
+
+Precision-sensitive projections stay as ``nn.Linear`` (BF16 GEMM)
+in all cases (see the projection-name lists below for the
+rationale).
+
+The legacy boolean flags ``kda_fp8`` / ``kda_mxfp8`` were removed
+on 2026-07-21; the scheme is the single source of truth. MXFP8
+is no longer supported (the b12x dense GEMM was not maintained
+and has been removed).
 """
+from __future__ import annotations
+
+import warnings
+
 import torch
 import torch.nn as nn
 
@@ -18,14 +54,38 @@ from src.models.ops._vendored.fla.layers.kda import KimiDeltaAttention
 
 
 # Modules inside KimiDeltaAttention that should run their GEMM in FP8
-# E4M3 when ``config.kda_fp8`` is True. ``o_proj`` is included for
-# output projection; ``b_proj`` is the small (1536 -> 12) Linear that
-# produces the beta scalar (post-sigmoid; the test sweep showed this
-# path has 0.98% sig_rel — essentially noise-free).
-_DIRECT_FP8_LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj", "b_proj")
-# Sequential pairs (f_proj is the gate log-bottleneck, g_proj is the
-# value-side gate). Each pair has two Linears; both get FP8.
-_SEQUENTIAL_FP8_LINEARS = ("f_proj", "g_proj")
+# E4M3 when ``config.attention_precision`` is ``"w8a8"`` (or any
+# non-w16a16 scheme that resolves to FP8 — currently that's just
+# w8a8 and the w4a8 fallback).
+#
+# Precision-sensitive projections stay as ``nn.Linear`` (BF16 GEMM):
+#
+#   * ``f_proj`` (sequential 2-Linear gate pre-exp): per-module
+#     noise probe showed 5.11% sig_rel at its output (the highest
+#     of any KDA projection), driven by compounded FP8 noise across
+#     two GEMMs in series. The output feeds ``exp(-A_log.exp())``
+#     in chunk_kda, so any quant noise gets amplified by the
+#     exponential before driving the per-token decay rate. Too
+#     sensitive to quantize. Reverted to BF16 on 2026-07-21.
+#
+#   * ``b_proj``: beta gate; small-output Linear whose FP8 path is
+#     already BF16 via the div-by-16 fallback at prod H=12. The
+#     remaining (q, k, v, o) projections are kept in FP8 because:
+#       - ``l2norm`` inside chunk_kda absorbs magnitude noise for
+#         q, k (only direction matters post-l2norm);
+#       - ``o_proj``'s 3.66% intrinsic noise is the same as q/k/v
+#         — not more precision-sensitive (probe 2026-07-21). The
+#         high whole-KDA sig_rel at the residual stream is mostly
+#         upstream chunk_kda accumulation; adding 1pp absolute
+#         from o_proj's FP8 noise is acceptable for the ~45ms/step
+#         BF16 GEMM saving.
+_DIRECT_FP8_LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj")
+# Sequential pairs kept in FP8. ``g_proj`` survives because its
+# output feeds ``o_norm`` (FusedRMSNormGated) which divides by
+# ``||x||`` — magnitude quant noise is damped; per-module noise
+# probe showed only 1.60% sig_rel at its output (lowest of any
+# KDA projection).
+_SEQUENTIAL_FP8_LINEARS = ("g_proj",)
 
 
 def _replace_linear_with_fp8(old: nn.Linear) -> nn.Linear:
@@ -49,6 +109,7 @@ def _replace_linear_with_fp8(old: nn.Linear) -> nn.Linear:
         bias=has_bias,
         device=old.weight.device,
         dtype=old.weight.dtype,
+        fp8_bwd=True,
     )
     new.weight.data.copy_(old.weight.data)
     if has_bias:
@@ -82,20 +143,77 @@ class KDA(nn.Module):
             norm_eps=config.rms_norm_eps,
         )
 
-        # FP8 W8A8 path for the projection layers (q/k/v/o/b_proj +
-        # f_proj[0..1] + g_proj[0..1]). The kernel itself, the
-        # gating path (A_log / dt_bias / FusedRMSNormGated), and the
-        # rest of the model stay in BF16.
-        # See ``src.models.ops.fp8_linear`` for the per-row-act +
-        # per-channel-weight E4M3 GEMM via ``torch._scaled_mm``.
-        if getattr(config, "kda_fp8", False):
+        # Resolve the attention_precision scheme to a concrete
+        # replacement function (or None for the no-swap w16a16
+        # case). See the module docstring for the full spec; the
+        # table is:
+        #
+        #   w16a16 → no swap (plain nn.Linear throughout)
+        #   w8a8   → _replace_linear_with_fp8 (FP8Linear fp8_bwd=True)
+        #   w8a16  → no kernel → w16a16 fallback (nn.Linear) + warn
+        #   w4a8   → no kernel → w8a8 fallback + warn
+        #   w4a16  → no kernel → w16a16 fallback + warn
+        scheme = getattr(config, "attention_precision", "w16a16")
+        replace_fn = self._resolve_replace_fn(scheme)
+
+        if replace_fn is not None:
             for name in _DIRECT_FP8_LINEARS:
                 old = getattr(self.attn, name)
-                setattr(self.attn, name, _replace_linear_with_fp8(old))
+                setattr(self.attn, name, replace_fn(old))
             for seq_name in _SEQUENTIAL_FP8_LINEARS:
                 seq = getattr(self.attn, seq_name)
                 for i in range(len(seq)):
-                    seq[i] = _replace_linear_with_fp8(seq[i])
+                    seq[i] = replace_fn(seq[i])
+
+    @staticmethod
+    def _resolve_replace_fn(scheme: str):
+        """Map the attention_precision scheme to a Linear replacement.
+
+        Returns ``None`` for ``w16a16`` (no swap). For schemes
+        without a KDA kernel on sm_120, falls back to the closest
+        available scheme and emits a RuntimeWarning.
+        """
+        if scheme == "w16a16":
+            return None
+        if scheme == "w8a8":
+            return _replace_linear_with_fp8
+        if scheme == "w8a16":
+            # No BF16-GEMM W8A16 KDA kernel on sm_120 today.
+            # Fall back to plain nn.Linear (BF16 GEMM, BF16 grads)
+            # with a warning — preserves the BF16 GEMM contract.
+            warnings.warn(
+                "attention_precision='w8a16' is not supported on sm_120 "
+                "today (no BF16-GEMM W8A16 KDA kernel); falling back to "
+                "'w16a16' (plain nn.Linear).",
+                RuntimeWarning, stacklevel=2,
+            )
+            return None
+        if scheme == "w4a8":
+            # No NVFP4 KDA kernel on sm_120 today. The closest
+            # available match for the spec's "NVFP4 storage + FP8
+            # GEMM" is FP8Linear (FP8 GEMM via _scaled_mm).
+            warnings.warn(
+                "attention_precision='w4a8' is not supported on sm_120 "
+                "today (no NVFP4 KDA kernel); falling back to 'w8a8' "
+                "(FP8Linear, FP8 GEMM + FP8 bwd).",
+                RuntimeWarning, stacklevel=2,
+            )
+            return _replace_linear_with_fp8
+        if scheme == "w4a16":
+            # No NVFP4 KDA kernel on sm_120 today. The closest
+            # available match for the spec's "NVFP4 storage + BF16
+            # GEMM" is plain nn.Linear (BF16 GEMM, BF16 grads).
+            warnings.warn(
+                "attention_precision='w4a16' is not supported on sm_120 "
+                "today (no NVFP4 KDA kernel); falling back to 'w16a16' "
+                "(plain nn.Linear, BF16 GEMM + BF16 grads).",
+                RuntimeWarning, stacklevel=2,
+            )
+            return None
+        raise AssertionError(
+            f"attention_precision must be one of 'w16a16', 'w8a16', "
+            f"'w8a8', 'w4a16', 'w4a8'; got {scheme!r}"
+        )
 
     def forward(
         self,

@@ -161,10 +161,16 @@ def _setup_worker(
         pack_chunk_size=args.pack_chunk_size,
         pack_buffer_size=args.pack_buffer_size,
         kda_skip_aqk_akk_saved=getattr(args, "kda_skip_aqk_akk_saved", False),
-        ffn_nvfp4=getattr(args, "ffn_nvfp4", False),
-        ffn_nvfp4_marlin=getattr(args, "ffn_nvfp4_marlin", False),
-        ffn_nvfp4_no_bf16_master=getattr(args, "ffn_nvfp4_no_bf16_master", False),
-        kda_fp8=getattr(args, "kda_fp8", False),
+        # Scheme-driven precision (2026-07-21, 5-scheme spec).
+        # Each module gets one of "w16a16", "w8a16", "w8a8",
+        # "w4a16", "w4a8". The legacy boolean flags
+        # (``ffn_nvfp4``, ``ffn_nvfp4_marlin``,
+        # ``ffn_nvfp4_no_bf16_master``, ``kda_fp8``, ``kda_mxfp8``)
+        # were removed from the dataclass on 2026-07-21; the
+        # scheme is the single source of truth.
+        embedding_precision=getattr(args, "embedding_precision", "w16a16"),
+        attention_precision=getattr(args, "attention_precision", "w16a16"),
+        ffn_precision=getattr(args, "ffn_precision", "w16a16"),
     )
     if rank == 0:
         logger.info(f"Model config: {config}")

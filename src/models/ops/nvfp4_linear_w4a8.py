@@ -354,6 +354,147 @@ def quantize_act_fp8_fused(
 
 
 # ---------------------------------------------------------------------------
+# Triton kernel: fused per-col amax + quantize + transpose (BF16 -> fp8 E4M3)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quantize_act_fp8_fused_transposed_kernel(
+    X_ptr,           # [M, K] BF16 (input, row-major; must be contiguous)
+    X_scale_out_ptr, # [K, 1] FP32  (output: per-col amax / E4M3_MAX)
+    X_out_ptr,       # [K, M] float8_e4m3fn (output, row-major = transposed)
+    M, K,
+    stride_xm, stride_xk,
+    stride_sk,
+    stride_ok, stride_om,
+    E4M3_MAX: tl.constexpr,
+    E4M3_MIN_NORMAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Fused per-col amax + quantize + transpose in one kernel.
+
+    Inverse of :func:`quantize_act_fp8_fused` along the M axis:
+    instead of one program owning ``BLOCK_M`` rows and reducing
+    across K, this kernel has one program own ``BLOCK_K`` columns
+    and reduce across M. The amax stays in registers between the
+    two passes; the output is written directly into the transposed
+    [K, M] row-major layout.
+
+    Reads x in its original [M, K] row-major order (no separate
+    transpose copy) and writes the FP8 output in [K, M] row-major
+    (which is the col-major view of the original). Used by the
+    FP8 KDA backward to skip the ``.T.contiguous()`` materialization
+    before the transposed quant pass — at KDA prod shape (M=16k,
+    N=K=1536) saves ~1.4 ms / FP8 bwd call.
+    """
+    pid_k = tl.program_id(0)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_m = tl.arange(0, BLOCK_M)
+    mask_k = offs_k < K
+    # Input ptrs shape [BLOCK_K, BLOCK_M]: each program block owns
+    # BLOCK_K cols of x and reads them in [BLOCK_K, BLOCK_M] tiles.
+    x_ptrs = X_ptr + offs_k[:, None] * stride_xk + offs_m[None, :] * stride_xm
+
+    # ---- pass 1: per-col amax reduction across all M ----
+    amax = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for m0 in range(tl.cdiv(M, BLOCK_M)):
+        m_base = m0 * BLOCK_M
+        mask_m_chunk = (m_base + offs_m)[None, :] < M
+        x = tl.load(
+            x_ptrs + m_base * stride_xm,
+            mask=mask_k[:, None] & mask_m_chunk,
+            other=tl.cast(0.0, tl.bfloat16),
+        ).to(tl.float32)
+        # Per-col max over BLOCK_M (axis=1). The block owns BLOCK_K
+        # cols; each col sees BLOCK_M elements per pass-1 chunk.
+        chunk_max = tl.max(tl.abs(x), axis=1)
+        amax = tl.maximum(amax, chunk_max)
+
+    amax = tl.maximum(amax, E4M3_MIN_NORMAL)
+    # Same BF16-truncate-the-scale trick as the per-row kernel:
+    # matches the PyTorch reference path's scale precision exactly
+    # (within ~0.62% med_rel; well under the FP8 noise floor).
+    scale_bf16 = (amax / E4M3_MAX).to(tl.bfloat16)
+    scale = scale_bf16.to(tl.float32)
+    inv_scale = (E4M3_MAX / amax).to(tl.bfloat16).to(tl.float32)
+
+    tl.store(X_scale_out_ptr + offs_k * stride_sk, scale, mask=mask_k)
+
+    # ---- pass 2: quantize using the just-computed scale ----
+    # Output ptrs shape [BLOCK_K, BLOCK_M]: write to output[k, m].
+    o_ptrs = X_out_ptr + offs_k[:, None] * stride_ok + offs_m[None, :] * stride_om
+    for m0 in range(tl.cdiv(M, BLOCK_M)):
+        m_base = m0 * BLOCK_M
+        mask_m_chunk = (m_base + offs_m)[None, :] < M
+        x = tl.load(
+            x_ptrs + m_base * stride_xm,
+            mask=mask_k[:, None] & mask_m_chunk,
+            other=tl.cast(0.0, tl.bfloat16),
+        ).to(tl.float32)
+        x_q = tl.minimum(
+            tl.maximum(x * inv_scale[:, None], -E4M3_MAX),
+            E4M3_MAX,
+        ).to(tl.float8e4nv)
+        tl.store(
+            o_ptrs + m_base * stride_om,
+            x_q,
+            mask=mask_k[:, None] & mask_m_chunk,
+        )
+
+
+def quantize_act_fp8_fused_transposed(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    scale: torch.Tensor | None = None,
+    block_m: int = 128,
+    block_k: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused per-col amax + quantize + transpose for the FP8 bwd path.
+
+    Equivalent to ``out, scale = quantize_act_fp8_fused(x.T.contiguous())``
+    but in a single Triton kernel — saves the BF16 [K, M] materialize
+    that the explicit ``.T.contiguous()`` does. Used by the KDA
+    FP8 bwd path to re-quantize ``w``, ``grad_out`` and ``x`` in
+    their transposed layouts in one pass each.
+
+    Args:
+        x     : [M, K] BF16 input, must be contiguous (the kernel
+                uses raw stride-indexed loads; non-contig would
+                read the wrong memory).
+        out   : optional [K, M] fp8_e4m3fn output buffer
+        scale : optional [K, 1] FP32 per-col-of-input scale buffer
+        block_m, block_k : Triton tile dims (default 128 / 64,
+                the autotune winner for KDA prod M=16384 K=N=1536)
+
+    Returns:
+        (q_fp8, s) — ``q_fp8`` is [K, M] float8_e4m3fn (row-major
+        = transpose of x's col-major view); ``s`` is [K, 1] FP32
+        per-col-of-x scales (= per-row-of-q_fp8).
+    """
+    assert x.is_contiguous(), (
+        "quantize_act_fp8_fused_transposed requires a contiguous input; "
+        "call .contiguous() before passing in"
+    )
+    M, K = x.shape
+    if out is None:
+        out = torch.empty(K, M, dtype=torch.float8_e4m3fn, device=x.device)
+    if scale is None:
+        scale = torch.empty(K, 1, dtype=torch.float32, device=x.device)
+    grid = (triton.cdiv(K, block_k),)
+    _quantize_act_fp8_fused_transposed_kernel[grid](
+        x, scale, out,
+        M, K,
+        x.stride(0), x.stride(1),
+        scale.stride(0),
+        out.stride(0), out.stride(1),
+        E4M3_MAX=448.0,
+        E4M3_MIN_NORMAL=_E4M3_MIN_NORMAL,
+        BLOCK_M=block_m, BLOCK_K=block_k,
+        num_warps=8,
+    )
+    return out, scale
+
+
+# ---------------------------------------------------------------------------
 # Triton kernel: NVFP4 → fp8 E4M3
 # ---------------------------------------------------------------------------
 @triton.jit

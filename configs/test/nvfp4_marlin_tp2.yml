@@ -1,7 +1,7 @@
 # configs/test/nvfp4_marlin_tp2.yml
 # --------------------------------
 # Smoke test for the W4A16 NVFP4 FFN path with the Marlin fused kernel
-# in TP=2 mode (nvfp4 + ffn_nvfp4_marlin + tp_sim + tp_size=2). This
+# in TP=2 mode (ffn_precision='w4a16' + tp_sim + tp_size=2). This
 # exercises the row-parallel Marlin path (down_proj all-reduce) which
 # the tp1 variant does NOT cover (tp_size=1 means the row-parallel
 # case degenerates to a no-all-reduce fast path).
@@ -12,13 +12,19 @@
 extends: ../base.yml
 
 # Diff vs base.yml:
-#   * ffn_nvfp4=true — every FFN linear uses the NVFP4 storage path
-#   * ffn_nvfp4_marlin=true — the forward matmul uses vLLM's Marlin
-#     FP4 kernel
+#   * ffn_precision="w4a16" — every FFN linear uses the W4A16 NVFP4
+#     path: NVFP4ColumnParallelLinear + NVFP4RowParallelLinear with
+#     Marlin mode-3 (hardcoded). FP4 packed buffers are the source
+#     of truth; no BF16 master.
 #   * tp_sim=true, tp_size=2 — exercises the row-parallel Marlin
-#     path (down_proj all-reduce) on a single GPU via gloo
-ffn_nvfp4: true
-ffn_nvfp4_marlin: true
+#     path (down_proj all-reduce) on a single GPU via gloo.
+#
+# Note: this test covers W4A16 (Marlin) — the canonical prod FFN
+# scheme. W4A8 in TP is not implemented on sm_120 today (no NVFP4
+# W4A8 Column/Row-Parallel); the FFN wrapper falls back to BF16 TP
+# with a RuntimeWarning when ``ffn_precision='w4a8'`` is set on a
+# TP path.
+ffn_precision: w4a16
 
 tp_sim: true
 tp_size: 2

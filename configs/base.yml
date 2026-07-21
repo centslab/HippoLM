@@ -129,30 +129,28 @@ mb_timing: 0
 empty_cache_between_mb: false
 kda_skip_aqk_akk_saved: false
 
-# FFN NVFP4 path
-ffn_nvfp4: true
-ffn_nvfp4_marlin: true
-# Drop the BF16 master weight entirely — only the FP4 packed buffers
-# exist on CPU/GPU. The optimizer streams BF16 views through the
-# module's material/commit/apply_chunk_update API at chunk granularity
-# (~8 MiB BF16 peak surface, regardless of module size). MoE-friendly:
-# the per-expert BF16 master that would otherwise scale linearly with
-# N_experts is eliminated. Requires ffn_nvfp4_marlin=true (the dequant+
-# cuBLAS no-leaf Function exists but isn't wired into the SwiGLU
-# pipeline yet).
-ffn_nvfp4_no_bf16_master: true
-
-# KDA W8A8 FP8 (E4M3) projections. The 9 projection Linears inside
-# KimiDeltaAttention (q/k/v/o_proj + b_proj + f_proj[0/1] + g_proj[0/1])
-# run their GEMM in FP8 E4M3 via ``torch._scaled_mm`` with per-row
-# activation + per-output-channel weight scaling. Backward is STE
-# (BF16 matmul against the BF16 leaf). The KDA kernel itself, the
-# gating path (A_log / dt_bias / FusedRMSNormGated), and the FFN
-# (NVFP4 above) stay in their native precisions. b_proj's output dim
-# is 12 (=num_v_heads) at prod H=12; this is NOT divisible by 16
-# (torch._scaled_mm requirement), so it silently falls back to BF16
-# via FP8Linear's shape-constraint guard. See test/test_kda_fp8.py
-# for the rollout regression test and test/_tmp/test_kda_w8a8_*.py
-# for the noise sweep (~3.7% per-Linear sig_rel, ~7-8% whole-KDA
-# after compounding across 9 layers).
-kda_fp8: true
+# Scheme-driven precision (2026-07-21, 5-scheme spec).
+# Each of the three module groups picks ONE scheme. The kernel
+# choice (two-pass vs Marlin, FP8 vs BF16 GEMM, FP8 vs BF16 grads)
+# is hardcoded per scheme — no per-config knobs. MXFP4 / MXFP8 are
+# NOT supported (only NVFP4 for w4*; E4M3 for w8*). The 5 schemes
+# (W = weight storage, a = activation/GEMM/grad precision):
+#
+#   w16a16 — pure BF16. Default. nn.Linear + cuBLAS BF16.
+#   w8a16  — FP8 storage + BF16 GEMM + BF16 grads. No kernel
+#            today (dequant-to-BF16 path missing); falls back to
+#            w16a16 with warning. Not used by this config.
+#   w8a8   — FP8 storage + FP8 GEMM + FP8 grads.
+#            FP8Linear(fp8_bwd=True). FP8 _scaled_mm fwd+bwd.
+#   w4a16  — NVFP4 storage + BF16 GEMM + BF16 grads.
+#            NVFP4Linear (Marlin mode-3). FP4 packed buffers ARE
+#            source of truth. The canonical prod FFN scheme.
+#   w4a8   — NVFP4 storage + FP8 GEMM + FP8 grads (spec).
+#            NVFP4LinearW4A8 (two-pass Triton dequant +
+#            _scaled_mm). Current bwd is BF16 STE (spec gap; TODO).
+#            The FP8-feasibility-branch FFN scheme.
+#
+# This branch's canonical config (FP8 feasibility branch):
+embedding_precision: w16a16   # storage-only; no GEMM gain
+attention_precision: w8a8      # FP8 GEMM in q/k/v/o + g_proj
+ffn_precision: w4a8            # NVFP4 two-pass W4A8
