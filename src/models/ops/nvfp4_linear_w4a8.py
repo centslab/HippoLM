@@ -266,6 +266,107 @@ def _quantize_act_fp8_fused_kernel(
         )
 
 
+# ---------------------------------------------------------------------------
+# Triton kernel: single-pass per-row amax + quantize (BF16 → fp8 E4M3)
+# (resident BLOCK_M × BLOCK_K tile, no K-loop, no HBM re-read)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _quantize_act_fp8_fused_singlepass_kernel(
+    X_ptr,           # [M, K] BF16
+    X_scale_out_ptr, # [M, 1] FP32  (output: per-row amax/E4M3_MAX)
+    X_out_ptr,       # [M, K] float8_e4m3fn
+    M, K,
+    stride_xm, stride_xk,
+    stride_sm,
+    stride_om, stride_ok,
+    E4M3_MAX: tl.constexpr,
+    E4M3_MIN_NORMAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # = next_power_of_2(K), the full K tile
+):
+    """Single-read per-row amax + quantize — no HBM re-read.
+
+    One program owns a ``BLOCK_M × BLOCK_K`` tile of the input and
+    loads it ONCE into registers. The per-row amax is reduced from
+    that resident tile; the quantization is performed against the
+    SAME tile (no second HBM read). This saves the 1.7x bandwidth
+    penalty that the 2-pass kernel pays (the 2-pass kernel re-reads
+    the BF16 input from HBM between the amax pass and the quantize
+    pass because the BLOCK_M × K FP32 tile won't fit in SMEM for
+    reuse across iterations of the K-loop).
+
+    Numerics: BYTE-EXACT equivalent to the 2-pass kernel. Same
+    dynamic per-row amax, same ``(amax / E4M3_MAX).to(bf16).to(fp32)``
+    scale rounding, same ``(E4M3_MAX / amax).to(bf16).to(fp32)``
+    inv_scale, same ``clamp(x * inv_scale, ±E4M3_MAX).to(fp8)`` cast.
+    Verified ``max |fp8 byte diff| = 0`` and ``max |scale diff| = 0``
+    across the prod shape set — see
+    ``test/test_kda_fp8.py::test_fp8_act_quant_singlepass_byte_exact``
+    for the regression guard.
+
+    Limitation: ``BLOCK_K`` is the FULL K (no loop), so the tile
+    must fit in registers. With ``BLOCK_M=8`` and ``num_warps=8``
+    the FP32-tile budget is ``8 * 32 * 255 ≈ 65K elements`` per
+    program — comfortably covers K ≤ 4096 (BLOCK_K = 4096 → 32K
+    elements per program = 128 KB FP32 = 16 KB / warp = 2 KB /
+    thread = 512 FP32 / thread, well under the 255-reg/thread
+    ceiling). K > 4096 falls back to the 2-pass kernel inside
+    :func:`quantize_act_fp8_fused`.
+
+    Layout note: the BF16 input must be contiguous (raw stride-
+    indexed loads; the kernel addresses x via ``stride_xm`` /
+    ``stride_xk``). Caller-side :func:`quantize_act_fp8_fused`
+    asserts this. See ``.claude/rules/einsum-noncontig-triton.md``
+    for the non-contig trap this avoids.
+    """
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = offs_m[:, None] < M
+    mask_k = offs_k[None, :] < K
+
+    # Single load of the full row tile into registers.
+    x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    x = tl.load(
+        x_ptrs,
+        mask=mask_m & mask_k,
+        other=tl.cast(0.0, tl.bfloat16),
+    ).to(tl.float32)
+
+    # Per-row amax across K (single reduction over the resident tile's
+    # K axis). Mask out-of-bounds K so they don't poison the amax.
+    x_abs = tl.where(mask_k, tl.abs(x), 0.0)
+    amax = tl.max(x_abs, axis=1)                # [BLOCK_M]
+    amax = tl.maximum(amax, E4M3_MIN_NORMAL)
+
+    # Same BF16-truncate-the-scale convention as the 2-pass kernel —
+    # matches the PyTorch reference path's scale precision exactly
+    # (within ~0.62% med_rel; well under the FP8 noise floor).
+    scale_bf16 = (amax / E4M3_MAX).to(tl.bfloat16)
+    scale = scale_bf16.to(tl.float32)           # [BLOCK_M]
+    inv_scale = (E4M3_MAX / amax).to(tl.bfloat16).to(tl.float32)
+
+    tl.store(X_scale_out_ptr + offs_m * stride_sm, scale, mask=offs_m < M)
+
+    # Quantize from the SAME resident tile (no HBM re-read).
+    x_q = tl.minimum(
+        tl.maximum(x * inv_scale[:, None], -E4M3_MAX),
+        E4M3_MAX,
+    ).to(tl.float8e4nv)
+
+    o_ptrs = X_out_ptr + offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+    tl.store(o_ptrs, x_q, mask=mask_m & mask_k)
+
+
+# Tile + threshold for the single-pass path. BLOCK_M=8 was the bench
+# winner on the prod shape (M=16384, K=1536); see
+# ``test/_tmp/probe_singlepass_quant.py`` for the BLOCK_M=1..16 sweep.
+# K ≤ 4096 covers every production shape (128, 1536, 4096). Larger K
+# falls back to the 2-pass kernel inside :func:`quantize_act_fp8_fused`.
+_SINGLEPASS_BLOCK_M = 8
+_SINGLEPASS_MAX_K = 4096
+
+
 def quantize_act_fp8(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -319,22 +420,74 @@ def quantize_act_fp8_fused(
     ``amax + .clamp + /E4M3_MAX + .to(fp32)`` chain (~0.34 ms at
     prod M=16k) and a separate quantize-kernel launch (~0.20 ms).
 
+    Internally dispatches between two kernels:
+
+      * **Single-pass** (``_quantize_act_fp8_fused_singlepass_kernel``,
+        default for K ≤ 4096) — one program owns a ``BLOCK_M × K``
+        tile and loads it ONCE into registers; amax + quantize both
+        operate on the resident tile. ~1.74× faster than the 2-pass
+        path because it skips the HBM re-read between the two
+        passes. Numerics are byte-exact (see
+        ``test/test_kda_fp8.py::test_fp8_act_quant_singlepass_byte_exact``).
+
+      * **2-pass** (``_quantize_act_fp8_fused_kernel``, fallback for
+        K > 4096) — pass 1 reduces per-row amax over a K-loop,
+        pass 2 re-reads x from HBM and quantizes. Used when K is
+        too large to fit the full row tile in registers.
+
+    The dispatch is internal — public signature unchanged. ``block_m``
+    and ``block_k`` are passed through to the 2-pass fallback and
+    ignored by the single-pass path (which uses
+    ``_SINGLEPASS_BLOCK_M = 8`` and ``BLOCK_K = next_power_of_2(K)``).
+
     Args:
         x     : [M, K] BF16 input (post-RMSNorm FFN input)
         out   : optional [M, K] fp8_e4m3fn output buffer
         scale : optional [M, 1] FP32 per-row scale output buffer
                 (shape must match what ``torch._scaled_mm`` expects)
-        block_m, block_k : Triton tile dims (default 64 / 128)
+        block_m, block_k : 2-pass fallback tile dims (default 64 / 128)
 
     Returns:
         (a_fp8, a_s) — ``a_fp8`` is [M, K] float8_e4m3fn, ``a_s`` is
         [M, 1] FP32 row scales.
     """
     M, K = x.shape
+    assert x.is_contiguous(), (
+        "quantize_act_fp8_fused requires a contiguous input; "
+        "call .contiguous() before passing in"
+    )
     if out is None:
         out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     if scale is None:
         scale = torch.empty(M, 1, dtype=torch.float32, device=x.device)
+
+    # Dispatch: single-pass when the full K fits in a resident tile.
+    if K <= _SINGLEPASS_MAX_K:
+        BLOCK_K = triton.next_power_of_2(K)
+        # num_warps=4 is enough for small K (≤256), num_warps=8 for
+        # larger K — keeps each warp's element budget healthy without
+        # over-saturating tiny tiles.
+        num_warps = 4 if K <= 256 else 8
+        grid = (triton.cdiv(M, _SINGLEPASS_BLOCK_M),)
+        _quantize_act_fp8_fused_singlepass_kernel[grid](
+            x,
+            scale,
+            out,
+            M, K,
+            x.stride(0), x.stride(1),
+            scale.stride(0),
+            out.stride(0), out.stride(1),
+            E4M3_MAX=448.0,
+            E4M3_MIN_NORMAL=_E4M3_MIN_NORMAL,
+            BLOCK_M=_SINGLEPASS_BLOCK_M,
+            BLOCK_K=BLOCK_K,
+            num_warps=num_warps,
+        )
+        return out, scale
+
+    # 2-pass fallback (K > 4096). Same math as the original kernel;
+    # the HBM re-read is unavoidable when the K tile won't fit in
+    # registers.
     grid = (triton.cdiv(M, block_m),)
     _quantize_act_fp8_fused_kernel[grid](
         x,

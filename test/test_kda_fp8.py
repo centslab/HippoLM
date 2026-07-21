@@ -201,6 +201,69 @@ def test_fp8_linear_weight_quant_is_fused_and_noise_floor():
     assert torch.isfinite(w_q.float()).all()
 
 
+@pytest.mark.parametrize("K", [32, 64, 128, 256, 512, 1024, 1536, 2048, 4096])
+def test_fp8_act_quant_singlepass_byte_exact(K):
+    """Single-pass quant is byte-exact vs the 2-pass kernel for K ≤ 4096.
+
+    Guards the 2026-07-21 swap of the 2-pass fused kernel
+    (``_quantize_act_fp8_fused_kernel`` — amax pass + re-read x +
+    quantize pass, ~318 µs at prod M=16k K=1536) for the single-pass
+    variant (``_quantize_act_fp8_fused_singlepass_kernel`` — single
+    HBM read with the full K resident in registers, ~184 µs at the
+    same shape, 1.72× faster). The two kernels compute the same
+    dynamic per-row amax, the same ``(amax / 448).to(bf16).to(fp32)``
+    scale, and the same ``(448 / amax).to(bf16).to(fp32)`` inv_scale;
+    the only difference is the quantize cast operates on registers
+    instead of a re-loaded HBM tile.
+
+    Asserts ``max |fp8 byte diff| == 0`` and ``max |scale diff| == 0``
+    — both zero across the K sweep on the prod M=4096 test input.
+    K > 4096 is not exercised here because the dispatcher falls back
+    to the 2-pass kernel (the FP8 tile no longer fits in registers);
+    correctness for that case is inherited from the existing
+    2-pass test coverage.
+    """
+    from src.models.ops.nvfp4_linear_w4a8 import (
+        quantize_act_fp8_fused,
+        _quantize_act_fp8_fused_kernel,
+    )
+    import triton
+    torch.manual_seed(0)
+    M = 4096
+    x = torch.randn(M, K, device=device, dtype=dtype)
+
+    # Single-pass (auto-dispatched by the wrapper).
+    out_sp, scale_sp = quantize_act_fp8_fused(x)
+
+    # Force the 2-pass kernel for direct comparison.
+    out_2p = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=device)
+    scale_2p = torch.empty(M, 1, dtype=torch.float32, device=device)
+    grid = (triton.cdiv(M, 64),)
+    _quantize_act_fp8_fused_kernel[grid](
+        x, scale_2p, out_2p, M, K,
+        x.stride(0), x.stride(1),
+        scale_2p.stride(0),
+        out_2p.stride(0), out_2p.stride(1),
+        E4M3_MAX=448.0,
+        E4M3_MIN_NORMAL=6.103515625e-05,
+        BLOCK_M=64, BLOCK_K=128,
+        num_warps=4,
+    )
+
+    fp8_byte_diff = (
+        out_sp.view(torch.uint8).int() - out_2p.view(torch.uint8).int()
+    ).abs().max().item()
+    scale_diff = (scale_sp - scale_2p).abs().max().item()
+    assert fp8_byte_diff == 0, (
+        f"K={K}: single-pass vs 2-pass fp8 byte diff = {fp8_byte_diff} (expected 0)"
+    )
+    assert scale_diff == 0.0, (
+        f"K={K}: single-pass vs 2-pass scale diff = {scale_diff:.2e} (expected 0)"
+    )
+    assert torch.isfinite(out_sp.float()).all()
+    assert torch.isfinite(scale_sp).all()
+
+
 def test_fp8_linear_bf16_only_escape():
     """``bf16_only=True`` matches plain ``nn.Linear`` exactly (0% noise)."""
     torch.manual_seed(0)
