@@ -105,28 +105,30 @@ class _FP8E4M3Matmul(torch.autograd.Function):
         w: torch.Tensor,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Quantize to FP32 (so we can use FP32 division for the scale).
-        x_fp32 = x.to(torch.float32)
+        # Activation quant: use the Triton fused kernel from
+        # ``nvfp4_linear_w4a8.quantize_act_fp8_fused``. The original
+        # PyTorch broadcast path (x.to(fp32) → amax → divide → cast)
+        # cost ~2.65 ms per call at KDA prod shape (M=16384 K=1536);
+        # the fused kernel is 8.2× faster (~0.32 ms) because the amax
+        # stays in registers across the two passes and the FP32
+        # intermediate is never materialized. See auto-memory
+        # ``project_fp8_linear_quant_fusion.md``.
+        #
+        # The kernel truncates the FP32 scale to BF16 precision (matches
+        # the FFN W4A8 path's existing convention) — gives 0.62% med_rel
+        # shift vs the prior PyTorch FP32-scale path, well under the FP8
+        # ~3.7% noise floor. Tests in ``test/test_kda_fp8.py`` still pass.
+        from src.models.ops.nvfp4_linear_w4a8 import quantize_act_fp8_fused
+        x_2d = x.reshape(-1, x.shape[-1])
+        x_q, scale_x = quantize_act_fp8_fused(x_2d)
+
+        # Per-output-channel weight quant (kept in PyTorch — separate
+        # small win to cache this on the module, see followups in
+        # ``project_fp8_linear_quant_fusion.md``).
         w_fp32 = w.to(torch.float32)
-
-        # Per-row activation scale (M, 1). amax over the K axis (last
-        # dim) gives one scale per row. ``reshape(-1, K)`` flattens the
-        # leading dims so we always operate on 2D.
-        x_2d = x_fp32.reshape(-1, x_fp32.shape[-1])
-        amax_x = x_2d.abs().amax(dim=1, keepdim=True).clamp(min=_E4M3_MIN_NORMAL)
-        scale_x = (amax_x / _E4M3_MAX).contiguous()            # (M, 1) FP32
-
-        # Per-output-channel weight scale. amax over K gives one
-        # scale per output row (channel). We compute the *input* to
-        # the quantization as ``amax_w / _E4M3_MAX`` (shape [N, 1])
-        # so the FP8 values land in [-448, 448]; the *output* scale
-        # for ``_scaled_mm`` is the same value transposed to [1, N].
         amax_w = w_fp32.abs().amax(dim=1, keepdim=True).clamp(min=_E4M3_MIN_NORMAL)
         scale_w_input = (amax_w / _E4M3_MAX)                   # [N, 1] FP32
         scale_w = scale_w_input.T.contiguous()                  # (1, N) FP32
-
-        # Quantize: divide by scale, clamp, cast to FP8.
-        x_q = (x_2d / scale_x).clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
         w_q = (w_fp32 / scale_w_input).clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
 
         # ``torch._scaled_mm`` computes ``x_q @ w_q.T`` with FP32
