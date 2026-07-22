@@ -471,6 +471,128 @@ def test_pack_cache_invalidates_on_weight_change():
 
 
 # ---------------------------------------------------------------------------
+# w_dquant output buffer cache (saves torch.empty on every forward)
+# ---------------------------------------------------------------------------
+def test_w_dquant_output_buffer_is_cached_and_reused():
+    """The dequant_nvfp4_to_fp8 output buffer must be lazily allocated
+    on first forward and reused on subsequent forwards (same weight
+    shape). Validates that the buffer identity is stable and the output
+    is correct."""
+    torch.manual_seed(0)
+    K, N = 1024, 4096
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16).cuda()
+    x = torch.randn(64, K, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    # First forward: cache miss, buffer allocated.
+    y0 = layer(x)
+    assert layer._fp8_dequant_buf is not None, (
+        "w_dquant output buffer cache should be populated after first forward"
+    )
+    buf_id = layer._fp8_dequant_buf
+    assert layer._fp8_dequant_buf.shape == (N, K), (
+        f"cached buf shape {layer._fp8_dequant_buf.shape} != ({N}, {K})"
+    )
+
+    # Second forward with same weight shape: buffer identity preserved
+    # (allocator hit; no new torch.empty).
+    y1 = layer(x)
+    assert layer._fp8_dequant_buf is buf_id, (
+        "w_dquant output buffer identity changed — cache did not hit"
+    )
+    assert torch.equal(y0, y1), (
+        "w_dquant output buffer reuse should give bit-exact repeats"
+    )
+
+    # Same weight, different M (act shape): buf still correct (M doesn't
+    # touch w_dquant output shape — only (N, K) matters).
+    x2 = torch.randn(128, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    y2 = layer(x2)
+    assert layer._fp8_dequant_buf is buf_id, (
+        "act-shape change should not invalidate w_dquant buffer cache"
+    )
+
+
+def test_w_dquant_buffer_resizes_on_module_shape_change():
+    """If a module is re-instantiated with a different (N, K) shape,
+    the w_dquant buffer cache must be reallocated to fit. (In
+    production this happens only across unrelated sub-modules — same
+    shape from layer to layer — so this is a defensive test.)"""
+    K1, N1 = 1024, 1024
+    K2, N2 = 1024, 4096
+    layer_a = NVFP4LinearW4A8(K1, N1, bias=False, block_size=16).cuda()
+    x = torch.randn(64, K1, dtype=torch.bfloat16, device="cuda") * 0.1
+    layer_a(x)
+    assert layer_a._fp8_dequant_buf.shape == (N1, K1)
+
+    layer_b = NVFP4LinearW4A8(K2, N2, bias=False, block_size=16).cuda()
+    layer_b(x)
+    assert layer_b._fp8_dequant_buf.shape == (N2, K2), (
+        f"buffer shape {layer_b._fp8_dequant_buf.shape} != ({N2}, {K2})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# act_quant output buffer cache (saves torch.empty on every forward)
+# ---------------------------------------------------------------------------
+def test_act_quant_output_buffer_is_cached_and_reused():
+    """The act_quant output (a_fp8, a_s) buffers must be lazily allocated
+    on first forward and reused on subsequent forwards with same-or-smaller
+    M. Output numerics must match the no-cache reference."""
+    torch.manual_seed(0)
+    K, N = 1024, 4096
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16).cuda()
+    M = 512
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    # First forward: cache miss.
+    y0 = layer(x)
+    assert layer._act_fp8_buf is not None
+    assert layer._act_s_buf is not None
+    assert layer._act_fp8_buf.shape == (M, K)
+    assert layer._act_s_buf.shape == (M, 1)
+    buf_id_fp8 = layer._act_fp8_buf.data_ptr()
+    buf_id_s = layer._act_s_buf.data_ptr()
+
+    # Second forward same M: buffer identity preserved (allocator hit).
+    y1 = layer(x)
+    assert layer._act_fp8_buf.data_ptr() == buf_id_fp8, (
+        "act_fp8 buffer identity changed — cache did not hit"
+    )
+    assert layer._act_s_buf.data_ptr() == buf_id_s, (
+        "act_s buffer identity changed — cache did not hit"
+    )
+    assert torch.equal(y0, y1), (
+        "act_quant output buffer reuse should give bit-exact repeats"
+    )
+
+    # Smaller M: still reuse, just view a prefix.
+    x_small = torch.randn(128, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    y2 = layer(x_small)
+    assert layer._act_fp8_buf.data_ptr() == buf_id_fp8
+    assert layer._act_s_buf.data_ptr() == buf_id_s
+
+
+def test_act_quant_buffer_grows_when_M_increases():
+    """If a forward comes in with M larger than the current buffer's
+    leading dim, the cache must reallocate (never silently truncate)."""
+    torch.manual_seed(0)
+    K, N = 1024, 1024
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16).cuda()
+    x1 = torch.randn(64, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    layer(x1)
+    cap_after_first = layer._act_fp8_buf.shape[0]
+    assert cap_after_first == 64
+
+    x2 = torch.randn(256, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    layer(x2)
+    assert layer._act_fp8_buf.shape[0] >= 256, (
+        f"buffer did not grow to accommodate M=256; "
+        f"current shape {layer._act_fp8_buf.shape}"
+    )
+    assert layer._act_fp8_buf.shape[1] == K
+
+
+# ---------------------------------------------------------------------------
 # Strategy 1: forward_precomputed skips act_quant (shared activation)
 # ---------------------------------------------------------------------------
 def test_forward_precomputed_matches_forward():

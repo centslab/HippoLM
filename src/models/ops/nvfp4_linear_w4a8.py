@@ -814,7 +814,24 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         # NVFP4W4A8SwiGLU), the caller pre-computes a_fp8/a_s on the
         # shared input and passes them in here to skip this launch.
         if a_fp8_override is None:
-            a_fp8, a_s = quantize_act_fp8_fused(x_2d)
+            M_act = x_2d.shape[0]
+            # Cache the act_quant output buffers (saves the torch.empty
+            # alloc + allocator hit on every forward — small but real,
+            # ~10 us / call). Sized to max-M-seen; doesn't shrink.
+            if (module._act_fp8_buf is None
+                    or module._act_fp8_buf.shape[0] < M_act):
+                module._act_fp8_buf = torch.empty(
+                    M_act, K, dtype=torch.float8_e4m3fn, device=x.device,
+                )
+                module._act_s_buf = torch.empty(
+                    M_act, 1, dtype=torch.float32, device=x.device,
+                )
+            else:
+                module._act_fp8_buf = module._act_fp8_buf[:M_act]
+                module._act_s_buf = module._act_s_buf[:M_act]
+            a_fp8, a_s = quantize_act_fp8_fused(
+                x_2d, out=module._act_fp8_buf, scale=module._act_s_buf,
+            )
         else:
             a_fp8, a_s = a_fp8_override, a_s_override
 
@@ -831,8 +848,20 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         # (i.e. when the optimizer/loader modifies the BF16 master weight).
         boost = module._get_or_refresh_boost(w_bf16, s_e4m3)
 
-        # Dequant weight: NVFP4 → fp8 [N, K]
-        b_fp8 = dequant_nvfp4_to_fp8(packed, s_e4m3, boost)
+        # Dequant weight: NVFP4 → fp8 [N, K]. Reuse a cached buffer
+        # if shape matches (saves the torch.empty alloc + allocator hit
+        # on every forward — small but real, ~3-12 us/call = ~30 us/step
+        # across the 3 W4A8 linears per step).
+        N = w_bf16.shape[0]
+        K = w_bf16.shape[1]
+        if (module._fp8_dequant_buf is None
+                or module._fp8_dequant_buf.shape != (N, K)):
+            module._fp8_dequant_buf = torch.empty(
+                N, K, dtype=torch.float8_e4m3fn, device=w_bf16.device,
+            )
+        b_fp8 = dequant_nvfp4_to_fp8(
+            packed, s_e4m3, boost, out=module._fp8_dequant_buf,
+        )
 
         # Pass-2 GEMM: pick backend
         g_adj = g.float() / boost
@@ -981,6 +1010,18 @@ class NVFP4LinearW4A8(nn.Module):
         self._pack_cache: tuple[torch.Tensor, torch.Tensor, float] | None = None
         self._pack_w_ver: int = -1
         self._pack_block_size: int = -1
+
+        # w_dquant output buffer cache (saves the torch.empty alloc on
+        # every forward). Lazily allocated on first forward; sized to
+        # (out_features, in_features) FP8. ~3 MB at FFN gate/up shape.
+        self._fp8_dequant_buf: torch.Tensor | None = None
+
+        # act_quant output buffer cache (saves the torch.empty alloc
+        # for a_fp8 + a_s on every forward). Lazily allocated; sized
+        # to (max_M_seen, in_features) FP8 + (max_M_seen) FP32.
+        # The M dimension grows as needed — we don't shrink.
+        self._act_fp8_buf: torch.Tensor | None = None
+        self._act_s_buf: torch.Tensor | None = None
 
         self._init_weights()
 
