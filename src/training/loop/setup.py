@@ -172,11 +172,13 @@ def _setup_worker(
         attention_precision=getattr(args, "attention_precision", "w16a16"),
         ffn_precision=getattr(args, "ffn_precision", "w16a16"),
         # Producer-side FP8 fusions (2026-07-22, full-FP8
-        # productionization). Both default to False; yml sets
-        # ``true`` in ``configs/test/fp8_full.yml`` for the
-        # smoke-test scenario. End-to-end fwd+bwd STE-bwd probe
-        # showed +0.27% loss delta at 300 steps vs BF16, well
-        # inside the FP8 noise floor.
+        # productionization). All default to False; ``base.yml``
+        # enables ``fp8_rmsnorm`` + ``fp8_silu_mul`` and leaves
+        # ``fp8_residual`` off (precision-sensitive). End-to-end
+        # fwd+bwd STE-bwd probe at 300 steps showed +0.27% loss
+        # delta when all three were on; the FP8-only residual
+        # amplifies that further, so production keeps it BF16.
+        fp8_rmsnorm=getattr(args, "fp8_rmsnorm", False),
         fp8_residual=getattr(args, "fp8_residual", False),
         fp8_silu_mul=getattr(args, "fp8_silu_mul", False),
     )

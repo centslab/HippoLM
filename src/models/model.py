@@ -32,15 +32,29 @@ class HippoLayer(nn.Module):
     :class:`HippoModel`).
 
     Optional producer-side FP8 fusions (gated by
-    ``config.fp8_residual`` and ``config.fp8_silu_mul``):
+    ``config.fp8_rmsnorm`` / ``fp8_residual`` / ``fp8_silu_mul``):
 
+      - ``fp8_rmsnorm=True``   → ``attn_norm(x)`` and ``mlp_norm(x)``
+        run through :class:`RmsNormFp8STE` instead of the BF16 fla
+        kernel. The fused kernel (``src/models/ops/rmsnorm_fp8.py``)
+        does RMSNorm + per-row FP8 quant in one launch; saves 1
+        kernel per RMSNorm (2 RMSNorms per layer → 2 launches saved).
+        STE on the FP8 round, proper RMSNorm bwd on the math
+        (``dL/dweight`` is preserved). The downstream KDA / FFN GEMMs
+        consume the BF16 dequantized output via their own internal
+        act_quant (the FP8 + scale output is currently discarded;
+        a future KDA-side change could consume it directly and save
+        the re-quant, but that requires KDA's act_quant to be plumbed
+        to accept pre-quantized inputs).
       - ``fp8_residual=True``  → ``x = Fp8ResidualSTE(x, sub)`` instead
         of ``x + sub`` for both sublayer residuals. The fused kernel
         (``src/models/ops/fp8_residual.py``) does quant-add-requant
         in one Triton launch with STE backward. Numerics: per-row
         FP8 representation noise (3.76% sig_rel vs BF16 reference at
         a single boundary; compounds via ``sqrt(N)`` across layers as
-        is standard for FP8).
+        is standard for FP8). Production keeps this OFF — the residual
+        stream's precision is the load-bearing path for the L-layer
+        noise compounding.
       - ``fp8_silu_mul=True`` → FFN's middle op is
         ``SiluMulFp8STE(gate, up)`` instead of ``silu(gate)*up`` (BF16).
         The fused kernel (``src/models/ops/silu_mul_fp8.py``) does
@@ -63,8 +77,15 @@ class HippoLayer(nn.Module):
         # Lazy imports: ops module is the only consumer, and the
         # autograd Functions depend on the Triton kernels which
         # JIT on first call (no eager cost).
+        self._use_fp8_rmsnorm: bool = bool(getattr(config, "fp8_rmsnorm", False))
         self._use_fp8_residual: bool = bool(getattr(config, "fp8_residual", False))
         self._use_fp8_silu_mul: bool = bool(getattr(config, "fp8_silu_mul", False))
+
+    def _norm(self, layer: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+        if self._use_fp8_rmsnorm:
+            from .ops.rmsnorm_fp8 import RmsNormFp8STE
+            return RmsNormFp8STE.apply(x, layer.weight, layer.eps)
+        return layer(x)
 
     def forward(
         self,
@@ -81,16 +102,17 @@ class HippoLayer(nn.Module):
         Returns:
             ``[B, T, hidden_size]`` output after KDA and FFN with
             standard residual connections (BF16 or fused FP8, see
-            ``HippoConfig.fp8_residual`` / ``fp8_silu_mul``).
+            ``HippoConfig.fp8_rmsnorm`` / ``fp8_residual`` /
+            ``fp8_silu_mul``).
         """
-        sub = self.kda(self.attn_norm(x), cu_seqlens=cu_seqlens)
+        sub = self.kda(self._norm(self.attn_norm, x), cu_seqlens=cu_seqlens)
         if self._use_fp8_residual:
             from .ops.fp8_residual import Fp8ResidualSTE
             x = Fp8ResidualSTE.apply(x, sub)
         else:
             x = x + sub
 
-        x_norm = self.mlp_norm(x)
+        x_norm = self._norm(self.mlp_norm, x)
         if self._use_fp8_silu_mul:
             # Fused silu(gate)*up → FP8 inside the FFN. We bypass
             # SwiGLU.forward so its internals don't re-fuse (avoid

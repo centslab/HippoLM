@@ -154,3 +154,31 @@ kda_skip_aqk_akk_saved: false
 embedding_precision: w16a16   # storage-only; no GEMM gain
 attention_precision: w8a8      # FP8 GEMM in q/k/v/o + g_proj
 ffn_precision: w4a8            # NVFP4 two-pass W4A8
+
+# Producer-side FP8 fusions (2026-07-22, full-FP8 productionization).
+# These run on top of the module-group precision schemes above:
+#
+#   fp8_rmsnorm:   RMSNorm(BF16→BF16) + quantize_act_fp8_fused →
+#                  fused RMSNorm→FP8 Triton kernel (1 launch instead
+#                  of 2). STE on FP8 quant; proper RMSNorm bwd
+#                  preserves dL/dweight. KDA's q/k/v/o act_quant
+#                  and FFN's gate/up act_quant still re-quantize the
+#                  BF16 dequant output — the FP8+scale from this
+#                  kernel is currently discarded. Saves 1 launch per
+#                  RMSNorm × 2 RMSNorms per layer = 2 launches/layer.
+#
+#   fp8_residual:  the residual stream is the load-bearing path for
+#                  the L-layer sqrt(N) noise compounding, so we keep
+#                  it BF16 (x + sub elementwise add). Previous e2e
+#                  probe showed +0.27% loss delta at 300 steps with
+#                  full FP8; the residual contribution amplifies that
+#                  further when enabled. Pin OFF.
+#
+#   fp8_silu_mul:  silu(gate)*up + quantize_act_fp8_fused → fused
+#                  silu_mul_fp8 Triton kernel. Saves 2 launches per
+#                  FFN sublayer (silu + mul + quant → 1 fused launch).
+#                  The downstream down_proj (W4A8) still does its own
+#                  internal act_quant on the BF16 dequant output.
+fp8_rmsnorm: true
+fp8_residual: false
+fp8_silu_mul: true

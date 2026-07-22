@@ -174,22 +174,33 @@ class HippoConfig:
     ffn_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
 
     # Producer-side quant fusions (2026-07-22, full-FP8 productionization).
-    # Both default to False for backward compatibility; flipping on is
-    # the "full FP8" production recipe (see auto-memory
-    # ``project_fp8_full_e2e.md`` for the precondition that passed
-    # end-to-end at 300 steps with +0.27% loss delta).
+    # All three default to False for backward compatibility; the
+    # production recipe in ``configs/base.yml`` enables ``fp8_rmsnorm``
+    # and ``fp8_silu_mul`` (the two quant kernels that don't sit on the
+    # critical-path precision gradient) and leaves ``fp8_residual`` off
+    # (the residual stream's elementwise add amplifies quant noise
+    # through the L-layer sqrt(N) compounding; BF16 is the right call).
+    # See auto-memory ``project_fp8_full_e2e.md`` for the e2e probe.
+    #
+    # ``fp8_rmsnorm=True`` replaces ``RMSNorm(x)`` (BF16→BF16) +
+    # ``quantize_act_fp8_fused`` (BF16→FP8) with the fused Triton kernel
+    # in ``src/models/ops/rmsnorm_fp8.py``. STE on the FP8 round, proper
+    # RMSNorm bwd on the math (preserves ``dL/dweight``). Saves 1 kernel
+    # launch per RMSNorm (2 RMSNorms per layer → 2 launches saved).
     #
     # ``fp8_residual=True`` replaces the ``x + sub`` elementwise add
     # with the fused FP8 quant-add-requant kernel in
     # ``src/models/ops/fp8_residual.py``. Numerics: per-row amax carries
     # the FP8 representation noise (≈3.76% sig_rel vs BF16 reference,
     # same as a single GEMM round; the ``sqrt(N)`` compounding through
-    # L layers is the standard FP8 noise model).
+    # L layers is the standard FP8 noise model). Disabled by default —
+    # precision-sensitive on the residual stream.
     #
     # ``fp8_silu_mul=True`` replaces the FFN's silu(gate)*up (BF16)
     # with the fused ``silu_mul_fp8`` Triton kernel in
     # ``src/models/ops/silu_mul_fp8.py``. Numerics: same FP8 noise
     # floor; saves 2 kernel launches per FFN sublayer.
+    fp8_rmsnorm: bool = False
     fp8_residual: bool = False
     fp8_silu_mul: bool = False
 
