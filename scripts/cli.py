@@ -273,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
                         " 'bf16' = full-precision BF16 buffer (legacy)."
                         " 'fp8_2d_tight' = E4M3 + per-(row × col-block) +"
                         " per-(col × row-block) FP32 scales; dequant+requant"
-                        " per step. Brings NS output drift from 14-21%"
+                        " per step. Brings NS output drift from 14-21%%"
                         " down to ~1.45%% on outlier regimes at prod shape."
                         " Production rollout (2026-07-16): see"
                         " project_2d_tight_scale.md for the empirical basis.")
