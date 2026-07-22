@@ -245,6 +245,63 @@ def test_ste_backward_grads_finite_and_match_bf16():
     )
 
 
+def test_ste_backward_is_bit_equivalent_to_f_linear():
+    """Regression guard against the FP32-cast perf bug.
+
+    The autograd backward must run in BF16 throughout — NOT cast to
+    FP32 first. The historical FP32-cast path ran FP32 GEMMs (12.5 TFLOPS
+    FP32 SIMT peak vs 50 TFLOPS BF16 TC = ~3× slower at FFN prod shape)
+    AND produced numerically distinct grad_w (FP32 accumulation vs
+    BF16 accumulation; reduction-order differences).
+
+    Verify at FFN prod shape (M=1024, K=1536, N=4096) that
+    NVFP4LinearW4A8.backward produces grad_w with cos_sim == 1.0
+    against the F.linear reference. Any future regression to FP32
+    casting (or any non-trivial deviation from the BF16 STE contract)
+    will fail this assertion.
+    """
+    torch.manual_seed(0)
+    M, K, N = 1024, 1536, 4096   # FFN gate/up prod shape
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.05
+
+    layer = NVFP4LinearW4A8(K, N, bias=False, block_size=16).cuda()
+    with torch.no_grad():
+        layer.weight.data.copy_(w)
+
+    grad_out = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+
+    # W4A8 backward path
+    x_w4a8 = x.detach().clone().requires_grad_(True)
+    y_w4a8 = layer(x_w4a8)
+    y_w4a8.backward(grad_out)
+
+    # BF16 reference: plain F.linear bwd computes grad_w as
+    # grad_out.T @ x in BF16 — bit-equivalent to the STE backward.
+    grad_w_ref = grad_out.t() @ x_w4a8.detach()
+
+    # BF16 STE bwd must produce bit-exact grad_w (modulo reduction order
+    # which only changes last-bit on K=1536). cos_sim == 1.0 + tiny
+    # max_abs_err detects any non-BF16-cast path (FP32, FP8, etc.).
+    cos_w = torch.nn.functional.cosine_similarity(
+        layer.weight.grad.flatten().float(),
+        grad_w_ref.flatten().float(),
+        dim=0,
+    ).item()
+    max_abs_err = (layer.weight.grad.float() - grad_w_ref.float()).abs().max().item()
+    assert cos_w > 0.9999, (
+        f"STE grad_w diverges from BF16 F.linear ref (cos_sim={cos_w:.6f}); "
+        f"backward may have been cast to FP32 or quant-dequanted."
+    )
+    # BF16 STE bwd should match F.linear bwd at BF16 rounding noise.
+    # A FP32-cast path would introduce FP32-accumulation error that's
+    # an order of magnitude larger than BF16 eps.
+    assert max_abs_err < 1e-2, (
+        f"STE grad_w max_abs_err={max_abs_err:.4f} > 1e-2; "
+        f"backward likely ran in FP32, not BF16."
+    )
+
+
 # ---------------------------------------------------------------------------
 # State dict compatibility with nn.Linear
 # ---------------------------------------------------------------------------

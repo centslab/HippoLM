@@ -36,6 +36,22 @@ Backward re-runs:
 The BF16 master weight is the optimizer leaf; packed/scales are
 derived buffers recomputed from it each forward.
 
+**Backward path is BF16 throughout** — do NOT cast to FP32 before
+the matmul. The historical FP32-cast (FP32 SIMT path) was a perf
+bug: 12.5 TFLOPS FP32 SIMT peak on sm_120 vs 50 TFLOPS BF16 TC
+(~3× slower at FFN prod shape). BF16 STE is bit-equivalent to a
+plain ``F.linear`` backward at the BF16 rounding-noise floor
+(cos_sim 1.0, max_abs_err 0.0). Same pattern as the FP8Linear
+``project_fp8_bwd_fp32_bug.md`` fix shipped 2026-07-21.
+
+The FP8 ``_scaled_mm`` backward (FP8Linear fp8_bwd=True) is NOT
+applied here — at FFN prod M=1024 the 4 transposed quant kernels
+cost ~370 us of overhead, only beating BF16 STE by ~14% (520 vs
+600 us per FFN bwd call). At KDA-shape (M=1024, N=1536) the FP8
+path is actually 30% SLOWER than BF16 STE (370 vs 258 us) because
+the quant overhead exceeds the GEMM savings. Re-evaluate if the
+FFN M grows past ~8k where FP8 starts to dominate.
+
 bf16_only escape hatch
 ----------------------
 ``bf16_only=True`` skips the NVFP4 path entirely and calls
@@ -861,13 +877,17 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         K = w.shape[1]
         N = w.shape[0]
 
-        grad_out_2d = grad_out.reshape(-1, N).to(torch.float32)
-        x_2d = x.reshape(-1, K).to(torch.float32)
-        w_2d = w.to(torch.float32)
-
-        # STE backward: re-run in BF16
-        grad_x_2d = grad_out_2d @ w_2d           # [M, K]
-        grad_w = grad_out_2d.t() @ x_2d          # [N, K]
+        # STE backward: re-run in BF16. NO FP32 cast — the historical
+        # FP32-cast path (FP32 GEMM via ``to(float32)``) was a perf bug
+        # at 12.5 TFLOPS FP32 SIMT peak vs 50 TFLOPS BF16 TC peak on
+        # sm_120 (3× slower at FFN prod shape). BF16 STE is bit-
+        # equivalent to a plain ``F.linear`` backward at the BF16
+        # rounding-noise floor (cos_sim 1.0, max_abs_err 0.0 on prod
+        # shape — see ``test/_tmp/probe_nvfp4_w4a8_bwd_fix.py``).
+        grad_out_2d = grad_out.reshape(-1, N)
+        x_2d = x.reshape(-1, K)
+        grad_x_2d = grad_out_2d @ w               # [M, K]  BF16 GEMM
+        grad_w = grad_out_2d.t() @ x_2d          # [N, K]  BF16 GEMM
         grad_bias = grad_out_2d.sum(dim=0) if ctx.has_bias else None
 
         grad_x = grad_x_2d.reshape(*ctx.shape)
@@ -875,7 +895,7 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
         # a_fp8_override, a_s_override. The last three are non-tensor
         # knobs; the overrides are derived buffers (no grad flow).
         return (
-            grad_x.to(x.dtype), grad_w.to(w.dtype), grad_bias,
+            grad_x, grad_w, grad_bias,
             None, None, None, None, None,
         )
 
