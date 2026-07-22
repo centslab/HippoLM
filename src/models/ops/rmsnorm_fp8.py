@@ -254,7 +254,14 @@ class RmsNormFp8STE(torch.autograd.Function):
         return y
 
     @staticmethod
-    def backward(ctx, grad_y: torch.Tensor):
+    def backward(ctx, grad_y: torch.Tensor, grad_fp8=None, grad_scale=None):
+        """Backward for the (y_bf16,) or (y_bf16, out_fp8, scale) tuple.
+
+        The optional ``grad_fp8`` / ``grad_scale`` are the upstream
+        gradients on the FP8 + scale auxiliary outputs (only present
+        when ``return_fp8=True`` was used). Both are None — no
+        gradient flows through the FP8 round (STE convention).
+        """
         x_2d, weight, rstd = ctx.saved_tensors
         K = x_2d.shape[-1]
         grad_y_2d = grad_y.reshape(-1, K).contiguous()

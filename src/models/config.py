@@ -148,6 +148,13 @@ class HippoConfig:
     #                         typically the biggest single buffer and
     #                         quantization of it isn't on the perf
     #                         critical path).
+    #   lm_head_precision:    only ``w16a16`` and ``w8a8`` are wired
+    #                         today. ``w8a8`` = ``FP8Linear(
+    #                         fp8_bwd=True)`` — saves ~9.5 ms/step at
+    #                         prod shape, 0.03% loss drift over 50
+    #                         steps, no compounding noise. The other
+    #                         three schemes fall back to ``w16a16``
+    #                         with a warning.
     #   attention_precision: ``w16a16`` ✓, ``w8a8`` ✓. ``w8a16``,
     #                         ``w4a8``, ``w4a16`` fall back: ``w8a16``
     #                         → ``w16a16`` (no BF16-GEMM W8A16 KDA
@@ -172,6 +179,14 @@ class HippoConfig:
     embedding_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
     attention_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
     ffn_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
+    # lm_head precision (2026-07-22). Only the W8A8 wiring is real
+    # today (``FP8Linear(fp8_bwd=True)`` — saves ~9.5 ms/step at prod
+    # shape, 0.03% loss drift over 50 steps, no compounding noise);
+    # the other schemes fall back to ``w16a16`` (plain nn.Linear)
+    # with a logged warning. See
+    # ``project_w8a8_lmhead_embed_probe_2026_07_22.md`` for the
+    # full probe.
+    lm_head_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
 
     # Producer-side quant fusions (2026-07-22, full-FP8 productionization).
     # All three default to False for backward compatibility; the
@@ -237,6 +252,7 @@ class HippoConfig:
             "embedding_precision",
             "attention_precision",
             "ffn_precision",
+            "lm_head_precision",
         ):
             value = getattr(self, field_name)
             assert value in SCHEMES, (

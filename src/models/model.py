@@ -186,10 +186,48 @@ class HippoModel(nn.Module):
         # to 0 (uniform attention) per the paper.
         self.attn_res = BlockAttnRes(config)
 
-        # Language modeling head
-        self.lm_head = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=config.use_bias
-        )
+        # Language modeling head. ``config.lm_head_precision`` drives
+        # the choice:
+        #   ``"w8a8"``  → ``FP8Linear(fp8_bwd=True)`` — saves ~9.5 ms
+        #                 per step at prod shape (M=1024 H=1536
+        #                 V=248320). 0.03% loss drift over 50 steps
+        #                 (no compounding noise; cos_sim > 0.999 on
+        #                 logits / grads). The BF16 master weight is
+        #                 the optimizer leaf — the FP8 quantization is
+        #                 computed on the fly per forward. Tied-
+        #                 embeddings (``tie_word_embeddings=True``)
+        #                 shares the same ``.weight`` tensor; see
+        #                 ``project_w8a8_lmhead_embed_probe_2026_07_22.md``.
+        #   ``"w16a16"`` (default) → plain ``nn.Linear``.
+        #   other schemes fall back to ``nn.Linear`` with a logged
+        #   warning (the only other candidate today is ``w8a16``
+        #   which has no BF16-GEMM W8A16 head kernel on sm_120; the
+        #   ``w4a16``/``w4a8`` paths are not implemented for lm_head).
+        lm_head_precision = getattr(config, "lm_head_precision", "w16a16")
+        if lm_head_precision == "w8a8":
+            from .ops.fp8_linear import FP8Linear
+            # Shape-constraint check (FP8Linear silently falls back to
+            # BF16 when in/out not divisible by 16). For the prod
+            # shape (V=248320, H=1536) both are divisible by 16, so
+            # this branch always fires — the FP8 path is real.
+            self.lm_head = FP8Linear(
+                config.hidden_size, config.vocab_size,
+                bias=config.use_bias, fp8_bwd=True,
+            )
+        else:
+            if lm_head_precision != "w16a16":
+                import warnings
+                warnings.warn(
+                    f"lm_head_precision={lm_head_precision!r} is not "
+                    f"implemented for the lm_head module today (only "
+                    f"'w16a16' and 'w8a8' are wired); falling back to "
+                    f"'w16a16' (plain nn.Linear).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self.lm_head = nn.Linear(
+                config.hidden_size, config.vocab_size, bias=config.use_bias
+            )
 
         # Tie embeddings and output weights
         if config.tie_word_embeddings:

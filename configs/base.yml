@@ -154,6 +154,11 @@ kda_skip_aqk_akk_saved: false
 embedding_precision: w16a16   # storage-only; no GEMM gain
 attention_precision: w8a8      # FP8 GEMM in q/k/v/o + g_proj
 ffn_precision: w4a8            # NVFP4 two-pass W4A8
+lm_head_precision: w8a8        # FP8 lm_head (FP8Linear fp8_bwd=True)
+                               # ~9.5 ms/step savings at prod shape,
+                               # 0.03% loss drift over 50 steps.
+                               # BF16 master weight is the optimizer
+                               # leaf (tied-embeddings still works)
 
 # Producer-side FP8 fusions (2026-07-22, full-FP8 productionization).
 # These run on top of the module-group precision schemes above:
