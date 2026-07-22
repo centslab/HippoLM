@@ -21,6 +21,7 @@ from .norms import RMSNorm
 from .ops.kda import KDA
 from .ops.attn_res import BlockAttnRes
 from .activation import SwiGLU
+from .ops._vendored.fla.modules.fused_cross_entropy import FusedCrossEntropyLoss
 
 
 class HippoLayer(nn.Module):
@@ -160,6 +161,13 @@ class HippoModel(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
+        # Fused log-softmax + nll + softmax-derivative (Triton). Used by
+        # the non-TP forward path; the TP path uses TPFusedLceLoss which
+        # additionally folds the lm_head materialization. ~2x faster
+        # than F.cross_entropy at prod shape (1024, 248320); saves the
+        # 9.4 ms elementwise cluster on each step.
+        self.fused_ce = FusedCrossEntropyLoss(ignore_index=-100, reduction="mean")
+
         self._init_weights()
 
     def _init_weights(self):
@@ -243,10 +251,13 @@ class HippoModel(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            loss = nn.functional.cross_entropy(
+            # Fused log-softmax + nll + softmax-derivative via FLA Triton
+            # kernel. ~2x faster than F.cross_entropy at prod shape;
+            # see test/test_fused_cross_entropy.py for the numerics
+            # contract (cos_sim > 0.9999 on bwd grad).
+            loss = self.fused_ce(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
-                ignore_index=-100,
             )
             output["loss"] = loss
 
