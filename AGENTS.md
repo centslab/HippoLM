@@ -80,7 +80,9 @@ A kernel must have a numerical-correctness test and a benchmark
 before it lands. Triton patterns live in
 [`docs/triton_kernel_playbook.md`](docs/triton_kernel_playbook.md);
 Marlin FP4 build and runtime notes live in
-[`docs/marlin_build_pipeline.md`](docs/marlin_build_pipeline.md).
+[`docs/marlin_build_pipeline.md`](docs/marlin_build_pipeline.md);
+FP8 E4M3 GEMM build + cross-arch dispatch in
+[`docs/fp8_gemm_kernel_pipeline.md`](docs/fp8_gemm_kernel_pipeline.md).
 For the correctness gate when sweeping kernel parameters, see
 [`.claude/skills/kda-correctness-sweep/SKILL.md`](.claude/skills/kda-correctness-sweep/SKILL.md).
 

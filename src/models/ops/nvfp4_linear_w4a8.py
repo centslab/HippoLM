@@ -869,33 +869,23 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
             packed, s_e4m3, boost, out=module._fp8_dequant_buf,
         )
 
-        # Pass-2 GEMM: pick backend
+        # Pass-2 GEMM: route through the FP8 GEMM runtime
+        # auto-dispatcher. Per-arch `.so` discovery + per-(M, K, N)
+        # micro-bench picks the fastest available backend at first
+        # call (BM64/BN64 wins at small M, BM128/BN128 at large M);
+        # falls back to ``torch._scaled_mm`` automatically when no
+        # prebuilt .so covers the current arch.
+        #
+        # The ``use_custom_gemm`` opt-in flag is now subsumed by the
+        # dispatcher's own backend pick; we still honor the flag for
+        # backwards compatibility (True = "prefer fp8_gemm kernels
+        # over _scaled_mm when available", but never refuse to run).
+        from src.models.ops.cuda.fp8_gemm_dispatch import fp8_gemm_auto_dispatch
         g_adj = g.float() / boost
-        if use_custom_gemm:
-            from src.models.ops.cuda.fp8_gemm import (
-                fp8_gemm_scaled, is_available as _fp8_gemm_available,
-            )
-            if not _fp8_gemm_available():
-                # .so not built for this arch — fall back to _scaled_mm
-                # (no warning; the caller opted in knowing the .so
-                # may or may not be present).
-                use_custom_gemm = False
-
-        if use_custom_gemm:
-            # Custom kernel: a_s is [M, 1], scale_b is a scalar
-            # broadcast to [1, N] (all entries = g_adj).
-            scale_b = torch.full((1, N), g_adj.item(), dtype=torch.float32, device=x.device)
-            out_2d = fp8_gemm_scaled(a_fp8, b_fp8, a_s, scale_b)
-        else:
-            # cuBLAS nvjet via _scaled_mm (B is [K, N] col-major view).
-            scale_b = torch.full((1, N), g_adj.item(), dtype=torch.float32, device=x.device)
-            out_2d = torch._scaled_mm(
-                a_fp8,
-                b_fp8.t(),
-                scale_a=a_s,
-                scale_b=scale_b,
-                out_dtype=torch.bfloat16,
-            )
+        # scale_b is per-N (NVFP4 global scale folds into one scalar
+        # applied to all N output channels); broadcast to [1, N].
+        scale_b = torch.full((1, N), g_adj.item(), dtype=torch.float32, device=x.device)
+        out_2d = fp8_gemm_auto_dispatch(a_fp8, b_fp8, a_s, scale_b)
 
         if bias is not None:
             out_2d = out_2d + bias

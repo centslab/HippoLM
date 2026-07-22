@@ -200,14 +200,17 @@ class _FP8E4M3Matmul(torch.autograd.Function):
 
         w_q, scale_w = _quantize_w_per_channel(w)
 
-        # ``torch._scaled_mm`` computes ``x_q @ w_q.T`` with FP32
-        # accum. The b operand is the *transposed* weight (column-
-        # major view of the row-major [N, K] weight).
-        out_2d = torch._scaled_mm(
-            x_q, w_q.T,
-            scale_x, scale_w,
-            out_dtype=torch.bfloat16,
-        )                                                        # (M, N)
+        # Custom CUDA C++ FP8 GEMM via the runtime dispatcher
+        # (per-arch `.so` discovery + per-(M, K, N) micro-bench at
+        # first call). At prod M=1024 this picks BM64/BN64 over the
+        # CUTLASS `_scaled_mm` path and saves ~13-29% on the GEMM.
+        # Falls back to ``torch._scaled_mm`` automatically if no
+        # prebuilt .so matches the current arch (e.g. on a fresh env
+        # without ``scripts/build_fp8_gemm.py``). See
+        # ``docs/fp8_gemm_kernel_pipeline.md`` and auto-memory
+        # ``project_fp8_dispatch_by_m.md``.
+        from src.models.ops.cuda.fp8_gemm_dispatch import fp8_gemm_auto_dispatch
+        out_2d = fp8_gemm_auto_dispatch(x_q, w_q, scale_x, scale_w)
 
         # Add bias (broadcasts over the leading dims of the input).
         if bias is not None:
@@ -297,11 +300,9 @@ class _FP8E4M3MatmulFP8Bwd(torch.autograd.Function):
         x_2d = x.reshape(-1, x.shape[-1])
         x_q, scale_x = quantize_act_fp8_fused(x_2d)
         w_q, scale_w = _quantize_w_per_channel(w)
-        out_2d = torch._scaled_mm(
-            x_q, w_q.T,
-            scale_x, scale_w,
-            out_dtype=torch.bfloat16,
-        )
+        # Dispatcher swap (see ``_FP8E4M3Matmul.forward`` comment).
+        from src.models.ops.cuda.fp8_gemm_dispatch import fp8_gemm_auto_dispatch
+        out_2d = fp8_gemm_auto_dispatch(x_q, w_q, scale_x, scale_w)
         if bias is not None:
             out_2d = out_2d + bias
         out = out_2d.reshape(*x.shape[:-1], w.shape[0])
