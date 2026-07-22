@@ -218,10 +218,18 @@ class RmsNormFp8STE(torch.autograd.Function):
     the requantization); the BF16 RMSNorm is the "differentiable
     surrogate" the gradient flows through. Numerically identical to
     the unfused path's backward within BF16 rounding.
+
+    When constructed via :func:`rmsnorm_fp8_with_passthrough`, returns
+    a tuple ``(y_bf16, out_fp8, scale)`` instead of just ``y_bf16`` —
+    the caller can route ``out_fp8 / scale`` directly into a
+    ``forward_precomputed`` consumer (FFN/KDA linear) to skip the
+    redundant downstream ``quantize_act_fp8_fused``. The autograd
+    graph still flows through ``y_bf16``, so the backward is unchanged.
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float,
+                return_fp8: bool = False):
         orig_shape = x.shape
         K = orig_shape[-1]
         x_2d = x.reshape(-1, K).contiguous()
@@ -235,6 +243,14 @@ class RmsNormFp8STE(torch.autograd.Function):
         ctx.save_for_backward(x_2d, weight, rstd)
         ctx.eps = eps
         ctx.orig_shape = orig_shape
+        if return_fp8:
+            # Tuple return: (bf16_for_autograd, fp8_for_precomputed,
+            # scale_for_precomputed). Only ``y`` is part of the
+            # autograd graph; ``out_fp8`` / ``scale`` are auxiliary
+            # tensors the caller routes to ``forward_precomputed``
+            # consumers. No gradient flows to them — the FP8 round
+            # is STE (treated as identity in backward).
+            return y, out_fp8, scale
         return y
 
     @staticmethod
@@ -259,4 +275,22 @@ class RmsNormFp8STE(torch.autograd.Function):
         d_x = (grad_y_2d.float() * w_fp32[None, :] * rstd_col).to(x_2d.dtype)
         d_x = d_x.reshape(ctx.orig_shape)
 
-        return d_x, d_weight, None
+        # 4 grads returned (x, weight, eps, return_fp8); the last
+        # two are non-tensor knobs.
+        return d_x, d_weight, None, None
+
+
+def rmsnorm_fp8_with_passthrough(
+    x: torch.Tensor, weight: torch.Tensor, eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply :class:`RmsNormFp8STE` and return ``(y_bf16, out_fp8, scale)``.
+
+    Convenience wrapper around ``RmsNormFp8STE.apply(x, w, eps, return_fp8=True)``.
+    The returned ``out_fp8`` / ``scale`` can be passed directly to a
+    :func:`forward_precomputed` consumer (FFN / KDA linear) to skip
+    the redundant downstream ``quantize_act_fp8_fused`` call —
+    saving ~105 us per FFN at prod shape (1024, 1536).
+
+    The ``y_bf16`` is what autograd tracks; the FP8 round is STE.
+    """
+    return RmsNormFp8STE.apply(x, weight, eps, True)

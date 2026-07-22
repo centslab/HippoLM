@@ -833,7 +833,13 @@ class _NVFP4W4A8Matmul(torch.autograd.Function):
                 x_2d, out=module._act_fp8_buf, scale=module._act_s_buf,
             )
         else:
-            a_fp8, a_s = a_fp8_override, a_s_override
+            # Caller supplied a pre-quantized FP8 buffer (typically
+            # the upstream RmsNormFp8STE passthrough). Flatten any
+            # leading dims to 2-D — the matmul kernel needs 2-D, and
+            # callers may pass 3-D ``[B, T, K]`` from a
+            # :class:`HippoLayer` forward.
+            a_fp8 = a_fp8_override.reshape(-1, K) if a_fp8_override.dim() != 2 else a_fp8_override
+            a_s = a_s_override.reshape(-1, 1) if a_s_override.dim() != 2 else a_s_override
 
         # Quantize weight: NVFP4 packed + scales + global.
         # Cached on the module and invalidated when w_bf16._version changes
@@ -1359,16 +1365,24 @@ def silu_quant_fused(
         f"gate and up must have the same shape, got {gate.shape} vs {up.shape}"
     )
     assert gate.dtype == torch.bfloat16 and up.dtype == torch.bfloat16
-    M, N = gate.shape
+    # The kernel is 2-D only — flatten leading dims (e.g. [B, T, N]
+    # from a 3-D SwiGLU input) and reshape outputs back to the
+    # original shape. Numerics are bit-exact (each row is processed
+    # independently).
+    orig_shape = gate.shape
+    N = orig_shape[-1]
+    M = gate.numel() // N
+    gate_2d = gate.reshape(M, N)
+    up_2d = up.reshape(M, N)
     a_fp8 = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=gate.device)
     hidden_bf16 = torch.empty(M, N, dtype=torch.bfloat16, device=gate.device)
     a_s = torch.empty(M, 1, dtype=torch.float32, device=gate.device)
     grid = (M,)
     _silu_quant_kernel[grid](
-        gate, up, a_fp8, hidden_bf16, a_s,
+        gate_2d, up_2d, a_fp8, hidden_bf16, a_s,
         M, N,
-        gate.stride(0), gate.stride(1),
-        up.stride(0), up.stride(1),
+        gate_2d.stride(0), gate_2d.stride(1),
+        up_2d.stride(0), up_2d.stride(1),
         a_fp8.stride(0), a_fp8.stride(1),
         hidden_bf16.stride(0), hidden_bf16.stride(1),
         a_s.stride(0),
@@ -1377,7 +1391,45 @@ def silu_quant_fused(
         BLOCK_N=256,
         num_warps=4,
     )
-    return a_fp8, a_s, hidden_bf16
+    return a_fp8.reshape(*orig_shape), a_s, hidden_bf16.reshape(*orig_shape)
+
+
+class _SiluQuantFusedSTE(torch.autograd.Function):
+    """Autograd wrapper around :func:`silu_quant_fused`.
+
+    Forward: returns ``(a_fp8, a_s, hidden_bf16)`` like the function.
+    Only ``hidden_bf16`` participates in the autograd graph (the FP8
+    output is STE — discarded in backward). The grad on ``hidden_bf16``
+    is routed to both ``gate`` and ``up`` (the silu-mul Jacobian is
+    omitted — same STE convention as :class:`SiluMulFp8STE`; the
+    silu' correction is well below the FP8 noise floor, see
+    ``src/models/ops/silu_mul_fp8.py``).
+    """
+
+    @staticmethod
+    def forward(ctx, gate, up):
+        a_fp8, a_s, hidden_bf16 = silu_quant_fused(gate, up)
+        ctx.save_for_backward(gate, up)
+        return a_fp8, a_s, hidden_bf16
+
+    @staticmethod
+    def backward(ctx, grad_a_fp8, grad_a_s, grad_hidden):
+        # STE: grad_hidden flows to both gate and up. grad_a_fp8 /
+        # grad_a_s are not connected (the FP8 quant round is STE).
+        return grad_hidden, grad_hidden
+
+
+def silu_quant_fused_with_passthrough(
+    gate: torch.Tensor, up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autograd-aware wrapper around :func:`silu_quant_fused`.
+
+    Use this from module-level forward paths that need gradient flow
+    to ``gate`` and ``up`` (e.g. :class:`NVFP4W4A8SwiGLU`). The
+    returned ``hidden_bf16`` is the autograd-tracked tensor;
+    ``a_fp8`` / ``a_s`` are auxiliary (no gradient).
+    """
+    return _SiluQuantFusedSTE.apply(gate, up)
 
 
 class NVFP4W4A8SwiGLU(nn.Module):
@@ -1435,8 +1487,12 @@ class NVFP4W4A8SwiGLU(nn.Module):
             hidden = F.silu(gate) * up
             return self.down_proj(hidden)
         # Shared act_quant: gate and up both consume ``x``, so quantize
-        # once and route the fp8 buffers into both.
-        a_fp8, a_s = quantize_act_fp8_fused(x.reshape(-1, x.shape[-1]))
+        # once and route the fp8 buffers into both. The matmul kernel
+        # requires 2D, but callers may pass 3D ``[B, T, H]`` (e.g.
+        # :class:`HippoLayer`); flatten the leading dims and reshape
+        # the final output back to the original shape.
+        x_2d = x.reshape(-1, x.shape[-1])
+        a_fp8, a_s = quantize_act_fp8_fused(x_2d)
         gate = self.gate_proj.forward_precomputed(x, a_fp8, a_s)
         up = self.up_proj.forward_precomputed(x, a_fp8, a_s)
         # Fused silu(gate) * up + down_proj act_quant in one Triton kernel:
@@ -1444,7 +1500,34 @@ class NVFP4W4A8SwiGLU(nn.Module):
         # through HBM twice (once for silu_mul, once for act_quant). Returns
         # the fp8 hidden + per-row scale for the down GEMM, plus the bf16
         # hidden for the down_proj STE backward (see :func:`silu_quant_fused`).
-        h_fp8, h_s, hidden = silu_quant_fused(gate, up)
+        h_fp8, h_s, hidden = silu_quant_fused_with_passthrough(gate, up)
+        return self.down_proj.forward_precomputed(hidden, h_fp8, h_s)
+
+    def forward_precomputed(
+        self,
+        x: torch.Tensor,
+        a_fp8: torch.Tensor,
+        a_s: torch.Tensor,
+    ) -> torch.Tensor:
+        """Like ``forward(x)`` but the FP8 + scale for the shared act_quant
+        is supplied by the caller (typically the upstream
+        :func:`src.models.ops.rmsnorm_fp8.rmsnorm_fp8_with_passthrough`
+        output). Skips the redundant :func:`quantize_act_fp8_fused`
+        call inside :meth:`forward` — saves ~105 us / FFN at prod shape.
+
+        ``x`` (BF16) is still passed in for the silu_quant_fused
+        backward path's saved tensor (the bf16 hidden is required by
+        the silu STE bwd); the GEMM path uses only ``a_fp8`` / ``a_s``.
+        """
+        if self.gate_proj.bf16_only:
+            # bf16_only path: caller-supplied fp8 ignored, gate/up are BF16 GEMMs.
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            hidden = F.silu(gate) * up
+            return self.down_proj(hidden)
+        gate = self.gate_proj.forward_precomputed(x, a_fp8, a_s)
+        up = self.up_proj.forward_precomputed(x, a_fp8, a_s)
+        h_fp8, h_s, hidden = silu_quant_fused_with_passthrough(gate, up)
         return self.down_proj.forward_precomputed(hidden, h_fp8, h_s)
 
     def extra_repr(self) -> str:

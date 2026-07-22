@@ -15,9 +15,13 @@ Precision is scheme-driven via ``config.ffn_precision``
                    per-channel weight FP8 E4M3; FP8 forward AND
                    backward via ``_scaled_mm``).
   * ``"w4a8"``   — NVFP4 mode-3 two-pass:
-                   ``NVFP4LinearW4A8`` (NVFP4 packed weights +
+                   ``NVFP4W4A8SwiGLU`` (NVFP4 packed weights +
                    FP8 E4M3 activations via Triton dequant +
-                   ``_scaled_mm``).
+                   ``_scaled_mm``). The wrapper shares a single
+                   ``act_quant`` across gate+up and exposes
+                   ``forward_precomputed(x, a_fp8, a_s)`` so
+                   an upstream :func:`rmsnorm_fp8_with_passthrough`
+                   can skip the redundant per-FFN quant.
   * ``"w4a16"``  — NVFP4 mode-3 Marlin: ``NVFP4Linear(
                    use_marlin=True, no_bf16_master=True)``
                    (NVFP4 packed weights + BF16 MMA via Marlin;
@@ -30,13 +34,25 @@ config knob. MXFP4 is not supported for any scheme.
 The legacy boolean flags ``ffn_nvfp4`` / ``ffn_nvfp4_marlin`` /
 ``ffn_nvfp4_no_bf16_master`` were removed on 2026-07-21; the
 scheme is the single source of truth.
+
+Producer-side passthrough (2026-07-22)
+--------------------------------------
+When ``ffn_precision="w4a8"`` and ``config.fp8_rmsnorm`` is on,
+:class:`HippoLayer` calls :meth:`SwiGLU.forward_precomputed` with
+the ``(bf16_x, a_fp8, a_s)`` tuple returned by
+:func:`rmsnorm_fp8_with_passthrough`. The wrapper routes the
+fp8 buffers directly into gate+up's
+:meth:`NVFP4LinearW4A8.forward_precomputed`, skipping the
+internal ``quantize_act_fp8_fused(x)`` — saves ~105 us / FFN at
+prod shape (the single-pass fused act_quant cost).
 """
 import warnings
 
+import torch
 import torch.nn as nn
 
 from src.models.ops.nvfp4_linear import NVFP4Linear
-from src.models.ops.nvfp4_linear_w4a8 import NVFP4LinearW4A8
+from src.models.ops.nvfp4_linear_w4a8 import NVFP4LinearW4A8, NVFP4W4A8SwiGLU
 from src.models.ops.fp8_linear import FP8Linear
 
 
@@ -51,10 +67,30 @@ class SwiGLU(nn.Module):
     def __init__(self, config):
         super().__init__()
         scheme = getattr(config, "ffn_precision", "w16a16")
-        Cls, kwargs = self._resolve_class(scheme, config)
-        self.gate_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
-        self.up_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
-        self.down_proj = Cls(config.intermediate_size, config.hidden_size, **kwargs)
+        bias = bool(config.use_bias)
+        # Special case: w4a8 uses the NVFP4W4A8SwiGLU wrapper which
+        # shares a single act_quant across gate+up and exposes a
+        # forward_precomputed hook for the upstream RmsNormFp8STE
+        # passthrough. All other schemes build the three projections
+        # directly (no FFN-level fusion available).
+        if scheme == "w4a8":
+            self.ffn_inner: nn.Module = NVFP4W4A8SwiGLU(
+                config.hidden_size, config.intermediate_size, bias=bias,
+            )
+            # Expose the inner's three projections as direct attributes
+            # so external access (state_dict, tests, debug) keeps the
+            # ``ffn.gate_proj.weight`` path working.
+            self.gate_proj = self.ffn_inner.gate_proj
+            self.up_proj = self.ffn_inner.up_proj
+            self.down_proj = self.ffn_inner.down_proj
+            self._uses_inner = True
+        else:
+            Cls, kwargs = self._resolve_class(scheme, config)
+            self.gate_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
+            self.up_proj = Cls(config.hidden_size, config.intermediate_size, **kwargs)
+            self.down_proj = Cls(config.intermediate_size, config.hidden_size, **kwargs)
+            self.ffn_inner = None
+            self._uses_inner = False
 
     @staticmethod
     def _resolve_class(scheme: str, config) -> tuple[type, dict]:
@@ -85,12 +121,6 @@ class SwiGLU(nn.Module):
             # w8a8 contract (FP8 E4M3 backward via two
             # ``_scaled_mm`` calls).
             return FP8Linear, {"bias": bias, "fp8_bwd": True}
-        if scheme == "w4a8":
-            # NVFP4 storage + FP8 GEMM (two-pass Triton dequant +
-            # ``_scaled_mm``). BF16 master weight is the leaf;
-            # backward is BF16 STE (spec says FP8 bwd + FP8 grads;
-            # current implementation is BF16 — tracked as TODO).
-            return NVFP4LinearW4A8, {"bias": bias}
         if scheme == "w4a16":
             # NVFP4 storage + BF16 GEMM (Marlin mode-3). Marlin
             # kernel + no-BF16-master are hardcoded — the kernel
@@ -106,6 +136,32 @@ class SwiGLU(nn.Module):
         )
 
     def forward(self, x):
+        if self._uses_inner:
+            return self.ffn_inner(x)
         gate = nn.functional.silu(self.gate_proj(x))
         up = self.up_proj(x)
         return self.down_proj(gate * up)
+
+    def forward_precomputed(
+        self,
+        x: torch.Tensor,
+        a_fp8: torch.Tensor,
+        a_s: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward with caller-supplied FP8+scale for the shared act_quant.
+
+        Only available when ``ffn_precision="w4a8"`` (the
+        :class:`NVFP4W4A8SwiGLU` wrapper). ``x`` is the BF16 input
+        (kept for the silu_quant_fused backward's saved tensor);
+        ``a_fp8`` / ``a_s`` are the FP8 representation of ``x`` to
+        route into gate+up. Saves the ~105 us / FFN redundant
+        ``quantize_act_fp8_fused`` call that :meth:`forward` would
+        otherwise issue internally.
+        """
+        if not self._uses_inner:
+            raise RuntimeError(
+                "SwiGLU.forward_precomputed is only supported when "
+                "ffn_precision='w4a8' (uses NVFP4W4A8SwiGLU inner). "
+                f"Got scheme with ffn_inner={self.ffn_inner!r}."
+            )
+        return self.ffn_inner.forward_precomputed(x, a_fp8, a_s)

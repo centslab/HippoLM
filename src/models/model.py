@@ -88,6 +88,20 @@ class HippoLayer(nn.Module):
             return RmsNormFp8STE.apply(x, layer.weight, layer.eps)
         return layer(x)
 
+    def _norm_with_passthrough(
+        self, layer: RMSNorm, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused ``RMSNorm → FP8`` returning ``(y_bf16, out_fp8, scale)``.
+
+        Used for the ``mlp_norm`` when ``ffn_precision='w4a8'`` and
+        ``fp8_rmsnorm=True``: the returned fp8 + scale are routed
+        directly into :meth:`SwiGLU.forward_precomputed` to skip the
+        redundant per-FFN ``quantize_act_fp8_fused``. See
+        :func:`src.models.ops.rmsnorm_fp8.rmsnorm_fp8_with_passthrough`.
+        """
+        from .ops.rmsnorm_fp8 import rmsnorm_fp8_with_passthrough
+        return rmsnorm_fp8_with_passthrough(x, layer.weight, layer.eps)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -113,19 +127,39 @@ class HippoLayer(nn.Module):
         else:
             x = x + sub
 
-        x_norm = self._norm(self.mlp_norm, x)
-        if self._use_fp8_silu_mul:
+        # ---- FFN block ----
+        # Two passthrough opportunities when the FFN is W4A8 and
+        # fp8_rmsnorm is on:
+        #   1. mlp_norm returns (bf16, fp8, scale) so the FFN's
+        #      internal act_quant can be skipped.
+        #   2. silu_mul_fp8 returns (bf16, fp8, scale) so the
+        #      down_proj's internal act_quant can be skipped.
+        # The W4A8 SwiGLU wrapper handles the second one
+        # internally (silu_quant_fused already exposes fp8 hidden
+        # to the down_proj) — so we only need to wire the first.
+        if self._use_fp8_rmsnorm and self.ffn._uses_inner:
+            # Producer-side passthrough: mlp_norm → (bf16, fp8, scale)
+            # → SwiGLU.forward_precomputed. Skips the W4A8 wrapper's
+            # internal quantize_act_fp8_fused (saves ~105 us/FFN at
+            # prod shape, on top of the ~243 us/FFN already saved
+            # by SwiGLU's own shared-act_quant optimization).
+            x_norm_bf16, x_norm_fp8, x_norm_s = self._norm_with_passthrough(
+                self.mlp_norm, x,
+            )
+            sub = self.ffn.forward_precomputed(x_norm_bf16, x_norm_fp8, x_norm_s)
+        elif self._use_fp8_silu_mul:
             # Fused silu(gate)*up → FP8 inside the FFN. We bypass
             # SwiGLU.forward so its internals don't re-fuse (avoid
             # double-quant). The FP8 output dequantises back to BF16
             # for ``down_proj`` (W8A8) to consume via its own quant.
+            x_norm = self._norm(self.mlp_norm, x)
             gate = self.ffn.gate_proj(x_norm)
             up = self.ffn.up_proj(x_norm)
             from .ops.silu_mul_fp8 import SiluMulFp8STE
             inter = SiluMulFp8STE.apply(gate, up)
             sub = self.ffn.down_proj(inter)
         else:
-            sub = self.ffn(x_norm)
+            sub = self.ffn(self._norm(self.mlp_norm, x))
         if self._use_fp8_residual:
             from .ops.fp8_residual import Fp8ResidualSTE
             x = Fp8ResidualSTE.apply(x, sub)
