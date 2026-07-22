@@ -173,6 +173,26 @@ class HippoConfig:
     attention_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
     ffn_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
 
+    # Producer-side quant fusions (2026-07-22, full-FP8 productionization).
+    # Both default to False for backward compatibility; flipping on is
+    # the "full FP8" production recipe (see auto-memory
+    # ``project_fp8_full_e2e.md`` for the precondition that passed
+    # end-to-end at 300 steps with +0.27% loss delta).
+    #
+    # ``fp8_residual=True`` replaces the ``x + sub`` elementwise add
+    # with the fused FP8 quant-add-requant kernel in
+    # ``src/models/ops/fp8_residual.py``. Numerics: per-row amax carries
+    # the FP8 representation noise (≈3.76% sig_rel vs BF16 reference,
+    # same as a single GEMM round; the ``sqrt(N)`` compounding through
+    # L layers is the standard FP8 noise model).
+    #
+    # ``fp8_silu_mul=True`` replaces the FFN's silu(gate)*up (BF16)
+    # with the fused ``silu_mul_fp8`` Triton kernel in
+    # ``src/models/ops/silu_mul_fp8.py``. Numerics: same FP8 noise
+    # floor; saves 2 kernel launches per FFN sublayer.
+    fp8_residual: bool = False
+    fp8_silu_mul: bool = False
+
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
             f"num_layers ({self.num_layers}) must be divisible by num_blocks ({self.num_blocks})"

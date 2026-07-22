@@ -30,6 +30,22 @@ class HippoLayer(nn.Module):
     ``x = x + SubLayer(x)`` form. AttnRes lives at the model
     level and is invoked only at block boundaries (see
     :class:`HippoModel`).
+
+    Optional producer-side FP8 fusions (gated by
+    ``config.fp8_residual`` and ``config.fp8_silu_mul``):
+
+      - ``fp8_residual=True``  → ``x = Fp8ResidualSTE(x, sub)`` instead
+        of ``x + sub`` for both sublayer residuals. The fused kernel
+        (``src/models/ops/fp8_residual.py``) does quant-add-requant
+        in one Triton launch with STE backward. Numerics: per-row
+        FP8 representation noise (3.76% sig_rel vs BF16 reference at
+        a single boundary; compounds via ``sqrt(N)`` across layers as
+        is standard for FP8).
+      - ``fp8_silu_mul=True`` → FFN's middle op is
+        ``SiluMulFp8STE(gate, up)`` instead of ``silu(gate)*up`` (BF16).
+        The fused kernel (``src/models/ops/silu_mul_fp8.py``) does
+        silu+mul+quant in one launch; saves 2 kernel launches per
+        FFN sublayer.
     """
 
     def __init__(self, layer_idx: int, config):
@@ -44,12 +60,18 @@ class HippoLayer(nn.Module):
         self.kda = KDA(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
+        # Lazy imports: ops module is the only consumer, and the
+        # autograd Functions depend on the Triton kernels which
+        # JIT on first call (no eager cost).
+        self._use_fp8_residual: bool = bool(getattr(config, "fp8_residual", False))
+        self._use_fp8_silu_mul: bool = bool(getattr(config, "fp8_silu_mul", False))
+
     def forward(
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Standard residual transformer layer.
+        """Standard residual transformer layer (with optional FP8 fusions).
 
         Args:
             x: ``[B, T, hidden_size]`` input.
@@ -58,10 +80,34 @@ class HippoLayer(nn.Module):
 
         Returns:
             ``[B, T, hidden_size]`` output after KDA and FFN with
-            standard residual connections.
+            standard residual connections (BF16 or fused FP8, see
+            ``HippoConfig.fp8_residual`` / ``fp8_silu_mul``).
         """
-        x = x + self.kda(self.attn_norm(x), cu_seqlens=cu_seqlens)
-        x = x + self.ffn(self.mlp_norm(x))
+        sub = self.kda(self.attn_norm(x), cu_seqlens=cu_seqlens)
+        if self._use_fp8_residual:
+            from .ops.fp8_residual import Fp8ResidualSTE
+            x = Fp8ResidualSTE.apply(x, sub)
+        else:
+            x = x + sub
+
+        x_norm = self.mlp_norm(x)
+        if self._use_fp8_silu_mul:
+            # Fused silu(gate)*up → FP8 inside the FFN. We bypass
+            # SwiGLU.forward so its internals don't re-fuse (avoid
+            # double-quant). The FP8 output dequantises back to BF16
+            # for ``down_proj`` (W8A8) to consume via its own quant.
+            gate = self.ffn.gate_proj(x_norm)
+            up = self.ffn.up_proj(x_norm)
+            from .ops.silu_mul_fp8 import SiluMulFp8STE
+            inter = SiluMulFp8STE.apply(gate, up)
+            sub = self.ffn.down_proj(inter)
+        else:
+            sub = self.ffn(x_norm)
+        if self._use_fp8_residual:
+            from .ops.fp8_residual import Fp8ResidualSTE
+            x = Fp8ResidualSTE.apply(x, sub)
+        else:
+            x = x + sub
         return x
 
 
