@@ -271,9 +271,9 @@ def _scale_accum(s: _ParamState, coef: float) -> None:
 
     Resolves the right accumulator for the param:
       - AdamW: ``s.grad`` (BF16, the per-step accumulator).
-      - Muon:  ``s.grad`` (BF16 / FP16 / FP32, the per-step
-        accumulator; storage dtype is
-        ``precision.muon_momentum``).
+      - Muon:  ``s.grad`` (BF16, the per-step accumulator;
+        was originally ``precision.muon_momentum`` —
+        yml-side ``precision:`` block removed 2026-07-23).
 
     No-op when ``coef == 1.0`` (cheap guard so the grad-norm
     clip stays a no-op for well-behaved steps).

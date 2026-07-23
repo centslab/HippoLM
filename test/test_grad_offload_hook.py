@@ -43,7 +43,6 @@ from src.training.param_offload import (
     register_grad_offload_hooks,
     zero_cpu_grad_accum,
 )
-from src.training.precision_config import PrecisionConfig
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA needed")
@@ -56,18 +55,10 @@ def test_grad_offload_hook_uses_real_grad_not_param():
     model = nn.Sequential(nn.Linear(8, 16, bias=False)).to(device).to(torch.bfloat16)
     linear = model[0]
 
-    precision = PrecisionConfig.from_dict({
-        "model_weights":  {"dtype": "bf16"},
-        "gradients":      {"dtype": "bf16"},
-        "activations":    {"dtype": "bf16"},
-        "muon_momentum":  {"dtype": "bf16"},
-        "adamw_m":        {"dtype": "bf16"},
-        "adamw_v":        {"dtype": "bf16"},
-    })
     from src.training.param_offload import CPUAdamW
     # 2D weight → would normally go to Muon, but force it to
     # AdamW by calling the constructor directly.
-    opt = CPUAdamW([linear.weight], lr=1e-3, precision=precision)
+    opt = CPUAdamW([linear.weight], lr=1e-3)
 
     # Install the production hook.
     register_grad_offload_hooks([opt])
@@ -122,3 +113,42 @@ def test_grad_offload_hook_uses_real_grad_not_param():
 
     # Cleanup
     zero_cpu_grad_accum([opt])
+
+
+# --------------------------------------------------------------------------- #
+# adamw_dtype plumbing (2026-07-23).                                          #
+# --------------------------------------------------------------------------- #
+def test_resolve_dtype_maps_names():
+    """``_resolve_dtype`` maps the yml/CLI dtype names to torch dtypes
+    and rejects anything else (the single point of resolution at the
+    ``build_param_groups`` boundary)."""
+    from src.training.param_offload.param_groups import _resolve_dtype
+
+    assert _resolve_dtype("bf16") is torch.bfloat16
+    assert _resolve_dtype("fp16") is torch.float16
+    assert _resolve_dtype("fp32") is torch.float32
+    # Case / whitespace tolerant.
+    assert _resolve_dtype(" BF16 ") is torch.bfloat16
+    with pytest.raises(ValueError):
+        _resolve_dtype("int8")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA needed (pinned buffers)")
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float16, torch.float32]
+)
+def test_cpu_adamw_respects_dtype_kwarg(dtype):
+    """CPUAdamW allocates its three pinned buffers (grad / exp_avg /
+    exp_avg_sq) at the requested dtype. The default (bf16) matches the
+    pre-2026-07-23 hardcoded behavior; fp16/fp32 are the sweep
+    headroom options wired via ``optimizer.adamw.dtype`` / --adamw_dtype."""
+    from src.training.param_offload import CPUAdamW
+
+    device = 0
+    torch.cuda.set_device(device)
+    w = nn.Linear(8, 16, bias=False).to(device).to(torch.bfloat16).weight
+    opt = CPUAdamW([w], lr=1e-3, dtype=dtype)
+    s = list(opt.state.values())[0]
+    assert s.grad.dtype == dtype
+    assert s.exp_avg.dtype == dtype
+    assert s.exp_avg_sq.dtype == dtype

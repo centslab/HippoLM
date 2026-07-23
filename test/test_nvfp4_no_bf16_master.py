@@ -513,18 +513,14 @@ class TestOptimizerIntegration:
         post-2026-07-15 explicit-accumulator layout splits the
         old "merged accumulator" (``mom_buf`` doing both jobs)
         into two separate buffers. Quantized storage
-        (int8 / mxfp8) was removed 2026-07-12."""
+        (int8 / mxfp8) was removed 2026-07-12; BF16 is the only
+        layout since the legacy ``precision:`` yml block was
+        removed 2026-07-23."""
         from src.models.ops.nvfp4_linear import NVFP4Linear
         from src.training.param_offload import CPUMuon
-        from src.training.precision_config import PrecisionConfig
         torch.manual_seed(0)
         linear = NVFP4Linear(64, 128, use_marlin=True, no_bf16_master=True).cuda()
-        prec = PrecisionConfig()
-        prec.muon_momentum = type("M", (), {
-            "dtype": type("D", (), {"value": "bf16",
-                                    "to_torch": staticmethod(lambda: torch.bfloat16)})()
-        })()
-        opt = CPUMuon([], lr=0.01, weight_decay=0.01, precision=prec)
+        opt = CPUMuon([], lr=0.01, weight_decay=0.01)
         opt.register_nvfp4_module(linear)
         assert len(opt.state) == 1
         state = list(opt.state.values())[0]
@@ -545,15 +541,9 @@ class TestOptimizerIntegration:
         from src.training.param_offload import (
             CPUMuon, accumulate_grads_to_cpu,
         )
-        from src.training.precision_config import PrecisionConfig
         torch.manual_seed(0)
         linear = NVFP4Linear(64, 128, use_marlin=True, no_bf16_master=True).cuda()
-        prec = PrecisionConfig()
-        prec.muon_momentum = type("M", (), {
-            "dtype": type("D", (), {"value": "bf16",
-                                    "to_torch": staticmethod(lambda: torch.bfloat16)})()
-        })()
-        opt = CPUMuon([], lr=0.01, weight_decay=0.01, precision=prec)
+        opt = CPUMuon([], lr=0.01, weight_decay=0.01)
         opt.register_nvfp4_module(linear)
 
         packed_before = linear.packed_weight.clone()

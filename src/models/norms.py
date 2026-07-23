@@ -10,8 +10,9 @@ mul`` composition:
    ``x.pow(2).mean(-1, keepdim=True)``; ``mean`` is in PyTorch's
    autocast "promote" list and silently upcasts the result to FP32,
    propagating FP32 through the rest of the chain. Under a BF16
-   autocast (the canonical :class:`PrecisionConfig` setting) this
-   means the residual stream becomes FP32 for the rest of the
+   autocast (the canonical setting since the legacy
+   ``:class:`PrecisionConfig``` yml block was removed 2026-07-23)
+   this means the residual stream becomes FP32 for the rest of the
    forward pass, doubling activation memory. The fla kernel keeps
    the normalized output in the input dtype and only allocates
    FP32 for the per-row ``rstd`` (shape ``[N]``, a few KB) and the

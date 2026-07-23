@@ -56,6 +56,15 @@ def _small_cfg(**overrides):
         head_dim=64,
         num_heads=2,
         intermediate_size=384,
+        # These tests exercise the block-boundary AttnRes structure /
+        # gradient flow in FP32 on tiny shapes; they are precision-
+        # agnostic. Force the BF16 producer path — the default config
+        # now uses FP8 RMSNorm, whose fused kernel requires BF16 input
+        # (asserts x.dtype == bfloat16) and would reject these FP32
+        # tensors. Precision-specific behavior is covered in
+        # test_scheme_precision.py / test_rmsnorm_fp8.py.
+        rmsnorm_precision="bf16",
+        residual_precision="bf16",
     )
     base.update(overrides)
     return HippoConfig(**base)
@@ -129,6 +138,9 @@ def test_hippo_layer_standard_residual_within_block():
     if not torch.cuda.is_available():
         print("[SKIP] test_hippo_layer_standard_residual_within_block (CUDA required)")
         return
+    # ``_small_cfg`` forces BF16 producers (the default config uses
+    # FP8 RMSNorm, whose STE dequant would not match the plain-RMSNorm
+    # reference below within atol=1e-5).
     config = _small_cfg()
     layer = HippoLayer(0, config).cuda()
     layer.eval()

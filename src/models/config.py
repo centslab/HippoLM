@@ -188,36 +188,48 @@ class HippoConfig:
     # full probe.
     lm_head_precision: Literal["w16a16", "w8a16", "w8a8", "w4a16", "w4a8"] = "w16a16"
 
-    # Producer-side quant fusions (2026-07-22, full-FP8 productionization).
-    # All three default to False for backward compatibility; the
-    # production recipe in ``configs/base.yml`` enables ``fp8_rmsnorm``
-    # and ``fp8_silu_mul`` (the two quant kernels that don't sit on the
-    # critical-path precision gradient) and leaves ``fp8_residual`` off
-    # (the residual stream's elementwise add amplifies quant noise
-    # through the L-layer sqrt(N) compounding; BF16 is the right call).
-    # See auto-memory ``project_fp8_full_e2e.md`` for the e2e probe.
+    # ---------------------------------------------------------------------
+    # Producer-side fused-op precision (2026-07-23).
+    # ---------------------------------------------------------------------
+    # These three knobs pick the precision for the fused element-wise
+    # ops that sit BETWEEN the GEMMs (the "producers" that feed the
+    # attention / FFN Linear layers and the residual adds). They are
+    # independent of the four scheme fields above (which govern the
+    # GEMMs themselves), because the fused kernels are not GEMMs —
+    # they are RMSNorm / residual-add / block-attn-res.
     #
-    # ``fp8_rmsnorm=True`` replaces ``RMSNorm(x)`` (BF16→BF16) +
-    # ``quantize_act_fp8_fused`` (BF16→FP8) with the fused Triton kernel
-    # in ``src/models/ops/rmsnorm_fp8.py``. STE on the FP8 round, proper
-    # RMSNorm bwd on the math (preserves ``dL/dweight``). Saves 1 kernel
-    # launch per RMSNorm (2 RMSNorms per layer → 2 launches saved).
+    #   * ``residual_precision`` — the inter-layer residual add
+    #     (``x = x + sub``). ``"bf16"`` (default) is a plain BF16
+    #     ``+``. ``"fp8"`` routes through ``Fp8ResidualSTE`` (fused
+    #     FP8 add + STE bwd). Prod default is ``"bf16"``: the FP8
+    #     residual path exists but the end-to-end A/B showed the
+    #     residual must stay BF16 to keep the layer-out drift under
+    #     budget (see ``project_fp8_mixed_e2e.md`` — full-FP8 residual
+    #     compounds to 11.7% sig_rel, BF16 residual drops it to 4.4%).
     #
-    # ``fp8_residual=True`` replaces the ``x + sub`` elementwise add
-    # with the fused FP8 quant-add-requant kernel in
-    # ``src/models/ops/fp8_residual.py``. Numerics: per-row amax carries
-    # the FP8 representation noise (≈3.76% sig_rel vs BF16 reference,
-    # same as a single GEMM round; the ``sqrt(N)`` compounding through
-    # L layers is the standard FP8 noise model). Disabled by default —
-    # precision-sensitive on the residual stream.
+    #   * ``rmsnorm_precision`` — the ``attn_norm`` / ``mlp_norm``
+    #     RMSNorm before each GEMM block. ``"bf16"`` is the plain
+    #     ``RMSNorm`` module. ``"fp8"`` (default) routes through
+    #     ``RmsNormFp8STE`` (fused RMSNorm + FP8 round + STE bwd);
+    #     verified 2.43x faster with 0.42% sub-1% BF16-precision
+    #     noise (see ``project_fp8_producer_fusions.md``).
     #
-    # ``fp8_silu_mul=True`` replaces the FFN's silu(gate)*up (BF16)
-    # with the fused ``silu_mul_fp8`` Triton kernel in
-    # ``src/models/ops/silu_mul_fp8.py``. Numerics: same FP8 noise
-    # floor; saves 2 kernel launches per FFN sublayer.
-    fp8_rmsnorm: bool = False
-    fp8_residual: bool = False
-    fp8_silu_mul: bool = False
+    #   * ``attn_res_precision`` — the block-level ``BlockAttnRes``
+    #     residual aggregation. Only ``"bf16"`` is wired: an FP8
+    #     BlockAttnRes kernel was never written (the online-softmax
+    #     bwd is already Triton-fused at BF16 and the op is not on
+    #     the FP8 critical path — not worth the kernel work). Anything
+    #     other than ``"bf16"`` raises at construction.
+    #
+    # The fused kernels live in
+    # ``src/models/ops/{rmsnorm_fp8,fp8_residual,silu_mul_fp8}.py``.
+    # They are wired into :class:`src.models.model.HippoLayer` and
+    # :class:`src.models.tp_model.layer.TPHippoLayer` gated on these
+    # fields. ``silu_mul`` FP8 is folded into the FFN scheme path
+    # (``ffn_precision``), so it has no separate knob here.
+    residual_precision: Literal["bf16", "fp8"] = "bf16"
+    rmsnorm_precision: Literal["bf16", "fp8"] = "fp8"
+    attn_res_precision: Literal["bf16"] = "bf16"
 
     def __post_init__(self):
         assert self.num_layers % self.num_blocks == 0, (
@@ -257,4 +269,40 @@ class HippoConfig:
             value = getattr(self, field_name)
             assert value in SCHEMES, (
                 f"{field_name} must be one of {SCHEMES!r}; got {value!r}"
+            )
+        # ---- Producer-side fused-op precision (2026-07-23) ----
+        assert self.residual_precision in ("bf16", "fp8"), (
+            f"residual_precision must be 'bf16' or 'fp8';"
+            f" got {self.residual_precision!r}"
+        )
+        assert self.rmsnorm_precision in ("bf16", "fp8"), (
+            f"rmsnorm_precision must be 'bf16' or 'fp8';"
+            f" got {self.rmsnorm_precision!r}"
+        )
+        # attn_res has no FP8 kernel; only bf16 is valid.
+        assert self.attn_res_precision == "bf16", (
+            f"attn_res_precision only supports 'bf16' (no FP8"
+            f" BlockAttnRes kernel exists); got"
+            f" {self.attn_res_precision!r}"
+        )
+        # ---- Tied-embeddings precision consistency (2026-07-23) ----
+        # When tie_word_embeddings=True, ``lm_head.weight`` aliases
+        # ``embed_tokens.weight`` (see ``HippoModel.__init__`` line
+        # ``self.lm_head.weight = self.embed_tokens.weight``). The
+        # two roles cannot pick different precision schemes — one
+        # side would have to quantize the shared tensor differently.
+        # Reject this at config-parse time so the failure is loud,
+        # not a silent "fp8 path on one side / bf16 on the other"
+        # at first forward. Prod base.yml satisfies this by having
+        # both at ``w16a16`` (the FP8 lm_head path was dead on TP
+        # anyway).
+        if self.tie_word_embeddings:
+            assert self.embedding_precision == self.lm_head_precision, (
+                f"tie_word_embeddings=True requires"
+                f" embedding_precision == lm_head_precision;"
+                f" got embedding_precision={self.embedding_precision!r},"
+                f" lm_head_precision={self.lm_head_precision!r}."
+                f" The two share one weight tensor at construction"
+                f" (lm_head.weight = embed_tokens.weight); they"
+                f" cannot be quantized under different schemes."
             )

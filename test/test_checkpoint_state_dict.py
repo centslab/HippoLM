@@ -193,22 +193,18 @@ def test_muon_state_dict_contains_hyperparams_and_per_param_state(tiny_model):
 
 
 def test_muon_state_dict_roundtrip_is_byte_equal(tiny_model):
-    """Full-precision momentum (the only supported storage since
-    2026-07-12 — int8 / mxfp8 quantization removed)."""
+    """BF16 momentum (the only supported storage since 2026-07-12
+    — int8 / mxfp8 quantization removed; the legacy
+    ``precision:`` yml block was also removed 2026-07-23)."""
     from src.training.param_offload import CPUMuon
-    from src.training.precision_config import PrecisionConfig
-    precision = PrecisionConfig.from_dict({
-        "muon_momentum": {"dtype": "bf16"},
-    })
     opt = CPUMuon(
         [p for p in tiny_model.parameters() if p.ndim >= 2],
         lr=1e-3,
-        precision=precision,
     )
     for s in opt.state.values():
         # Post-2026-07-15 explicit-accumulator layout: ``s.grad``
         # (per-step accumulator) and ``s.exp_avg`` (SGD
-        # momentum) share the configured storage dtype.
+        # momentum) share the BF16 storage dtype.
         assert s.grad.dtype == torch.bfloat16
         assert s.exp_avg.dtype == torch.bfloat16
 
@@ -218,7 +214,6 @@ def test_muon_state_dict_roundtrip_is_byte_equal(tiny_model):
     fresh = CPUMuon(
         [p for p in tiny_model.parameters() if p.ndim >= 2],
         lr=1e-3,
-        precision=precision,
     )
     fresh.load_state_dict(sd)
     for s_new, s_old in zip(fresh.state.values(), opt.state.values()):

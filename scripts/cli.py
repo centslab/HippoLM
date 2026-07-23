@@ -18,11 +18,11 @@ Overlay precedence (PR-9 follow-up):
     precision / batch / lr / etc.).
   - **CLI flags win** when explicitly passed: any value the
     user supplies on the command line overrides the yml.
-  - Nested dicts (e.g. ``precision: { model_weights: {...} }``)
-    flow through as a single attribute (``args.precision`` is
-    the whole dict); the training loop constructs the typed
-    :class:`PrecisionConfig` from it via
-    :meth:`PrecisionConfig.from_dict`.
+
+Precision is the per-module ``*_precision`` schemes on
+:class:`HippoConfig`. The legacy ``precision:`` yml block
+(``model_weights`` / ``activations`` / ``muon_momentum`` /
+``adamw_m`` / ``adamw_v``) was removed 2026-07-23.
 """
 from __future__ import annotations
 
@@ -255,6 +255,85 @@ def build_parser() -> argparse.ArgumentParser:
              "(~1 GB at 30 layers). Default False.",
     )
 
+    # ---- Precision schemes (per-module, 5-scheme spec) ----
+    # Yml key + CLI flag both work (yml wins by default; CLI
+    # overrides). Exposed as flags so a developer can debug a
+    # specific module's kernel without editing base.yml.
+    p.add_argument(
+        "--embedding_precision", type=str, default="w16a16",
+        choices=("w16a16", "w8a16", "w8a8", "w4a16", "w4a8"),
+        help="Storage + GEMM scheme for the embedding lookup. "
+             "Today only ``w16a16`` (BF16) and ``w8a8`` (FP8 "
+             "storage, gather-only — no compute win because "
+             "embedding is a gather op) are wired. When "
+             "``tie_word_embeddings=True`` (the base.yml "
+             "default), this MUST equal ``--lm_head_precision`` "
+             "(enforced by HippoConfig).",
+    )
+    p.add_argument(
+        "--attention_precision", type=str, default="w16a16",
+        choices=("w16a16", "w8a16", "w8a8", "w4a16", "w4a8"),
+        help="Storage + GEMM scheme for the KDA q/k/v/o + g_proj "
+             "linear blocks. ``w8a8`` = FP8 _scaled_mm fwd+bwd; "
+             "the other w8/w4 schemes currently fall back to "
+             "BF16 TP on the production path (option-A TODO).",
+    )
+    p.add_argument(
+        "--ffn_precision", type=str, default="w16a16",
+        choices=("w16a16", "w8a16", "w8a8", "w4a16", "w4a8"),
+        help="Storage + GEMM scheme for the SwiGLU FFN. All "
+             "five are wired: ``w16a16`` = plain BF16, "
+             "``w8a8`` = FP8Linear(fp8_bwd=True), "
+             "``w4a16`` = NVFP4 Marlin mode-3 (canonical prod), "
+             "``w4a8`` = NVFP4W4A8 two-pass Triton + FP8 "
+             "_scaled_mm. ``w8a16`` falls back to ``w16a16`` "
+             "with a warning (no W8A16 FFN kernel on sm_120).",
+    )
+    p.add_argument(
+        "--lm_head_precision", type=str, default="w16a16",
+        choices=("w16a16", "w8a16", "w8a8", "w4a16", "w4a8"),
+        help="Storage + GEMM scheme for the lm_head. "
+             "``w8a8`` = FP8Linear(fp8_bwd=True); the other "
+             "w8/w4 schemes currently fall back to BF16 TP on "
+             "the production path. When ``tie_word_embeddings=True`` "
+             "(the base.yml default), this MUST equal "
+             "``--embedding_precision`` (enforced by HippoConfig).",
+    )
+
+    # ---- Producer-side fused-op precision (RMSNorm / residual / attn_res) ----
+    # These are element-wise fused ops between the GEMMs, not GEMMs
+    # themselves, so they use a separate bf16/fp8 knob (not the
+    # 5-scheme names). Yml key + CLI flag both work (yml wins;
+    # CLI overrides). See HippoConfig for the wiring.
+    p.add_argument(
+        "--residual_precision", type=str, default="bf16",
+        choices=("bf16", "fp8"),
+        help="Precision for the inter-layer residual add "
+             "(``x = x + sub``). ``bf16`` (default) = plain BF16 "
+             "add; ``fp8`` = Fp8ResidualSTE (fused FP8 add + STE "
+             "bwd). Prod stays BF16 — the end-to-end A/B showed "
+             "the residual must be BF16 to keep layer-out drift "
+             "under budget (project_fp8_mixed_e2e.md).",
+    )
+    p.add_argument(
+        "--rmsnorm_precision", type=str, default="fp8",
+        choices=("bf16", "fp8"),
+        help="Precision for the attn_norm / mlp_norm RMSNorm "
+             "before each GEMM block. ``fp8`` (default) = "
+             "RmsNormFp8STE (fused RMSNorm + FP8 round + STE bwd, "
+             "2.43x faster, sub-1%% BF16 noise); ``bf16`` = plain "
+             "RMSNorm module.",
+    )
+    p.add_argument(
+        "--attn_res_precision", type=str, default="bf16",
+        choices=("bf16",),
+        help="Precision for the block-level BlockAttnRes residual "
+             "aggregation. Only ``bf16`` is wired (no FP8 "
+             "BlockAttnRes kernel exists — not worth writing; the "
+             "op is already Triton-fused at BF16 and off the FP8 "
+             "critical path).",
+    )
+
     # ---- GPU ----
     p.add_argument("--min_gpu_memory_mb", type=int, default=10240)
     p.add_argument("--muon_lr", type=float, default=0.02,
@@ -283,6 +362,13 @@ def build_parser() -> argparse.ArgumentParser:
                         " blocks reduce NS drift at the cost of more"
                         " scale storage. Only consulted when"
                         " --muon_exp_avg_storage=fp8_2d_tight.")
+    p.add_argument("--adamw_dtype", type=str, default="bf16",
+                   choices=("bf16", "fp16", "fp32"),
+                   help="Storage dtype for CPUAdamW's pinned buffers"
+                        " (``grad`` / ``exp_avg`` / ``exp_avg_sq``)."
+                        " Default 'bf16' (matches ``optimizer.adamw.dtype``"
+                        " in base.yml). FP16 / FP32 reserved for sweeps"
+                        " that need more headroom on the squared-grad v.")
     p.add_argument("--seed", type=int, default=42,
                    help="Init seed for replicated params on each device.")
 
@@ -300,31 +386,13 @@ def build_parser() -> argparse.ArgumentParser:
                         " is ~2-4 on a 16 GB GPU because replicated"
                         " weights are duplicated per process.")
 
-    # ---- Precision (yml-only for now; no --precision CLI flag) ----
-    # The yml schema is::
-    #
-    #     precision:
-    #       model_weights: { dtype: fp16 }
-    #       gradients:     { dtype: bf16 }
-    #       activations:   { dtype: fp16 }    # fp32/fp16/bf16 only
-    #       muon_momentum: { dtype: int8, scale: per-channel }
-    #       adamw_m:       { dtype: bf16 }
-    #       adamw_v:       { dtype: bf16 }
-    #
-    # ``activations`` controls ``torch.amp.autocast``: fp16 / bf16
-    # enable autocast with that dtype (tensor-core matmul); fp32
-    # disables autocast and runs a pure FP32 forward. Integer
-    # dtypes are rejected by :class:`PrecisionConfig`.
-    #
-    # argparse has no native nested-dict type, so the precision
-    # config flows through as a raw ``dict`` (set via
-    # ``set_defaults`` from the yml payload). The training loop
-    # converts it to :class:`PrecisionConfig` via
-    # :meth:`PrecisionConfig.from_dict`.
-    p.add_argument(
-        "--precision", type=str, default=None,
-        help=argparse.SUPPRESS,  # yml-only; suppress from --help
-    )
+    # Precision is the per-module ``*_precision`` schemes
+    # (``embedding_precision`` / ``attention_precision`` /
+    # ``ffn_precision`` / ``lm_head_precision``) on
+    # :class:`HippoConfig`. The legacy ``precision:`` yml block
+    # (model_weights / activations / muon_momentum / adamw_*) was
+    # removed 2026-07-23 — every entry was a default; the only
+    # real path was BF16 throughout.
 
     return p
 
@@ -349,15 +417,17 @@ def _flatten_optimizer_overrides(yml_dict: Dict[str, Any]) -> None:
     The canonical yml shape (see ``configs/base.yml``) is::
 
         optimizer:
-          adamw: { lr: 0.01, weight_decay: 0.01 }
-          muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95 }
+          adamw: { lr: 0.01, weight_decay: 0.01, beta1: 0.9,
+                   beta2: 0.95, eps: 1e-8, dtype: bf16 }
+          muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95,
+                   exp_avg_storage: fp8_2d_tight, block_size: 32 }
 
     argparse has no native nested-dict type, so the CLI surface
     stays flat (``--learning_rate``, ``--weight_decay``,
-    ``--muon_lr``, ``--muon_weight_decay``, ``--muon_momentum``).
-    This helper unpacks the yml nested block into the same flat
-    keys so the loop.py / param_offload.py reading code is
-    untouched.
+    ``--muon_lr``, ``--muon_weight_decay``, ``--muon_momentum``,
+    ``--adamw_dtype``). This helper unpacks the yml nested block
+    into the same flat keys so the loop.py / param_offload.py
+    reading code is untouched.
 
     Precedence: when a yml mixes the nested block with legacy
     flat keys (``learning_rate: 0.007`` AND ``optimizer.adamw.lr:
@@ -379,6 +449,7 @@ def _flatten_optimizer_overrides(yml_dict: Dict[str, Any]) -> None:
         ("adamw", "beta1",         "adamw_beta1"),
         ("adamw", "beta2",         "adamw_beta2"),
         ("adamw", "eps",           "adamw_eps"),
+        ("adamw", "dtype",         "adamw_dtype"),
         ("muon",  "lr",            "muon_lr"),
         ("muon",  "weight_decay",  "muon_weight_decay"),
         ("muon",  "momentum",      "muon_momentum"),
@@ -412,8 +483,8 @@ def _load_yaml_with_extends(
     design — predictable, easy to reason about, and matches what
     most users expect from a yml overlay. If a child needs to
     override one sub-key of a nested dict (e.g. just
-    ``precision.adamw_m.dtype``), it must repeat the whole
-    nested block.
+    ``optimizer.adamw.beta1``), it must repeat the whole nested
+    block.
 
     The visited set guards against circular chains
     (``a -> b -> a``) by absolute path.
@@ -460,16 +531,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
          become the parser defaults, then re-parse. Any explicit
          CLI flag overrides the yml-set default.
 
-    Nested dicts (``precision: { ... }``) flow through as
+    Nested dicts (e.g. ``optimizer: { ... }``) flow through as
     whole-dict attributes — ``set_defaults`` accepts any value,
-    including a nested dict. The training loop picks up
-    ``args.precision`` and converts to :class:`PrecisionConfig`.
+    including a nested dict. ``_flatten_optimizer_overrides``
+    then unpacks the canonical ``optimizer:`` block into the
+    flat argparse-default keys the training loop reads.
 
     The yml is read but no key validation is done against the
     parser schema. Unknown keys are simply added as
-    ``Namespace`` attributes, which is intentional: the precision
-    block and any future yml-only field don't need a matching
-    ``add_argument`` call.
+    ``Namespace`` attributes, which is intentional: future
+    yml-only fields don't need a matching ``add_argument`` call.
     """
     parser = build_parser()
     known, _ = parser.parse_known_args(argv)

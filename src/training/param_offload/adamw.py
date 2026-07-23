@@ -15,29 +15,32 @@ accumulator, etc.).
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 
-from ..precision_config import PrecisionConfig
 from ._state import _ParamState, _accumulator_target
 from .cpu_fused import fused_adam_step_bf16
 from .offload import _make_nvfp4_offload_cb
 
 
 class CPUAdamW:
-    """AdamW with CPU-side ``grad`` (BF16, per-step accumulator),
-    ``exp_avg`` (BF16, β1 EMA — preserved across steps) and
-    ``exp_avg_sq`` (BF16, β2 EMA — preserved across steps).
+    """AdamW with CPU-side ``grad`` (per-step accumulator),
+    ``exp_avg`` (β1 EMA — preserved across steps) and
+    ``exp_avg_sq`` (β2 EMA — preserved across steps). The three
+    CPU-pinned buffers share the storage dtype set by
+    ``__init__(dtype=...)`` (default BF16; the
+    ``optimizer.adamw.dtype`` yml key + ``--adamw_dtype`` CLI
+    flag select ``bf16`` / ``fp16`` / ``fp32``).
     Params live on the GPU; grads are streamed to CPU by the
     post-accumulate-grad hook (see :func:`register_grad_offload_hooks`)
     or by the manual :func:`accumulate_grads_to_cpu` path.
 
     Memory layout per trainable param:
-        CPU pinned: grad (BF16, numel),
-                    exp_avg (BF16, numel),
-                    exp_avg_sq (BF16, numel)
+        CPU pinned: grad (dtype, numel),
+                    exp_avg (dtype, numel),
+                    exp_avg_sq (dtype, numel)
         GPU:         param (training dtype, e.g. FP16), .grad (transient)
 
     The three CPU buffers have distinct, explicitly-named roles
@@ -65,15 +68,15 @@ class CPUAdamW:
     On :meth:`step`:
         1. ``s.grad`` holds the per-cycle grad sum (raw, no
            EMA across the cycle).
-        2. Update ``s.exp_avg`` in place (BF16):
+        2. Update ``s.exp_avg`` in place at the storage dtype:
            ``exp_avg ← β1·exp_avg + (1-β1)·grad``.
-        3. Update ``s.exp_avg_sq`` in place (BF16):
+        3. Update ``s.exp_avg_sq`` in place at the storage dtype:
            ``v ← β2·v + (1-β2)·exp_avg²``.
         4. Compute the update factor
            ``exp_avg / (sqrt(v/bc2) + eps)`` in FP32 (to
            recover the mantissa precision lost to the BF16 v
-           sqrt), then cast to FP16 (chunked, streamed to the
-           GPU).
+           sqrt in the production layout), then cast to FP16
+           (chunked, streamed to the GPU).
         5. Apply ``p -= lr * factor`` in place on the GPU.
         6. Zero ``s.grad`` for the next accumulation cycle
            (``s.exp_avg`` / ``s.exp_avg_sq`` are preserved).
@@ -92,39 +95,39 @@ class CPUAdamW:
         betas: Tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
-        precision: Optional[PrecisionConfig] = None,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        """CPU-offloaded AdamW with configurable per-tensor precision.
+        """CPU-offloaded AdamW. Storage dtype for all three
+        CPU-pinned buffers (``grad``, ``exp_avg``, ``exp_avg_sq``)
+        is set by the ``dtype`` arg (default BF16 since the
+        legacy hardcoded path was promoted to a yml knob
+        2026-07-23 — the ``optimizer.adamw.dtype`` yml key +
+        ``--adamw_dtype`` CLI flag select among ``bf16`` /
+        ``fp16`` / ``fp32``).
 
-        ``precision`` controls the storage dtypes of:
+        The cast target in the offload hook is ``s.grad.dtype``.
+        The :meth:`step` algorithm is dtype-agnostic — it always
+        promotes to FP32 for the divisor / factor math — so any
+        dtype change only affects the on-device memory footprint,
+        not the numerics.
 
-        - ``s.grad``       (per-step accumulator)  ← ``precision.adamw_m``
-        - ``s.exp_avg``    (first moment EMA)      ← ``precision.adamw_m``
-        - ``s.exp_avg_sq`` (second moment EMA)     ← ``precision.adamw_v``
-
-        The grad accumulator dtype is implicit in ``adamw_m``
-        (it shares storage with ``exp_avg``; both are BF16 by
-        default). The cast target in the offload hook is
-        ``s.grad.dtype`` (typically BF16).
-
-        Defaults (when ``precision`` is ``None``) match the canonical
-        yml: BF16 for both. The :meth:`step` algorithm is
-        dtype-agnostic — it always promotes to FP32 for the
-        divisor / factor math — so any combination of these
-        dtypes produces the same numerical answer up to casting
-        error.
+        Memory layout per trainable param:
+            CPU pinned: grad (dtype, numel),
+                        exp_avg (dtype, numel),
+                        exp_avg_sq (dtype, numel)
         """
         self.lr = lr
         self.beta1, self.beta2 = betas
         self.eps = eps
         self.weight_decay = weight_decay
-        # If no precision passed, use the dataclass defaults (which
-        # already match the canonical yml).
-        precision = precision or PrecisionConfig()
-
-        # Resolve dtypes once (avoids per-param .to_torch() calls).
-        m_dtype = precision.adamw_m.dtype.to_torch()
-        v_dtype = precision.adamw_v.dtype.to_torch()
+        # Storage dtype shared across ``grad`` / ``exp_avg`` /
+        # ``exp_avg_sq``. BF16 is the only choice in production
+        # today (``adamw_v`` is squared-grad magnitude within
+        # BF16's 8-bit exponent range; FP32 is reserved for
+        # future use as a memory-vs-precision knob).
+        self._dtype = dtype
+        m_dtype = dtype
+        v_dtype = dtype
 
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
@@ -183,16 +186,20 @@ class CPUAdamW:
         key = id(module)
         if key in self.state:
             return
-        # Match the precision the canonical yml uses for CPUAdamW
-        # (BF16 for both m and v) — do NOT pick up a per-config
-        # quantization here; the user's note was specifically that
-        # "AdamW 的 v 只是吃动态范围，精度不是那么敏感" so we just
-        # use the safe BF16 default that legacy AdamW uses.
+        # NVFP4 mode-3 AdamW mirror: same dtype as the regular
+        # AdamW params (``self._dtype`` — BF16 in production).
+        # The user's note was specifically that "AdamW 的 v 只是
+        # 吃动态范围，精度不是那么敏感" — the squared-grad
+        # magnitude stays inside BF16's 8-bit exponent range at
+        # typical grad magnitudes, so BF16 is the safe default;
+        # the yml-side ``optimizer.adamw.dtype`` knob lets the
+        # operator bump to fp32 if a regime needs it.
+        d = self._dtype
         self.state[key] = _ParamState(
             param=None,
-            grad=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
-            exp_avg=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
-            exp_avg_sq=torch.zeros(n, dtype=torch.bfloat16, device="cpu").pin_memory(),
+            grad=torch.zeros(n, dtype=d, device="cpu").pin_memory(),
+            exp_avg=torch.zeros(n, dtype=d, device="cpu").pin_memory(),
+            exp_avg_sq=torch.zeros(n, dtype=d, device="cpu").pin_memory(),
             kind="adamw_nvfp4",
             shape=(rows, cols),
             nvfp4_module=module,

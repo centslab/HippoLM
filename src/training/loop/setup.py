@@ -53,7 +53,9 @@ from src.training.param_offload import (
     build_param_groups,
     register_grad_offload_hooks,
 )
-from src.training.precision_config import PrecisionConfig
+# PrecisionConfig removed 2026-07-23 (legacy precision: yml block
+# + PrecisionConfig dataclass had only defaults; replaced by
+# hardcoded BF16 in the loop).
 from src.training.tokenizer import load_tokenizer
 
 log = logging.getLogger(__name__)
@@ -168,19 +170,17 @@ def _setup_worker(
         # ``ffn_nvfp4_no_bf16_master``, ``kda_fp8``, ``kda_mxfp8``)
         # were removed from the dataclass on 2026-07-21; the
         # scheme is the single source of truth.
-        embedding_precision=getattr(args, "embedding_precision", "w16a16"),
-        attention_precision=getattr(args, "attention_precision", "w16a16"),
-        ffn_precision=getattr(args, "ffn_precision", "w16a16"),
-        # Producer-side FP8 fusions (2026-07-22, full-FP8
-        # productionization). All default to False; ``base.yml``
-        # enables ``fp8_rmsnorm`` + ``fp8_silu_mul`` and leaves
-        # ``fp8_residual`` off (precision-sensitive). End-to-end
-        # fwd+bwd STE-bwd probe at 300 steps showed +0.27% loss
-        # delta when all three were on; the FP8-only residual
-        # amplifies that further, so production keeps it BF16.
-        fp8_rmsnorm=getattr(args, "fp8_rmsnorm", False),
-        fp8_residual=getattr(args, "fp8_residual", False),
-        fp8_silu_mul=getattr(args, "fp8_silu_mul", False),
+        embedding_precision=args.embedding_precision,
+        attention_precision=args.attention_precision,
+        ffn_precision=args.ffn_precision,
+        lm_head_precision=args.lm_head_precision,
+        # Producer-side fused-op precision (2026-07-23). RMSNorm and
+        # residual pick bf16/fp8 independently of the GEMM schemes
+        # above; attn_res is bf16-only (no FP8 BlockAttnRes kernel).
+        # Wired into HippoLayer / TPHippoLayer.
+        residual_precision=args.residual_precision,
+        rmsnorm_precision=args.rmsnorm_precision,
+        attn_res_precision=args.attn_res_precision,
     )
     if rank == 0:
         logger.info(f"Model config: {config}")
@@ -325,17 +325,15 @@ def _setup_worker(
     # ---- TP model ----
     init_tp(world_size=len(gpus), devices=gpus, backend=backend)
     torch.manual_seed(args.seed)
-    # Resolve the precision config: ``args.precision`` is a raw
-    # yml-shaped dict (set by the CLI overlay in
-    # ``scripts.cli.parse_args``); convert to a typed
-    # ``PrecisionConfig`` so the model_weights dtype flows into
-    # the model construction and the optimizer-state dtypes
-    # flow into ``build_param_groups`` below. ``None`` /
-    # missing means the canonical yml defaults.
-    precision = PrecisionConfig.from_dict(
-        getattr(args, "precision", None)
-    )
-    weight_dtype = precision.model_weights.dtype.to_torch()
+    # Model construction dtype is BF16 unconditionally. Per-module
+    # schemes (embedding/attention/ffn/lm_head_precision) pick the
+    # actual kernel — the dtype here only sets the master weight
+    # tensor (BF16) for modules not covered by a scheme (RMSNorm,
+    # AttnRes, embed). The legacy ``precision:`` yml block (with
+    # model_weights/activations/muon_momentum/adamw_*) was removed
+    # on 2026-07-23 because every entry was a default and the
+    # only real path was BF16.
+    weight_dtype = torch.bfloat16
     model = TPHippoModel(config, devices=gpus, dtype=weight_dtype)
     dist.barrier()
     model.sync_replicated_from(gpus[0])
@@ -377,12 +375,10 @@ def _setup_worker(
         )
 
     # ---- GradScaler (disabled) ----
-    # The forward runs at the activation dtype configured in
-    # ``precision.activations`` (fp16 by default, which matches
-    # the canonical FP16 weights). We disable the scaler
+    # The forward runs at BF16 throughout (TP path uses BF16 for
+    # all GEMMs and fusions). We disable the scaler
     # (PyTorch's GradScaler refuses to unscale FP16 grads in this
-    # version) and run plain backward in the configured dtype.
-    # See the long comment in scripts/train.py for the history.
+    # version) and run plain backward in BF16.
     scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     # ---- Optimizers (CPU offload) ----
@@ -394,11 +390,11 @@ def _setup_worker(
         adamw_beta1=args.adamw_beta1,
         adamw_beta2=args.adamw_beta2,
         adamw_eps=args.adamw_eps,
+        adamw_dtype=args.adamw_dtype,
         muon_momentum=args.muon_momentum,
         muon_weight_decay=args.muon_weight_decay,
         muon_exp_avg_storage=args.muon_exp_avg_storage,
         muon_block_size=args.muon_block_size,
-        precision=precision,
     )
     # Install the per-param post-accumulate-grad hooks so each
     # param's grad is DMA'd to its CPU accumulator as soon as
@@ -471,16 +467,17 @@ def _setup_worker(
     #                     ``s.exp_avg_sq`` (β2 EMA, dtype = adamw_v).
     #   Muon per param:  ``s.grad`` (per-step accumulator),
     #                     ``s.exp_avg`` (SGD momentum).
-    #                     Both share ``precision.muon_momentum``
-    #                     dtype (bf16 / fp16 / fp32).
+    #                     Both stored as BF16 (the legacy
+    #                     ``precision.muon_momentum`` dtype was
+    #                     removed 2026-07-23 — always BF16 today).
     #
     # Quantized storage formats (int8 per-row BF16 scale, mxfp8
     # per-block E8M0 scale) were removed on 2026-07-12 after
     # long-training runs showed quantization-error accumulation
     # destabilizing optimization. See
     # ``docs/optimizer_layout.md`` for the post-removal layout.
-    adamw_m_dtype_t = precision.adamw_m.dtype.to_torch()
-    adamw_v_dtype_t = precision.adamw_v.dtype.to_torch()
+    adamw_m_dtype_t = torch.bfloat16
+    adamw_v_dtype_t = torch.bfloat16
     adamw_m_bytes = n_adamw * adamw_m_dtype_t.itemsize
     adamw_exp_avg_bytes = n_adamw * adamw_m_dtype_t.itemsize
     adamw_v_bytes = n_adamw * adamw_v_dtype_t.itemsize
@@ -520,7 +517,6 @@ def _setup_worker(
         "run_dir": run_dir,
         "logger": logger,
         "config": config,
-        "precision": precision,
         "dataloader": dataloader,
         "prefetcher": prefetcher,
         "model": model,

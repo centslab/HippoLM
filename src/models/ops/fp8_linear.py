@@ -115,11 +115,14 @@ re-instantiating the model. Same numerics as ``nn.Linear``.
 """
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # FP8 E4M3 hardware constants (sm_120 / Blackwell consumer tensor cores).
@@ -443,6 +446,20 @@ class FP8Linear(nn.Module):
             self.register_parameter("bias", None)
 
         self._init_weights()
+
+        # 2026-07-23: surfaced for debug — verify which FP8 path
+        # is actually wired for a given layer (and whether the
+        # ``bf16_only`` shape-div-16 silent fallback fired).
+        resolved = (
+            "BF16(bf16_only)" if self.bf16_only
+            else ("FP8-W8A8 (FP8 bwd)" if self.fp8_bwd else "FP8-W8A8 (BF16 STE bwd)")
+        )
+        logger.info(
+            f"FP8Linear: in={in_features} out={out_features}"
+            f" bias={bias} dtype={self.weight.dtype}"
+            f" device={self.weight.device}"
+            f" → {resolved}"
+        )
 
     def _init_weights(self) -> None:
         # Kaiming-uniform matches nn.Linear's default reset (kaiming_uniform_

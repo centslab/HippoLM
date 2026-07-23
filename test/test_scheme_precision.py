@@ -114,14 +114,21 @@ class TestHippoConfigScheme:
     @pytest.mark.parametrize("scheme", list(SCHEMES))
     def test_all_five_schemes_accepted(self, scheme):
         """Every scheme in SCHEMES is a valid value for every field."""
+        # ``tie_word_embeddings=False`` so each field can take an
+        # independent scheme — with tying on, HippoConfig requires
+        # embedding_precision == lm_head_precision (they share one
+        # weight tensor). This test only exercises value acceptance.
         cfg = HippoConfig(
+            tie_word_embeddings=False,
             embedding_precision=scheme,
             attention_precision=scheme,
             ffn_precision=scheme,
+            lm_head_precision=scheme,
         )
         assert cfg.embedding_precision == scheme
         assert cfg.attention_precision == scheme
         assert cfg.ffn_precision == scheme
+        assert cfg.lm_head_precision == scheme
 
     @pytest.mark.parametrize(
         "field,bad_value",
@@ -153,10 +160,139 @@ class TestHippoConfigScheme:
         with pytest.raises(TypeError):
             HippoConfig(ffn_nvfp4_no_bf16_master=True)
 
+    # ---- Tied-embeddings precision consistency (2026-07-23) ----
+    def test_tied_embeddings_require_matching_precision(self):
+        """With tie_word_embeddings=True (the default), embedding and
+        lm_head share one weight tensor, so their schemes must match —
+        a mismatch is rejected at config-parse time."""
+        with pytest.raises(AssertionError, match="embedding_precision == lm_head_precision"):
+            HippoConfig(
+                tie_word_embeddings=True,
+                embedding_precision="w8a8",
+                lm_head_precision="w16a16",
+            )
+
+    def test_tied_embeddings_matching_precision_ok(self):
+        """Both sides at the same scheme is accepted (the prod
+        base.yml case: embedding == lm_head == w8a8)."""
+        cfg = HippoConfig(
+            tie_word_embeddings=True,
+            embedding_precision="w8a8",
+            lm_head_precision="w8a8",
+        )
+        assert cfg.embedding_precision == "w8a8"
+        assert cfg.lm_head_precision == "w8a8"
+
+    def test_untied_embeddings_allow_mismatched_precision(self):
+        """With tying OFF, the two roles are independent tensors and
+        may pick different schemes."""
+        cfg = HippoConfig(
+            tie_word_embeddings=False,
+            embedding_precision="w16a16",
+            lm_head_precision="w8a8",
+        )
+        assert cfg.embedding_precision == "w16a16"
+        assert cfg.lm_head_precision == "w8a8"
+
 
 # ---------------------------------------------------------------------------
-# 2. KDA wrapper: attention_precision -> FP8Linear / nn.Linear / fallback
+# 1b. HippoConfig: producer-side fused-op precision (2026-07-23)
 # ---------------------------------------------------------------------------
+class TestProducerPrecisionConfig:
+    """residual_precision / rmsnorm_precision / attn_res_precision are
+    the bf16/fp8 knobs for the fused element-wise ops between the GEMMs
+    (residual add / RMSNorm / BlockAttnRes). Independent of the four
+    5-scheme GEMM fields above."""
+
+    def test_producer_precision_defaults(self):
+        """Prod defaults: residual bf16, rmsnorm fp8, attn_res bf16."""
+        cfg = HippoConfig()
+        assert cfg.residual_precision == "bf16"
+        assert cfg.rmsnorm_precision == "fp8"
+        assert cfg.attn_res_precision == "bf16"
+
+    @pytest.mark.parametrize("value", ["bf16", "fp8"])
+    def test_residual_precision_accepts_bf16_and_fp8(self, value):
+        cfg = HippoConfig(residual_precision=value)
+        assert cfg.residual_precision == value
+
+    @pytest.mark.parametrize("value", ["bf16", "fp8"])
+    def test_rmsnorm_precision_accepts_bf16_and_fp8(self, value):
+        cfg = HippoConfig(rmsnorm_precision=value)
+        assert cfg.rmsnorm_precision == value
+
+    def test_attn_res_precision_accepts_bf16(self):
+        cfg = HippoConfig(attn_res_precision="bf16")
+        assert cfg.attn_res_precision == "bf16"
+
+    @pytest.mark.parametrize(
+        "field,bad_value",
+        [
+            ("residual_precision", "w8a8"),   # GEMM scheme, not a producer knob
+            ("residual_precision", "fp16"),
+            ("rmsnorm_precision", "w16a16"),
+            ("rmsnorm_precision", "int8"),
+        ],
+    )
+    def test_invalid_producer_value_rejected(self, field, bad_value):
+        with pytest.raises(AssertionError):
+            HippoConfig(**{field: bad_value})
+
+    def test_attn_res_precision_fp8_rejected(self):
+        """No FP8 BlockAttnRes kernel exists — only bf16 is valid."""
+        with pytest.raises(AssertionError):
+            HippoConfig(attn_res_precision="fp8")
+
+
+# ---------------------------------------------------------------------------
+# 1c. HippoLayer / model wiring for the producer-side precision fields
+# ---------------------------------------------------------------------------
+class TestProducerPrecisionWiring:
+    """The layer resolves the config fields into boolean toggles once
+    at construction and gates the fused kernels on them."""
+
+    @staticmethod
+    def _cfg(**overrides):
+        base = dict(
+            hidden_size=128, num_heads=2, head_dim=64,
+            intermediate_size=256, num_layers=2, num_blocks=2,
+            vocab_size=256, safe_gate=True, lower_bound=-5.0,
+            use_short_conv=False,
+        )
+        base.update(overrides)
+        return HippoConfig(**base)
+
+    def test_layer_toggles_follow_config(self):
+        from src.models.model import HippoLayer
+        layer = HippoLayer(0, self._cfg(
+            rmsnorm_precision="fp8", residual_precision="fp8"))
+        assert layer._use_fp8_rmsnorm is True
+        assert layer._use_fp8_residual is True
+        assert layer.config is not None
+
+        layer_bf = HippoLayer(0, self._cfg(
+            rmsnorm_precision="bf16", residual_precision="bf16"))
+        assert layer_bf._use_fp8_rmsnorm is False
+        assert layer_bf._use_fp8_residual is False
+
+    def test_tp_layer_toggles_follow_config(self):
+        from src.models.tp_model.layer import TPHippoLayer
+        layer = TPHippoLayer(0, self._cfg(
+            rmsnorm_precision="fp8", residual_precision="bf16"))
+        assert layer._use_fp8_rmsnorm is True
+        assert layer._use_fp8_residual is False
+
+    def test_model_rejects_non_bf16_attn_res_at_build(self):
+        """Config validation fires first, but the model-level guard is
+        the backstop if a field is mutated post-construction."""
+        from src.models.model import HippoModel
+        cfg = self._cfg()
+        object.__setattr__(cfg, "attn_res_precision", "fp8")
+        with pytest.raises(ValueError, match="attn_res_precision"):
+            HippoModel(cfg)
+
+
+
 def _make_kda(cfg):
     return KDA(cfg, layer_idx=0).to(device=device, dtype=dtype)
 

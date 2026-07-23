@@ -15,13 +15,32 @@ construction.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
+import torch
 import torch.nn as nn
 
-from ..precision_config import PrecisionConfig
 from .adamw import CPUAdamW
 from .muon import CPUMuon
+
+
+def _resolve_dtype(name: str) -> torch.dtype:
+    """Resolve a yml/CLI dtype name (``"bf16"`` / ``"fp16"`` /
+    ``"fp32"``) to :class:`torch.dtype`. Production today only
+    ships BF16; the others are reserved for sweeps that need
+    more headroom on ``adamw_v`` (e.g. very-large-grad regimes
+    where BF16's 8-bit exponent is not enough)."""
+    n = name.lower().strip()
+    if n == "bf16":
+        return torch.bfloat16
+    if n == "fp16":
+        return torch.float16
+    if n == "fp32":
+        return torch.float32
+    raise ValueError(
+        f"Unsupported adamw dtype {name!r}; expected one of "
+        f"'bf16', 'fp16', 'fp32'."
+    )
 
 
 def build_param_groups(
@@ -33,11 +52,11 @@ def build_param_groups(
     adamw_beta1: float = 0.9,
     adamw_beta2: float = 0.95,
     adamw_eps: float = 1e-8,
+    adamw_dtype: str = "bf16",
     muon_momentum: float = 0.95,
     muon_weight_decay: float = 0.0,
     muon_exp_avg_storage: str = "bf16",
     muon_block_size: int = 32,
-    precision: Optional[PrecisionConfig] = None,
 ) -> Tuple[List, List]:
     """Build a (muon_optimizer, adamw_optimizer) pair for a single
     rank's model fragment.
@@ -70,11 +89,18 @@ def build_param_groups(
     ``sqrt(v/bc2) + eps`` (see :meth:`CPUAdamW.step`). Comes from
     ``optimizer.adamw.eps`` in the yml or ``--adamw_eps`` on the CLI.
 
-    ``precision`` (optional :class:`PrecisionConfig`) is forwarded
-    to both optimizers; the model weights themselves are
-    constructed at the dtype from ``precision.model_weights`` by
-    the caller (``scripts.train`` / ``src.training.loop``).
-    Defaults to the canonical yml precision when ``None``.
+    ``adamw_dtype`` (default ``"bf16"``) is the storage dtype for
+    AdamW's three CPU-pinned buffers (``grad`` / ``exp_avg`` /
+    ``exp_avg_sq``). Comes from ``optimizer.adamw.dtype`` in the
+    yml or ``--adamw_dtype`` on the CLI. Resolved to
+    :class:`torch.dtype` via :func:`_resolve_dtype` (choices:
+    ``bf16`` / ``fp16`` / ``fp32`` — production uses BF16, the
+    others are reserved for sweeps).
+
+    Muon storage is also always BF16 — its persistent layout is
+    controlled by the orthogonal ``muon_exp_avg_storage`` knob
+    (``bf16`` vs ``fp8_2d_tight``), which doesn't change the
+    underlying buffer dtype.
     """
     muon_params: list[nn.Parameter] = []
     adamw_params: list[nn.Parameter] = []
@@ -115,7 +141,6 @@ def build_param_groups(
         weight_decay=muon_weight_decay,   # resolved per-config (default 0.0; was hardcoded)
         exp_avg_storage=muon_exp_avg_storage,
         block_size=muon_block_size,
-        precision=precision,
     )
     adamw_opt = CPUAdamW(
         adamw_params,
@@ -123,7 +148,7 @@ def build_param_groups(
         betas=(adamw_beta1, adamw_beta2),
         eps=adamw_eps,
         weight_decay=weight_decay,
-        precision=precision,
+        dtype=_resolve_dtype(adamw_dtype),
     )
 
     # ------------------------------------------------------------------

@@ -215,8 +215,11 @@ class TestHippoModelLMHeadW8A8:
             use_bias=False,
             ffn_precision="w4a8",
             tie_word_embeddings=True,
-            fp8_rmsnorm=True,
-            fp8_silu_mul=True,
+            rmsnorm_precision="fp8",
+            # Tied embeddings require embedding_precision ==
+            # lm_head_precision (they share one weight tensor); mirror
+            # the production base.yml where both are w8a8.
+            embedding_precision=lm_head_precision,
             lm_head_precision=lm_head_precision,
         )
         cfg_kwargs.update(overrides)
@@ -317,14 +320,21 @@ class TestHippoModelLMHeadW8A8:
             use_bias=False,
             tie_word_embeddings=True,
             ffn_precision="w4a8",
-            fp8_rmsnorm=True,
-            fp8_silu_mul=True,
+            rmsnorm_precision="fp8",
         )
-        # Build two models sharing init (one BF16, one FP8).
+        # Build two models sharing init (one BF16, one FP8). Tied
+        # embeddings require embedding_precision == lm_head_precision,
+        # so each model sets both to the same scheme.
         torch.manual_seed(42)
-        cfg_bf = HippoConfig(**cfg_kwargs, lm_head_precision="w16a16")
+        cfg_bf = HippoConfig(
+            **cfg_kwargs, embedding_precision="w16a16",
+            lm_head_precision="w16a16",
+        )
         torch.manual_seed(42)
-        cfg_fp8 = HippoConfig(**cfg_kwargs, lm_head_precision="w8a8")
+        cfg_fp8 = HippoConfig(
+            **cfg_kwargs, embedding_precision="w8a8",
+            lm_head_precision="w8a8",
+        )
         m_bf = HippoModel(cfg_bf).cuda().to(torch.bfloat16)
         m_fp8 = HippoModel(cfg_fp8).cuda().to(torch.bfloat16)
         # Copy weights from BF16 to FP8 model so the comparison starts

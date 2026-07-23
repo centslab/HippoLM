@@ -47,6 +47,33 @@ class TPHippoLayer(nn.Module):
         self.kda = _to(TPKDA(config, layer_idx=layer_idx))
         self.ffn = TPSwiGLU(config, device=device, dtype=dtype)
 
+        # Producer-side precision toggles (mirror the non-TP
+        # :class:`src.models.model.HippoLayer`). The autograd
+        # Functions lazy-import their Triton kernels on first call,
+        # so there is no eager JIT cost here. TPSwiGLU has no
+        # ``forward_precomputed`` passthrough today, so only the
+        # basic ``_norm`` / ``_residual`` gating applies.
+        self._use_fp8_rmsnorm: bool = (
+            getattr(config, "rmsnorm_precision", "bf16") == "fp8"
+        )
+        self._use_fp8_residual: bool = (
+            getattr(config, "residual_precision", "bf16") == "fp8"
+        )
+
+    def _norm(self, layer: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+        """RMSNorm, optionally through the fused FP8 kernel (BF16 out)."""
+        if self._use_fp8_rmsnorm:
+            from src.models.ops.rmsnorm_fp8 import RmsNormFp8STE
+            return RmsNormFp8STE.apply(x, layer.weight, layer.eps)
+        return layer(x)
+
+    def _residual(self, x: torch.Tensor, sub: torch.Tensor) -> torch.Tensor:
+        """Residual add, optionally through the fused FP8 kernel."""
+        if self._use_fp8_residual:
+            from src.models.ops.fp8_residual import Fp8ResidualSTE
+            return Fp8ResidualSTE.apply(x, sub)
+        return x + sub
+
     def forward(
         self,
         x: torch.Tensor,
@@ -89,9 +116,9 @@ class TPHippoLayer(nn.Module):
         """
         del save_residual  # empirically a zero-savings no-op — see memory note
         kda_out, final_state = self.kda(
-            self.attn_norm(x), cu_seqlens=cu_seqlens,
+            self._norm(self.attn_norm, x), cu_seqlens=cu_seqlens,
             initial_state=initial_state,
         )
-        x = x + kda_out
-        x = x + self.ffn(self.mlp_norm(x))
+        x = self._residual(x, kda_out)
+        x = self._residual(x, self.ffn(self._norm(self.mlp_norm, x)))
         return x, final_state

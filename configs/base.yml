@@ -46,27 +46,21 @@ pack_buffer_size: 2048
 
 # Optimizer hparams
 optimizer:
-  adamw: { lr: 0.004, weight_decay: 0.01, beta1: 0.9, beta2: 0.95, eps: 1e-8 }
+  adamw: { lr: 0.002, weight_decay: 0.01, beta1: 0.9, beta2: 0.95,
+           eps: 1e-8, dtype: bf16 }
   # Muon SGD momentum EMA storage: fp8_2d_tight ships 2026-07-16
   # (see auto-memory project_2d_tight_scale.md). E4M3 + per-(row ×
   # col-block) + per-(col × row-block) FP32 scales; brings NS output
   # drift from 14-21% (per-tensor baseline) to 1.45% on B/D regimes
-  # at the prod shape. The BF16 buffer at storage is
-  # precision.muon_momentum.dtype (BF16 in this base config); only
-  # the persistent storage layout changes.
-  muon:  { lr: 0.02, weight_decay: 0.0, momentum: 0.95,
+  # at the prod shape. The BF16 fallback buffer at storage is BF16
+  # (always — the legacy ``precision.muon_momentum`` yml knob that
+  # let the config switch among bf16/fp16/fp32 was removed 2026-07-23);
+  # only the persistent storage layout changes. The corresponding
+  # CLI flag is ``--muon_exp_avg_storage``.
+  muon:  { lr: 0.01, weight_decay: 0.0, momentum: 0.95,
            exp_avg_storage: fp8_2d_tight, block_size: 32 }
 max_grad_norm: 1.0
 seed: 42
-
-# Precision
-precision:
-  model_weights: { dtype: bf16 }
-  gradients:     { dtype: bf16 }
-  activations:   { dtype: bf16 }
-  muon_momentum: { dtype: bf16 }
-  adamw_m:       { dtype: bf16 }
-  adamw_v:       { dtype: bf16 }
 
 # Stage: pretrain or sft
 stage: pretrain
@@ -151,39 +145,33 @@ kda_skip_aqk_akk_saved: false
 #            The FP8-feasibility-branch FFN scheme.
 #
 # This branch's canonical config (FP8 feasibility branch):
-embedding_precision: w16a16   # storage-only; no GEMM gain
+embedding_precision: w8a8      # FP8 storage; gather-only, no GEMM
+                               # gain on the path (the compute is a
+                               # lookup, not a matmul). Verified
+                               # 2026-07-23 stable. Tied with lm_head
+                               # below (HIPPOConfig enforces equality
+                               # when ``tie_word_embeddings=True``).
 attention_precision: w8a8      # FP8 GEMM in q/k/v/o + g_proj
 ffn_precision: w4a8            # NVFP4 two-pass W4A8
-lm_head_precision: w8a8        # FP8 lm_head (FP8Linear fp8_bwd=True)
+lm_head_precision: w8a8        # FP8 lm_head (FP8Linear fp8_bwd=True);
                                # ~9.5 ms/step savings at prod shape,
                                # 0.03% loss drift over 50 steps.
                                # BF16 master weight is the optimizer
-                               # leaf (tied-embeddings still works)
+                               # leaf (tied-embed still works).
 
-# Producer-side FP8 fusions (2026-07-22, full-FP8 productionization).
-# These run on top of the module-group precision schemes above:
-#
-#   fp8_rmsnorm:   RMSNorm(BF16→BF16) + quantize_act_fp8_fused →
-#                  fused RMSNorm→FP8 Triton kernel (1 launch instead
-#                  of 2). STE on FP8 quant; proper RMSNorm bwd
-#                  preserves dL/dweight. KDA's q/k/v/o act_quant
-#                  and FFN's gate/up act_quant still re-quantize the
-#                  BF16 dequant output — the FP8+scale from this
-#                  kernel is currently discarded. Saves 1 launch per
-#                  RMSNorm × 2 RMSNorms per layer = 2 launches/layer.
-#
-#   fp8_residual:  the residual stream is the load-bearing path for
-#                  the L-layer sqrt(N) noise compounding, so we keep
-#                  it BF16 (x + sub elementwise add). Previous e2e
-#                  probe showed +0.27% loss delta at 300 steps with
-#                  full FP8; the residual contribution amplifies that
-#                  further when enabled. Pin OFF.
-#
-#   fp8_silu_mul:  silu(gate)*up + quantize_act_fp8_fused → fused
-#                  silu_mul_fp8 Triton kernel. Saves 2 launches per
-#                  FFN sublayer (silu + mul + quant → 1 fused launch).
-#                  The downstream down_proj (W4A8) still does its own
-#                  internal act_quant on the BF16 dequant output.
-fp8_rmsnorm: true
-fp8_residual: false
-fp8_silu_mul: true
+# Producer-side fused-op precision (RMSNorm / residual / attn_res).
+# These are the element-wise ops BETWEEN the GEMMs (not GEMMs, so
+# they use a bf16/fp8 knob instead of the 5-scheme names). Wired
+# into HippoLayer / TPHippoLayer, gated on these keys.
+residual_precision: bf16       # inter-layer residual add. BF16 (not
+                               # FP8): the e2e A/B showed FP8 residual
+                               # compounds layer-out drift to 11.7%;
+                               # BF16 keeps it at 4.4% (mixed recipe,
+                               # project_fp8_mixed_e2e.md).
+rmsnorm_precision: fp8         # attn_norm / mlp_norm. FP8 RmsNormFp8STE
+                               # (fused RMSNorm + FP8 round + STE bwd);
+                               # 2.43x faster, sub-1% BF16 noise
+                               # (project_fp8_producer_fusions.md).
+attn_res_precision: bf16       # block-level BlockAttnRes. bf16 only —
+                               # no FP8 kernel written (already Triton-
+                               # fused BF16, off the FP8 critical path).

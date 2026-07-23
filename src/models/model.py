@@ -32,40 +32,33 @@ class HippoLayer(nn.Module):
     level and is invoked only at block boundaries (see
     :class:`HippoModel`).
 
-    Optional producer-side FP8 fusions (gated by
-    ``config.fp8_rmsnorm`` / ``fp8_residual`` / ``fp8_silu_mul``):
+    Producer-side FP8 fusions are driven by the two per-op precision
+    fields on ``HippoConfig`` (2026-07-23):
 
-      - ``fp8_rmsnorm=True``   → ``attn_norm(x)`` and ``mlp_norm(x)``
-        run through :class:`RmsNormFp8STE` instead of the BF16 fla
-        kernel. The fused kernel (``src/models/ops/rmsnorm_fp8.py``)
-        does RMSNorm + per-row FP8 quant in one launch; saves 1
-        kernel per RMSNorm (2 RMSNorms per layer → 2 launches saved).
-        STE on the FP8 round, proper RMSNorm bwd on the math
-        (``dL/dweight`` is preserved). The downstream KDA / FFN GEMMs
-        consume the BF16 dequantized output via their own internal
-        act_quant (the FP8 + scale output is currently discarded;
-        a future KDA-side change could consume it directly and save
-        the re-quant, but that requires KDA's act_quant to be plumbed
-        to accept pre-quantized inputs).
-      - ``fp8_residual=True``  → ``x = Fp8ResidualSTE(x, sub)`` instead
-        of ``x + sub`` for both sublayer residuals. The fused kernel
-        (``src/models/ops/fp8_residual.py``) does quant-add-requant
-        in one Triton launch with STE backward. Numerics: per-row
-        FP8 representation noise (3.76% sig_rel vs BF16 reference at
-        a single boundary; compounds via ``sqrt(N)`` across layers as
-        is standard for FP8). Production keeps this OFF — the residual
-        stream's precision is the load-bearing path for the L-layer
-        noise compounding.
-      - ``fp8_silu_mul=True`` → FFN's middle op is
-        ``SiluMulFp8STE(gate, up)`` instead of ``silu(gate)*up`` (BF16).
-        The fused kernel (``src/models/ops/silu_mul_fp8.py``) does
-        silu+mul+quant in one launch; saves 2 kernel launches per
-        FFN sublayer.
+      - ``rmsnorm_precision='fp8'`` → ``attn_norm`` / ``mlp_norm`` use
+        the fused ``RmsNormFp8STE`` kernel
+        (``src/models/ops/rmsnorm_fp8.py``): RMSNorm + per-row FP8
+        quant in one launch (2 launches saved per layer). STE on the
+        FP8 round, proper RMSNorm bwd on the math (``dL/dweight`` is
+        preserved). When the FFN is also FP8/NVFP4 with an inner quant,
+        the fused kernel returns ``(bf16, fp8, scale)`` so the FFN's
+        internal ``quantize_act_fp8_fused`` can be skipped (see
+        :meth:`_norm_with_passthrough`).
+      - ``residual_precision='fp8'`` → both sub-layer residuals use
+        ``Fp8ResidualSTE`` (quant-add-requant in one Triton launch,
+        STE bwd) instead of ``x + sub``. Production keeps this
+        ``'bf16'`` — the residual stream's precision is the
+        load-bearing path for the L-layer FP8 noise compounding
+        (see ``project_fp8_mixed_e2e.md``).
+
+    ``silu_mul`` FP8 is folded into the FFN scheme (``ffn_precision``),
+    so it is handled inside :class:`SwiGLU`, not here.
     """
 
     def __init__(self, layer_idx: int, config):
         super().__init__()
         self.layer_idx = layer_idx
+        self.config = config
 
         # Pre-attention and pre-FFN RMSNorms.
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -75,14 +68,18 @@ class HippoLayer(nn.Module):
         self.kda = KDA(config, layer_idx=layer_idx)
         self.ffn = SwiGLU(config)
 
-        # Lazy imports: ops module is the only consumer, and the
-        # autograd Functions depend on the Triton kernels which
-        # JIT on first call (no eager cost).
-        self._use_fp8_rmsnorm: bool = bool(getattr(config, "fp8_rmsnorm", False))
-        self._use_fp8_residual: bool = bool(getattr(config, "fp8_residual", False))
-        self._use_fp8_silu_mul: bool = bool(getattr(config, "fp8_silu_mul", False))
+        # Producer-side precision toggles (resolved once at build time;
+        # the autograd Functions lazy-import their Triton kernels on
+        # first call, so there is no eager JIT cost here).
+        self._use_fp8_rmsnorm: bool = (
+            getattr(config, "rmsnorm_precision", "bf16") == "fp8"
+        )
+        self._use_fp8_residual: bool = (
+            getattr(config, "residual_precision", "bf16") == "fp8"
+        )
 
     def _norm(self, layer: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+        """RMSNorm, optionally through the fused FP8 kernel (BF16 out)."""
         if self._use_fp8_rmsnorm:
             from .ops.rmsnorm_fp8 import RmsNormFp8STE
             return RmsNormFp8STE.apply(x, layer.weight, layer.eps)
@@ -93,21 +90,29 @@ class HippoLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fused ``RMSNorm → FP8`` returning ``(y_bf16, out_fp8, scale)``.
 
-        Used for the ``mlp_norm`` when ``ffn_precision='w4a8'`` and
-        ``fp8_rmsnorm=True``: the returned fp8 + scale are routed
-        directly into :meth:`SwiGLU.forward_precomputed` to skip the
-        redundant per-FFN ``quantize_act_fp8_fused``. See
+        Used for ``mlp_norm`` when the FFN has an inner FP8 quant
+        (``ffn_precision='w4a8'``) and ``rmsnorm_precision='fp8'``:
+        the returned fp8 + scale route straight into
+        :meth:`SwiGLU.forward_precomputed`, skipping the redundant
+        per-FFN ``quantize_act_fp8_fused``. See
         :func:`src.models.ops.rmsnorm_fp8.rmsnorm_fp8_with_passthrough`.
         """
         from .ops.rmsnorm_fp8 import rmsnorm_fp8_with_passthrough
         return rmsnorm_fp8_with_passthrough(x, layer.weight, layer.eps)
+
+    def _residual(self, x: torch.Tensor, sub: torch.Tensor) -> torch.Tensor:
+        """Residual add, optionally through the fused FP8 kernel."""
+        if self._use_fp8_residual:
+            from .ops.fp8_residual import Fp8ResidualSTE
+            return Fp8ResidualSTE.apply(x, sub)
+        return x + sub
 
     def forward(
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Standard residual transformer layer (with optional FP8 fusions).
+        """Standard residual transformer layer.
 
         Args:
             x: ``[B, T, hidden_size]`` input.
@@ -116,55 +121,23 @@ class HippoLayer(nn.Module):
 
         Returns:
             ``[B, T, hidden_size]`` output after KDA and FFN with
-            standard residual connections (BF16 or fused FP8, see
-            ``HippoConfig.fp8_rmsnorm`` / ``fp8_residual`` /
-            ``fp8_silu_mul``).
+            standard residual connections. RMSNorm / residual precision
+            follow ``config.rmsnorm_precision`` / ``residual_precision``.
         """
         sub = self.kda(self._norm(self.attn_norm, x), cu_seqlens=cu_seqlens)
-        if self._use_fp8_residual:
-            from .ops.fp8_residual import Fp8ResidualSTE
-            x = Fp8ResidualSTE.apply(x, sub)
-        else:
-            x = x + sub
+        x = self._residual(x, sub)
 
-        # ---- FFN block ----
-        # Two passthrough opportunities when the FFN is W4A8 and
-        # fp8_rmsnorm is on:
-        #   1. mlp_norm returns (bf16, fp8, scale) so the FFN's
-        #      internal act_quant can be skipped.
-        #   2. silu_mul_fp8 returns (bf16, fp8, scale) so the
-        #      down_proj's internal act_quant can be skipped.
-        # The W4A8 SwiGLU wrapper handles the second one
-        # internally (silu_quant_fused already exposes fp8 hidden
-        # to the down_proj) — so we only need to wire the first.
-        if self._use_fp8_rmsnorm and self.ffn._uses_inner:
-            # Producer-side passthrough: mlp_norm → (bf16, fp8, scale)
-            # → SwiGLU.forward_precomputed. Skips the W4A8 wrapper's
-            # internal quantize_act_fp8_fused (saves ~105 us/FFN at
-            # prod shape, on top of the ~243 us/FFN already saved
-            # by SwiGLU's own shared-act_quant optimization).
+        # FFN block. ``SwiGLU`` dispatches on ``config.ffn_precision``.
+        # When both rmsnorm is FP8 and the FFN has an inner quant, use
+        # the passthrough to skip the FFN's internal act_quant.
+        if self._use_fp8_rmsnorm and getattr(self.ffn, "_uses_inner", False):
             x_norm_bf16, x_norm_fp8, x_norm_s = self._norm_with_passthrough(
                 self.mlp_norm, x,
             )
             sub = self.ffn.forward_precomputed(x_norm_bf16, x_norm_fp8, x_norm_s)
-        elif self._use_fp8_silu_mul:
-            # Fused silu(gate)*up → FP8 inside the FFN. We bypass
-            # SwiGLU.forward so its internals don't re-fuse (avoid
-            # double-quant). The FP8 output dequantises back to BF16
-            # for ``down_proj`` (W8A8) to consume via its own quant.
-            x_norm = self._norm(self.mlp_norm, x)
-            gate = self.ffn.gate_proj(x_norm)
-            up = self.ffn.up_proj(x_norm)
-            from .ops.silu_mul_fp8 import SiluMulFp8STE
-            inter = SiluMulFp8STE.apply(gate, up)
-            sub = self.ffn.down_proj(inter)
         else:
             sub = self.ffn(self._norm(self.mlp_norm, x))
-        if self._use_fp8_residual:
-            from .ops.fp8_residual import Fp8ResidualSTE
-            x = Fp8ResidualSTE.apply(x, sub)
-        else:
-            x = x + sub
+        x = self._residual(x, sub)
         return x
 
 
@@ -183,7 +156,15 @@ class HippoModel(nn.Module):
 
         # Block-boundary attention residual. One module shared
         # across all ``num_blocks - 1`` boundaries. Initialised
-        # to 0 (uniform attention) per the paper.
+        # to 0 (uniform attention) per the paper. Only BF16 is
+        # wired (no FP8 BlockAttnRes kernel); config validation
+        # already rejects anything else, but guard here too so a
+        # future field change fails loudly at the construction site.
+        if getattr(config, "attn_res_precision", "bf16") != "bf16":
+            raise ValueError(
+                f"attn_res_precision={config.attn_res_precision!r} is not "
+                f"supported (only 'bf16' — no FP8 BlockAttnRes kernel)."
+            )
         self.attn_res = BlockAttnRes(config)
 
         # Language modeling head. ``config.lm_head_precision`` drives

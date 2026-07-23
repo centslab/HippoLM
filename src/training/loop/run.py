@@ -80,14 +80,13 @@ def _run_training_loop(ctx: Dict[str, Any]) -> None:
     decay_steps = getattr(args, "lr_decay_steps", 0)
     peak_muon_lr = args.muon_lr
     peak_adamw_lr = args.learning_rate
-    # Activation precision comes from the precision config:
-    # fp16 / bf16 → ``torch.amp.autocast`` with that dtype
-    # (tensor-core matmul); fp32 → autocast disabled (pure FP32
-    # forward). Resolved once per worker because autocast is a
-    # hot-path and the dtype never changes after setup.
-    precision = ctx["precision"]
-    autocast_enabled = precision.autocast_enabled
-    autocast_dtype = precision.autocast_dtype
+    # Activation precision is BF16 throughout. The legacy
+    # ``precision.autocast_*`` fields (from the yml-side
+    # ``precision:`` block, removed 2026-07-23) used to switch
+    # autocast dtype per-arg — only BF16 remains, so this is
+    # resolved once per worker.
+    autocast_enabled = True
+    autocast_dtype = torch.bfloat16
 
     # Chunked-training configuration. ``seq_len`` is now the TOTAL
     # tokens per step (super-long FFD-packed sequence); the

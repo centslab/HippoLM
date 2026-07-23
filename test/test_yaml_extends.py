@@ -1,12 +1,17 @@
 """Tests for the ``extends:`` mechanism in ``scripts/cli.py``.
 
 The ``configs/test/*.yml`` files rely on ``extends: ../base.yml``
-to inherit the production defaults (precision block, optimizer
-hparams, data source) without duplicating them. The merge is
-**shallow** — the child wins for any top-level key it specifies,
-but cannot reach inside a nested dict. These tests pin both
-the happy path and the failure modes so a future refactor that
-breaks inheritance gets caught immediately.
+to inherit the production defaults (optimizer hparams, data
+source) without duplicating them. The merge is **shallow** —
+the child wins for any top-level key it specifies, but cannot
+reach inside a nested dict. These tests pin both the happy
+path and the failure modes so a future refactor that breaks
+inheritance gets caught immediately.
+
+(The legacy ``precision:`` yml block was removed 2026-07-23;
+the precision-related tests below used that block as their
+example nested-dict structure. They now use ``optimizer:``
+instead — same purpose, no collision with production.)
 
 Pinned here:
   * Child yml with ``extends:`` inherits parent's keys
@@ -40,7 +45,7 @@ def tmp_yml_tree(tmp_path):
     child mapping. Default tree:
 
         tmp_path/
-            root.yml        <- inherits precision + lr
+            root.yml        <- inherits optimizer + lr
             child.yml       <- overrides num_layers
             leaf.yml        <- overrides max_steps, no extends
             middle.yml      <- extends root, overrides vocab_size
@@ -48,9 +53,9 @@ def tmp_yml_tree(tmp_path):
             cycle_b.yml     <- extends cycle_a
     """
     (tmp_path / "root.yml").write_text(
-        "precision:\n"
-        "  model_weights: { dtype: bf16 }\n"
-        "  adamw_m: { dtype: bf16 }\n"
+        "optimizer:\n"
+        "  adamw: { lr: 0.002 }\n"
+        "  muon: { lr: 0.01 }\n"
         "learning_rate: 0.01\n"
         "num_layers: 32\n"
         "vocab_size: 248320\n"
@@ -85,8 +90,8 @@ def test_extends_inherits_parent_keys(tmp_yml_tree):
     didn't override."""
     merged = _load_yaml_with_extends(str(tmp_yml_tree / "child.yml"))
     assert merged["learning_rate"] == 0.01
-    assert merged["precision"]["model_weights"]["dtype"] == "bf16"
-    assert merged["precision"]["adamw_m"]["dtype"] == "bf16"
+    assert merged["optimizer"]["adamw"]["lr"] == 0.002
+    assert merged["optimizer"]["muon"]["lr"] == 0.01
 
 
 def test_child_override_wins(tmp_yml_tree):
@@ -116,18 +121,19 @@ def test_nested_dict_replaced_not_merged(tmp_yml_tree):
     the parent's whole dict, not deep-merges sub-keys.
 
     We test this indirectly by adding a child yml that overrides
-    the precision block with a partial dict (only one sub-key) and
-    asserting the OTHER sub-keys are dropped (i.e. replaced whole).
+    the optimizer block with a partial dict (only one sub-key)
+    and asserting the OTHER sub-keys are dropped (i.e. replaced
+    whole).
     """
     (tmp_yml_tree / "shallow.yml").write_text(
         "extends: root.yml\n"
-        "precision:\n"
-        "  adamw_m: { dtype: fp32 }\n"  # only this sub-key, no model_weights
+        "optimizer:\n"
+        "  adamw: { lr: 0.05 }\n"  # only this sub-key, no muon
     )
     merged = _load_yaml_with_extends(str(tmp_yml_tree / "shallow.yml"))
-    # Whole precision block replaced — model_weights is gone.
-    assert merged["precision"] == {"adamw_m": {"dtype": "fp32"}}
-    assert "model_weights" not in merged["precision"]
+    # Whole optimizer block replaced — muon is gone.
+    assert merged["optimizer"] == {"adamw": {"lr": 0.05}}
+    assert "muon" not in merged["optimizer"]
 
 
 def test_unrelated_keys_from_child_persist(tmp_yml_tree):
@@ -187,27 +193,32 @@ def test_real_base_yml_loads():
     if not base_path.exists():
         pytest.skip("configs/base.yml not present (out-of-tree checkout)")
     merged = _load_yaml_with_extends(str(base_path))
-    assert "precision" in merged
-    assert "model_weights" in merged["precision"]
+    # The legacy ``precision:`` block was removed 2026-07-23;
+    # sanity-check that the loader doesn't silently require it.
+    assert "precision" not in merged
+    # ``optimizer:`` and the scheme keys are still present.
+    assert "optimizer" in merged
+    assert "ffn_precision" in merged
+    assert "embedding_precision" in merged
+    assert "lm_head_precision" in merged
+    # Producer-side fused-op precision keys (added 2026-07-23).
+    assert "residual_precision" in merged
+    assert "rmsnorm_precision" in merged
+    assert "attn_res_precision" in merged
 
 
 def test_real_test_yml_inherits_base():
     """The actual ``configs/test/quick.yml`` extends base.yml and
-    pulls in the precision block. This is the contract the test
-    configs rely on.
-
-    Note: int8 / mxfp8 muon momentum storage was removed on
-    2026-07-12 (long-training instability). The base precision
-    is now BF16 throughout; ``configs/test/muon_mxfp8.yml`` was
-    deleted with the rest of the quantized muon path.
+    pulls in the optimizer block (the legacy ``precision:`` block
+    it used to also pull in was removed 2026-07-23). This is the
+    contract the test configs rely on.
     """
     quick = _REPO / "configs" / "test" / "quick.yml"
     if not quick.exists():
         pytest.skip("configs/test/quick.yml not present")
     merged = _load_yaml_with_extends(str(quick))
     # Inherited from base:
-    assert "precision" in merged
-    assert merged["precision"]["muon_momentum"]["dtype"] == "bf16"
+    assert "optimizer" in merged
     # Overridden by the child:
     assert merged["num_layers"] == 2
     # The extends key itself is consumed.
@@ -221,8 +232,9 @@ def test_optimizer_block_in_base_resolves_all_keys():
     """``configs/base.yml`` uses the grouped ``optimizer:`` block;
     after ``parse_args`` every CLI-default flat key the training
     loop reads must be populated (learning_rate, weight_decay,
-    adamw_beta1, adamw_beta2, adamw_eps, muon_lr, muon_weight_decay,
-    muon_momentum).
+    adamw_beta1, adamw_beta2, adamw_eps, adamw_dtype, muon_lr,
+    muon_weight_decay, muon_momentum, muon_exp_avg_storage,
+    muon_block_size).
 
     Locks in the contract that the nested yml shape correctly
     feeds the loop / ``build_param_groups`` reads.
@@ -237,11 +249,16 @@ def test_optimizer_block_in_base_resolves_all_keys():
         "--muon_weight_decay CLI flag must exist for the grouped"
         " optimizer config to be overridable from the command line"
     )
-    assert args.learning_rate == pytest.approx(0.004)
+    assert args.learning_rate == pytest.approx(0.002)
     assert args.weight_decay == pytest.approx(0.01)
     assert args.adamw_beta1 == pytest.approx(0.9)
     assert args.adamw_beta2 == pytest.approx(0.95)
     assert args.adamw_eps == pytest.approx(1e-8)
-    assert args.muon_lr == pytest.approx(0.02)
+    # adamw_dtype comes from ``optimizer.adamw.dtype`` (added 2026-07-23).
+    assert args.adamw_dtype == "bf16"
+    assert args.muon_lr == pytest.approx(0.01)
     assert args.muon_weight_decay == pytest.approx(0.0)
     assert args.muon_momentum == pytest.approx(0.95)
+    # muon storage knobs come from the ``optimizer.muon`` block.
+    assert args.muon_exp_avg_storage == "fp8_2d_tight"
+    assert args.muon_block_size == 32

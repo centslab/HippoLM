@@ -35,7 +35,6 @@ sys.path.insert(0, str(_REPO))
 
 from src.training.loop import _compute_and_clip_grad_norm  # noqa: E402
 from src.training.param_offload import CPUAdamW, CPUMuon  # noqa: E402
-from src.training.precision_config import PrecisionConfig  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -69,10 +68,9 @@ def adamw_opt(tiny_model):
 @pytest.fixture
 def muon_opt(tiny_model):
     """Muon on the 2D Linear params, BF16 momentum (no quant)."""
-    precision = PrecisionConfig.from_dict({"muon_momentum": {"dtype": "bf16"}})
     return CPUMuon(
         [p for p in tiny_model.parameters() if p.ndim >= 2],
-        lr=1e-3, precision=precision,
+        lr=1e-3,
     )
 
 

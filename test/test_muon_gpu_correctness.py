@@ -64,7 +64,6 @@ from src.training.param_offload import (
     CPUMuon, build_param_groups, flush_pending_grads,
     register_grad_offload_hooks, zero_cpu_grad_accum,
 )
-from src.training.precision_config import PrecisionConfig
 
 
 def _muon_step_gpu_inline(muon_opt: CPUMuon) -> None:
@@ -153,16 +152,15 @@ def _build_matched_pair(
     torch.manual_seed(42)
     model_a = TPHippoModel(cfg, devices=[device], dtype=torch.float16)
     model_b = TPHippoModel(cfg, devices=[device], dtype=torch.float16)
-    precision = PrecisionConfig()
     muon_a, adamw_a = build_param_groups(
         model_a, device=device,
         lr_muon=0.02, lr_adamw=3e-4, weight_decay=0.01,
-        muon_momentum=0.95, precision=precision,
+        muon_momentum=0.95,
     )
     muon_b, adamw_b = build_param_groups(
         model_b, device=device,
         lr_muon=0.02, lr_adamw=3e-4, weight_decay=0.01,
-        muon_momentum=0.95, precision=precision,
+        muon_momentum=0.95,
     )
     register_grad_offload_hooks([muon_a, adamw_a])
     register_grad_offload_hooks([muon_b, adamw_b])
@@ -196,6 +194,12 @@ def test_muon_step_gpu_matches_inline_reference():
         num_layers=2, num_blocks=1,
         intermediate_size=768,
         rms_norm_eps=1e-6,
+        # This test runs under FP16 autocast and checks Muon-step
+        # bit-equivalence (precision-agnostic on the norm). Force
+        # BF16 producers — the default FP8 RMSNorm kernel requires
+        # BF16 input/weight and would reject the FP16 tensors here.
+        rmsnorm_precision="bf16",
+        residual_precision="bf16",
     )
     model_a, model_b, muon_a, muon_b, adamw_a, adamw_b = (
         _build_matched_pair(cfg, device)

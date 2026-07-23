@@ -16,12 +16,11 @@ rationale.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.nn as nn
 
-from ..precision_config import PrecisionConfig
 from ._state import _ParamState, _accumulator_target
 from .cpu_fused import fused_zero_many
 from .offload import _make_nvfp4_offload_cb
@@ -60,14 +59,16 @@ class CPUMuon:
       ``grad + β·exp_avg``; otherwise it's just ``exp_avg``.
       Initial value is zero.
 
-    Storage dtype is ``precision.muon_momentum.dtype``:
+    Storage dtype is BF16 (full-precision; was originally
+    driven by ``precision.muon_momentum.dtype`` — the yml-side
+    ``precision:`` block that let the yml switch among
+    ``bf16`` / ``fp16`` / ``fp32`` was removed 2026-07-23):
 
-    * ``bf16`` / ``fp16`` / ``fp32``: full-precision storage
-      for both ``grad`` and ``exp_avg``. The Newton-Schulz
-      output precision is unaffected by the storage dtype (NS
-      orthogonalizes the dequantized / raw FP32 momentum on
-      the GPU regardless); the storage precision only affects
-      how much the EMA buffer is rounded between steps.
+    * The Newton-Schulz output precision is unaffected by the
+      storage dtype (NS orthogonalizes the dequantized / raw
+      FP32 momentum on the GPU regardless); the storage
+      precision only affects how much the EMA buffer is
+      rounded between steps.
 
     * Quantized storage (``int8`` per-row BF16 scale,
       ``mxfp8`` per-block E8M0 scale) was removed on
@@ -99,21 +100,17 @@ class CPUMuon:
         nesterov: bool = True,
         ns_steps: int = 5,
         weight_decay: float = 0.0,
-        precision: Optional[PrecisionConfig] = None,
         exp_avg_storage: str = "bf16",
         block_size: int = 32,
     ) -> None:
-        """CPU-offloaded Muon with configurable precision.
+        """CPU-offloaded Muon with BF16 state throughout.
 
-        ``precision`` controls:
+        Storage (BF16 for both buffers; the only supported
+        layout since the legacy ``precision:`` yml block was
+        removed 2026-07-23):
 
-        - ``s.grad``    (per-step accumulator)  ← ``precision.muon_momentum``
-        - ``s.exp_avg`` (SGD momentum EMA)     ← ``precision.muon_momentum``
-
-        Both buffers share storage dtype. Quantized storage
-        (``int8`` / ``mxfp8``) was removed on 2026-07-12;
-        supported dtypes are full-precision ``bf16`` / ``fp16``
-        / ``fp32``.
+        - ``s.grad``    (per-step accumulator)
+        - ``s.exp_avg`` (SGD momentum EMA)
 
         The ``momentum`` and ``nesterov`` hyperparameters are
         consumed by :meth:`step` (since the 2026-07-15 refactor
@@ -121,13 +118,16 @@ class CPUMuon:
         step computes ``exp_avg = β·exp_avg + grad`` and (when
         ``nesterov=True``) the Nesterov correction
         ``g_for_ns = grad + β·exp_avg`` before Newton-Schulz.
+
+        The ``exp_avg_storage`` / ``block_size`` parameters
+        control the optional FP8 2D-tight scale EMA layout
+        (see ``project_2d_tight_scale_shipped.md``).
         """
         self.lr = lr
         self.momentum = momentum
         self.nesterov = nesterov
         self.ns_steps = ns_steps
         self.weight_decay = weight_decay
-        precision = precision or PrecisionConfig()
 
         # Storage mode for the SGD momentum EMA ``exp_avg``.
         # - ``"bf16"`` (default): full-precision BF16 buffer.
@@ -154,14 +154,11 @@ class CPUMuon:
             self._quantize_2d = quantize_2d
             self._dequantize_2d = dequantize_2d
 
-        # fp* muon: full-precision storage at the configured
-        # dtype; no scale, no dequant/requant in step().
-        storage_dtype = precision.muon_momentum.dtype.to_torch()
-
-        # Keep the precision config so register_nvfp4_module can
-        # mirror the storage decisions for module-based (no-BF16-
-        # master) entries.
-        self._precision = precision
+        # Storage: BF16 for both ``grad`` and ``exp_avg``. The
+        # legacy ``precision.muon_momentum`` knob (which could
+        # route to fp16 / fp32 / fp8) was removed on 2026-07-23
+        # with the yml-side ``precision:`` block.
+        storage_dtype = torch.bfloat16
 
         self.state: dict[int, _ParamState] = {}
         seen: set[int] = set()
@@ -259,8 +256,9 @@ class CPUMuon:
         updates.
 
         Mirrors the per-param entry created in :meth:`__init__` —
-        the dtype config (``precision.muon_momentum``) controls
-        the storage format for both ``grad`` and ``exp_avg``.
+        BF16 storage for both ``grad`` and ``exp_avg`` (the only
+        supported layout since the legacy ``precision:`` yml block
+        was removed 2026-07-23).
 
         In all cases the apply at step time routes through
         :meth:`NVFP4Linear.apply_chunk_update` (the module-side
@@ -281,11 +279,10 @@ class CPUMuon:
         if key in self.state:
             return
 
-        # Replicate the storage decision from __init__ but keyed on
-        # the module's shape (not a Parameter's). Same precision
-        # config so all storage is consistent across the model.
-        precision = self._precision
-        storage_dtype = precision.muon_momentum.dtype.to_torch()
+        # Replicate the storage decision from __init__ but keyed
+        # on the module's shape (not a Parameter's). Same BF16
+        # storage so all state is consistent across the model.
+        storage_dtype = torch.bfloat16
 
         st = _ParamState(
             param=None,
@@ -621,8 +618,8 @@ class CPUMuon:
     # Checkpoint save/load (resume).                                     #
     # ------------------------------------------------------------------ #
     # See the equivalent block on :class:`CPUAdamW` for the design.
-    # Full-precision storage (``precision.muon_momentum``) is the
-    # only path supported post-2026-07-12; quantized storage was
+    # Full-precision BF16 storage is the only layout
+    # supported post-2026-07-12; quantized storage was
     # removed along with int8 / mxfp8 storage. The saved entry
     # contains ``grad`` (per-step accumulator — zero at save time
     # in steady state) and ``exp_avg`` (SGD momentum — preserved

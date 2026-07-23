@@ -48,7 +48,6 @@ from src.training.param_offload import (
     build_param_groups, flush_pending_grads, flush_manual_flush_params,
     register_grad_offload_hooks, zero_cpu_grad_accum,
 )
-from src.training.precision_config import PrecisionConfig
 
 
 # Per-phase measurement helper.
@@ -123,10 +122,7 @@ def main():
     torch.set_float32_matmul_precision("high")
     init_tp(world_size=1, devices=[device], backend="gloo")
 
-    # Production config from base.yml (prod-shape, post opt-5/2).
-    # ``ffn_nvfp4=False`` since 2026-07-06 — opt-5/2 dropped the
-    # NVFP4 packed_weight/scales buffers. See
-    # ``project_opt5_bf16_only_ffn.md`` in auto-memory.
+    # Production config from base.yml (prod-shape).
     cfg = HippoConfig(
         vocab_size=248320, hidden_size=1536,
         tie_word_embeddings=True, use_bias=False,
@@ -138,7 +134,6 @@ def main():
         num_layers=32, num_blocks=8,
         intermediate_size=4096,
         rms_norm_eps=1e-6,
-        ffn_nvfp4=False,
     )
     print(f"[init] config: {cfg}")
     print(f"[init] model build start (alloc={torch.cuda.memory_allocated()/1024**2:.1f} MiB)")
@@ -150,12 +145,11 @@ def main():
           f"alloc={torch.cuda.memory_allocated()/1024**2:.1f} MiB, "
           f"reserved={torch.cuda.memory_reserved()/1024**2:.1f} MiB")
 
-    precision = PrecisionConfig()
     print(f"[init] param groups build start")
     muon_opt, adamw_opt = build_param_groups(
         model, device=device,
         lr_muon=0.02, lr_adamw=4e-3, weight_decay=0.01,
-        muon_momentum=0.95, precision=precision,
+        muon_momentum=0.95,
     )
     torch.cuda.synchronize()
     print(f"[init] optimizers built, "

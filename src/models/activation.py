@@ -35,16 +35,14 @@ The legacy boolean flags ``ffn_nvfp4`` / ``ffn_nvfp4_marlin`` /
 ``ffn_nvfp4_no_bf16_master`` were removed on 2026-07-21; the
 scheme is the single source of truth.
 
-Producer-side passthrough (2026-07-22)
---------------------------------------
-When ``ffn_precision="w4a8"`` and ``config.fp8_rmsnorm`` is on,
-:class:`HippoLayer` calls :meth:`SwiGLU.forward_precomputed` with
-the ``(bf16_x, a_fp8, a_s)`` tuple returned by
-:func:`rmsnorm_fp8_with_passthrough`. The wrapper routes the
-fp8 buffers directly into gate+up's
-:meth:`NVFP4LinearW4A8.forward_precomputed`, skipping the
-internal ``quantize_act_fp8_fused(x)`` — saves ~105 us / FFN at
-prod shape (the single-pass fused act_quant cost).
+Producer-side FP8 quant fusions (fp8_rmsnorm /
+fp8_residual / fp8_silu_mul) were removed on 2026-07-23 — see
+:class:`HippoConfig` for the rationale. The fused kernels in
+``src/models/ops/{rmsnorm_fp8,fp8_residual,silu_mul_fp8}.py``
+are kept for unit-test coverage but no longer wired into the
+SwiGLU forward path. ``forward_precomputed`` remains available
+for callers that want to route pre-quantized activations into
+the W4A8 wrapper directly.
 """
 import warnings
 

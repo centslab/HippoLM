@@ -67,7 +67,6 @@ def main():
         build_param_groups, flush_pending_grads, flush_manual_flush_params,
         register_grad_offload_hooks, zero_cpu_grad_accum,
     )
-    from src.training.precision_config import PrecisionConfig
 
     device = 0
     torch.cuda.set_device(device)
@@ -79,14 +78,16 @@ def main():
         kda_mode="chunk", use_short_conv=True, allow_neg_eigval=False,
         safe_gate=True, lower_bound=-5.0, conv_size=4, conv_bias=False,
         num_layers=32, num_blocks=8, intermediate_size=4096,
-        rms_norm_eps=1e-6, ffn_nvfp4=True,
+        rms_norm_eps=1e-6,
+        # Production FFN scheme (post-2026-07-21 migration; the
+        # legacy ``ffn_nvfp4=True`` boolean was removed).
+        ffn_precision="w4a16",
     )
     print(f"[init] building model")
     model = TPHippoModel(cfg, devices=[device], dtype=torch.float16)
-    precision = PrecisionConfig()
     muon_opt, adamw_opt = build_param_groups(
         model, device=device, lr_muon=0.02, lr_adamw=4e-3,
-        weight_decay=0.01, muon_momentum=0.95, precision=precision,
+        weight_decay=0.01, muon_momentum=0.95,
     )
     device_mods = model.replicated_per_device[str(device)]
     embed_param = device_mods["embed_tokens"] if "embed_tokens" in device_mods else None

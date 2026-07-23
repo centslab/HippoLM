@@ -267,6 +267,14 @@ class TPHippoModel(nn.Module):
         # ``nn.ModuleDict`` requires string keys, so all access uses
         # ``str(d)`` for the device index.
         self.replicated_per_device: nn.ModuleDict = nn.ModuleDict()
+        # BlockAttnRes only has a BF16 kernel; reject any other
+        # attn_res_precision loudly at construction (config validation
+        # already covers this, but guard at the build site too).
+        if getattr(config, "attn_res_precision", "bf16") != "bf16":
+            raise ValueError(
+                f"attn_res_precision={config.attn_res_precision!r} is not "
+                f"supported (only 'bf16' — no FP8 BlockAttnRes kernel)."
+            )
         for d in self.devices:
             # Cast the embedding to the training dtype at construction
             # time. Otherwise ``.to(device=...)`` only moves and

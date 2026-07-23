@@ -78,6 +78,7 @@ No conversion needed to load a BF16 checkpoint.
 """
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
@@ -91,6 +92,8 @@ from src.models.ops.nvfp4_marlin import (
     _repack_for_marlin,
     quantize_nvfp4_with_global_scale,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1023,20 @@ class NVFP4LinearW4A8(nn.Module):
         self._act_s_buf: torch.Tensor | None = None
 
         self._init_weights()
+
+        # 2026-07-23: surfaced for debug — verify which NVFP4 W4A8
+        # path is wired (and whether the ``bf16_only`` shape-div-16
+        # silent fallback fired). Spec gap: bwd is BF16 STE today
+        # even when fwd is NVFP4+FP8; the line below reports the
+        # resolved fwd mode only.
+        resolved = "BF16(bf16_only)" if self.bf16_only else "NVFP4-W4A8 (FP8 fwd + BF16 STE bwd)"
+        logger.info(
+            f"NVFP4LinearW4A8: in={in_features} out={out_features}"
+            f" bias={bias} dtype={self.weight.dtype}"
+            f" block_size={block_size} device={self.weight.device}"
+            f" use_custom_gemm={use_custom_gemm}"
+            f" → {resolved}"
+        )
 
     def _init_weights(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))

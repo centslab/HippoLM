@@ -43,13 +43,13 @@ Implements two optimizer variants used together via param groups:
       4. Stream NS over rows, apply the update to the GPU param.
       5. ``grad`` is zeroed for the next cycle (the EMA
          ``exp_avg`` is preserved across steps).
-    Momentum storage is configurable via
-    ``precision.muon_momentum``:
-      * ``bf16`` / ``fp16`` / ``fp32``: full-precision
-        momentum, no quantization. Both ``grad`` and
-        ``exp_avg`` are at the storage dtype. The NS iteration
-        is unaffected (it orthogonalizes the raw momentum in
-        FP32 on the GPU regardless).
+    Momentum storage is BF16 throughout (the only supported
+    layout since the yml-side ``precision:`` block that let
+    operators pick among ``bf16`` / ``fp16`` / ``fp32`` was
+    removed 2026-07-23). Both ``grad`` and ``exp_avg`` are
+    at BF16; the NS iteration is unaffected (it
+    orthogonalizes the raw momentum in FP32 on the GPU
+    regardless).
       Quantized storage (``int8`` per-row BF16 scale,
       ``mxfp8`` per-block E8M0 scale) was removed on
       2026-07-12 after long-training runs showed

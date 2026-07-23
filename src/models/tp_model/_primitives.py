@@ -24,10 +24,13 @@ read it via :func:`get_tp_world_size`.
 """
 from __future__ import annotations
 
+import logging
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +301,22 @@ class ColumnParallelLinear(nn.Module):
             self.register_parameter("bias", None)
         self._init_weights()
 
+        # 2026-07-23: surfaced for debug — TP-path BF16 fallback.
+        # If the user's yml asked for ``attention_precision='w8a8'``
+        # / ``ffn_precision='w4a8'`` but you see *only* these lines
+        # (no FP8Linear / NVFP4LinearW4A8 lines from the same
+        # build), the precision scheme did NOT fire on the TP path
+        # (see ``tp_model/swiglu.py:_resolve_classes`` for the
+        # known fallback surface).
+        logger.info(
+            f"ColumnParallelLinear (BF16): in={in_features}"
+            f" out={out_features}"
+            f" per_partition={self.out_features_per_partition}"
+            f" tp_world={self.world}"
+            f" bias={bias} dtype={self.weight.dtype}"
+            f" device={self.weight.device}"
+        )
+
     def _init_weights(self) -> None:
         nn.init.xavier_uniform_(self.weight)
         if self.bias is not None:
@@ -352,6 +371,17 @@ class RowParallelLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
         self._init_weights()
+
+        # 2026-07-23: surfaced for debug — TP-path BF16 fallback.
+        # See ColumnParallelLinear log note above for context.
+        logger.info(
+            f"RowParallelLinear (BF16): in={in_features}"
+            f" out={out_features}"
+            f" per_partition={self.in_features_per_partition}"
+            f" tp_world={self.world}"
+            f" bias={bias} dtype={self.weight.dtype}"
+            f" device={self.weight.device}"
+        )
 
     def _init_weights(self) -> None:
         nn.init.xavier_uniform_(self.weight)
