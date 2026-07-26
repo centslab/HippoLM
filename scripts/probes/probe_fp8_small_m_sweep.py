@@ -1,14 +1,15 @@
 """FP8 GEMM small-M × large-M sweep on sm_120.
 
 Sweeps every prebuilt fp8_gemm_scaled config + cuBLAS BF16 + _scaled_mm FP8
-across M ∈ {128, 256, 512, 1024, 2048, 4096, 8192} at the prod KDA + FFN shapes.
+across M ∈ {64, 128, 256, 512, 1024, 2048, 4096, 8192} at the prod KDA + FFN shapes.
 
 Goal: pick the right backend at each M without regressing large M.
 
 Per auto-memory feedback_verify_correctness.md / feedback_roofline_discipline.md:
 - direct CUDA event median timing
 - correctness gate: max-diff vs cuBLAS BF16 reference, isfinite check
-- reported as TFLOPS = 2*M*N*K / time, % of 97 TF dense fp8 peak (sm_120)
+- reported as TFLOPS = 2*M*N*K / time, % of either 188 TF (hardware FP8
+  dense peak, PEAK_FP8_HW) or 97 TF (CUTLASS rowwise ceiling, PEAK_FP8_RW)
 
 Run:
   PYTHONPATH=/hy-tmp/HippoLM python scripts/probes/probe_fp8_small_m_sweep.py
@@ -27,7 +28,14 @@ from pathlib import Path
 
 import torch
 
-PEAK_FP8 = 97.0   # sm_120 5060 Ti dense FP8 (cuBLAS RowWise absent; CUTLASS reaches this)
+# sm_120 5060 Ti FP8 ceilings — see docs/fp8_gemm_landscape_2026_07_23.md §1
+# Two ceilings, not one: 97 TF is the CUTLASS rowwise *achievable* (current
+# prod path); 188 TF is the *hardware* peak via cuBLASLt nvjet scalar-mode.
+# Use PEAK_FP8_HW for "% of hardware peak" framing; PEAK_FP8_RW for
+# "% of CUTLASS rowwise ceiling" framing.
+PEAK_FP8_HW = 188.0  # sm_120 5060 Ti hardware FP8 dense (cuBLASLt nvjet scalar)
+PEAK_FP8_RW = 97.0   # sm_120 5060 Ti CUTLASS RowWise ceiling (current prod)
+PEAK_FP8 = PEAK_FP8_HW  # default to hardware peak
 PEAK_BF16 = 50.0  # sm_120 5060 Ti dense BF16
 
 _LIB_DIR = Path("/hy-tmp/HippoLM/src/models/ops/cuda/lib")
@@ -61,7 +69,7 @@ SHAPES = [
 
 # M values to sweep. Picks cover the user's upcoming MBS shrink trajectory plus
 # two large-M anchors to detect regression.
-M_VALUES = [128, 256, 512, 1024, 2048, 4096, 8192]
+M_VALUES = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 
 def _load_custom_so(so_name: str):

@@ -4,8 +4,12 @@ Drop-in ``nn.Linear`` replacement that runs its forward GEMM through
 the vendored ``b12x`` MXFP8 dense kernel (per-32-element-block E4M3
 values + UE8M0 pow2 scales on *both* activation and weight). At the
 KDA prod shape (M=16384, K=N=1536) on sm_120 the b12x MXFP8 GEMM
-hits ~103 TFLOPS (~106% of the 97 TFLOPS FP8 dense spec) — measurably
-faster than ``torch._scaled_mm`` W8A8 (~95 TFLOPS) at large M.
+hits ~103 TFLOPS — that's at the CUTLASS RowWise ceiling (~97 TF on
+this arch, ~55% of the 188 TF hardware FP8 dense peak measured via
+cuBLASLt nvjet scalar mode; see
+``docs/fp8_gemm_landscape_2026_07_23.md`` §1). Measurably faster
+than ``torch._scaled_mm`` W8A8 (~95 TFLOPS) at large M; the same
+M × N × K / time.
 
 Why MXFP8 vs the W8A8 ``FP8Linear`` path
 ----------------------------------------

@@ -26,35 +26,73 @@ Two pieces:
 
 The kernel itself (`fp8_gemm.cuh`) is a TMA + warp-specialized
 `m16n8k32` E4M3 MMA on sm_120 (Blackwell consumer) with multi-stage
-`mbarrier` pipeline. The kernel is **at peak** at large M (~100
-TFLOPS = ~103% of the 97 TFLOPS sm_120 dense fp8 peak); see
-auto-memory `project_fp8_gemm_bottleneck.md` for the bottleneck
-analysis. The remaining upside is **at small M**, where the per-call
-backend choice (BM=64 vs BM=128) is the load-bearing lever — that's
-what the dispatcher automates.
+`mbarrier` pipeline. The kernel is **at the CUTLASS rowwise ceiling**
+at large M (~100 TFLOPS = 53% of the **hardware** FP8 dense peak
+~188 TF); see auto-memory `project_fp8_gemm_bottleneck.md` for the
+bottleneck analysis, and `docs/fp8_gemm_landscape_2026_07_23.md` §1
+for the 209 / 188 / 97 / 50 TF breakdown. The remaining upside is
+**at small M**, where the per-call backend choice (BM=64 vs BM=128)
+is the load-bearing lever — that's what the dispatcher automates.
 
-## Per-arch baseline — what "at peak" looks like
+**Block-scale scale precision (SCALE_FP32).** The `fp8_gemm.cuh`
+blockwise variants (64×64 / 128×128 / 256×256 / `accum_bsk*` /
+`32x32`) take per-block scales via the `SCALE_FP32` template param.
+The **64×64 R5b² variant** (the blockwise throughput winner at
+~91 TF) ships with `SCALE_FP32=true` (FP32 scales) as of
+2026-07-25 — see auto-memory `project_fp8_issue_bound.md` §
+"64×64 BLOCK → FP32 scales" for the full rationale. Briefly:
+QMMA `m16n8k32.f32.e4m3.e4m3` on sm_120 has **FP32-only
+accumulator** (no .f16 / .bf16 variant on this arch), so passing
+FP32 scales matches the accumulator precision and removes any
+ambiguity in the per-block accumulator chain. Cost: ~1% perf
+from 2× HBM for scales (which is small enough — scales are ~1/64
+the size of the FP8 A/B tiles per K-tile). **Important**: BF16→FP32
+scale conversion is **bit-exact** (BF16 mantissa 7 bits ≤ FP32
+mantissa 23 bits), so the precision benefit of FP32 vs BF16
+scales is theoretical (matches accumulator type), not measured
+— on synthetic clamped-Gaussian the med_rel is 0.135% for both.
+Larger-block variants (128×128 / 256×256) keep BF16 scales
+because blocks cover 2M+ FP8 elements per scale, well past the
+BF16 mantissa precision floor.
 
-Before building anything, establish the FP8 peak FLOPS for the
-target arch so you can read the sweep output sensibly. The 97 TF
-number for sm_120 is a measurement, not a spec; each arch differs.
+## Per-arch baseline — what "peak" means on this arch
+
+sm_120 has two FP8 ceilings that matter, not one:
+
+- **Hardware FP8 dense peak** (the actual FP8 ceiling): **~188 TF**
+  measured via `torch._scaled_mm` TensorWise (scalar scale) at large
+  M; NVIDIA vendor dense spec is 209 TF. The cuBLASLt `nvjet_sm120`
+  hand-tuned kernel reaches 88% of vendor.
+- **CUTLASS rowwise ceiling** (current prod path): **~97-100 TF** at
+  the same shape — the gap to 188 TF is **scale-broadcast overhead**
+  (40-46% of CUTLASS rowwise time at prod FFN shapes).
+
+Quick measurement recipe for the *hardware* peak (use this as the
+denominator for "% of FP8 peak"):
 
 ```
-# Baseline: a single M=16384 N=8192 K=1536 FP8 GEMM via _scaled_mm.
-# This gives the cuBLAS CUTLASS rowwise achievable TFLOPS on the
-# current device, which is what we define as "100% peak" for this
-# device (sm_120 was 97 TF at this measurement).
+# Baseline: a single M=16384 N=4096 K=4096 FP8 GEMM via _scaled_mm
+# with TensorWise (scalar) scale. This hits the nvjet hand-tuned
+# kernel = the hardware FP8 dense ceiling on sm_120.
 #
-# For other archs:
-#   sm_80 (A100):       ~220 TF (spec ≈ 312 TF, vendor caps at 220 in CUTLASS rowwise)
-#   sm_89 (RTX 4090):   ≈ 165 TF
+# For other archs (best-known measurements):
+#   sm_80 (A100):       ~220 TF (vendor dense spec ≈ 312 TF)
+#   sm_89 (RTX 4090):   ≈ 165 TF (vendor ≈ 330 TF dense)
 #   sm_90 (H100):       ≈ 360 TF
 #   sm_100 (B200):      ≈ 660 TF
+#   sm_120 (5060 Ti):   ≈ 188 TF (vendor 209 TF dense)
 ```
 
-Quick measurement recipe: run `_scaled_mm` on a single `(M=16384,
-K=1536, N=8192)` shape, time 30 iters, divide FLOPs by median time.
-Use this as the denominator in the sweep `%peak` column.
+For the *CUTLASS rowwise* measurement (current prod path), the
+recipe is the same shape but with `_scaled_mm` RowWise or
+`_scaled_mm` Blockwise 1x128 (the rowwise-scale modes); that's
+~97-100 TF on sm_120.
+
+The earlier versions of this doc (pre-2026-07-23) used 97 TF as
+"100% peak" — that was wrong. The 97 TF number is the CUTLASS
+rowwise achievable, not the hardware ceiling. The auto-memory
+`project_fp8_gemm_bottleneck.md` was re-baselined 2026-07-23 to
+reflect this.
 
 ## Build pipeline
 
@@ -100,7 +138,7 @@ What this sweep does and why every line matters:
 
 | Step | Why |
 | --- | --- |
-| `for M in [128, 256, 512, 1024, 2048, 4096, 8192]` | Covers the user MBS-shrink trajectory and the large-M regression anchor. |
+| `for M in [64, 128, 256, 512, 1024, 2048, 4096, 8192]` | Covers sub-BM64 inputs, the MBS-shrink trajectory, and the large-M regression anchor. |
 | For each `(M, K, N)`: 3 prod shapes (KDA qkv, FFN gate_up, FFN down) | Each shape has a different N tile-utilization behavior; a single shape is not representative. |
 | Per cell, benchmark every prebuilt `.so` (skip the ones whose `BM`, `BN`, `BK` don't divide `M`, `K`, `N`) | The kernel hard-asserts (`fp8_gemm.cuh:567-569`), so we filter in Python rather than crash on launch. |
 | Median of 10 timed iters per backend (5 warmup) | Matches `feedback_verify_correctness.md` and the regression-guard style in `test_fp8_gemm.py`. |
