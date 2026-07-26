@@ -1,27 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-// Per-config kernel entry point. The build pipeline instantiates this
-// once per (BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE)
-// combination and the runtime loader dispatches via the gemm_run
-// symbol.
-
+// FP8 E4M3 GEMM with BF16 per-1x32 K-block scales — R5 dual-accumulator.
+// mma writes into a fresh tmp[4] (C=0); 4 fma into running acc with scale.
+// See project_fp8_issue_bound.md for the per-K-sub-MMA FMA bottleneck.
 #include "fp8_gemm.cuh"
 
-extern "C" void gemm_run(
+extern "C" void dual_accum_gemm_run(
     int M, int N, int K,
     const void *A, const void *B, void *Y,
-    const float *a_scale, const float *b_scale,
+    const void *a_scale, const void *b_scale,
     void *workspace, cudaStream_t stream)
 {
-    (void)workspace;  // unused for the no-split-K path
-    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, false,
-               /*DUAL_ACCUM=*/false, /*BLOCK_SCALE_K=*/32,
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, true, true,
+               /*BLOCK_SCALE_K=*/32,
                /*BLOCK_TILE_SCALE=*/false, /*BLOCK_OUT_M=*/64, /*BLOCK_OUT_N=*/64,
                /*BLOCK_ACCUM=*/false, /*SCALE_FP32=*/false, /*PERSISTENT=*/false>::run(
         M, N, K,
         reinterpret_cast<const fp8e4m3 *>(A),
         reinterpret_cast<const fp8e4m3 *>(B),
-        a_scale, b_scale,
         nullptr, nullptr,
+        reinterpret_cast<const void *>(a_scale),
+        reinterpret_cast<const void *>(b_scale),
         reinterpret_cast<bf16 *>(Y),
         /*tile_counter=*/nullptr,
         stream);

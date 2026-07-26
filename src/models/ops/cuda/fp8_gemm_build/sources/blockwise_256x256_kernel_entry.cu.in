@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: Apache-2.0
+// FP8 E4M3 GEMM with 256×256 BLOCK scales — 2D-block sweep point.
+//
+// a_scale [M/256, K/64], b_scale [N/256, K/64]. The scale tile spans
+// multiple CTAs (BM=BN=128), so this measures whether letting one scale
+// cover a 2×2 CTA neighbourhood changes throughput. Warp-constant
+// hoisting still holds (BLOCK_OUT >= warp shape).
+#include "fp8_gemm.cuh"
+
+extern "C" void blockwise_256x256_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const void *a_scale, const void *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE,
+               true, /*DUAL_ACCUM=*/false, /*BLOCK_SCALE_K=*/64,
+               /*BLOCK_TILE_SCALE=*/true, /*BLOCK_OUT_M=*/256,
+               /*BLOCK_OUT_N=*/256,
+               /*BLOCK_ACCUM=*/false,
+               /*SCALE_FP32=*/false,
+               /*PERSISTENT=*/false>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        nullptr, nullptr,
+        reinterpret_cast<const void *>(a_scale),
+        reinterpret_cast<const void *>(b_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}

@@ -176,10 +176,49 @@ __device__ __forceinline__ int swizzle_smem_offset(int row, int col, int row_ele
 // FP8GemmMMA — TMA + warp specialization + m16n8k16 FP8 MMA
 // ════════════════════════════════════════════════════════════════════════
 template <int BM, int BN, int BK, int NUM_STAGES, int CWG,
-          int WARP_M = 64, int WARP_N = 64, bool DIRECT_STORE = false>
+          int WARP_M = 64, int WARP_N = 64, bool DIRECT_STORE = false,
+          bool BLOCKWISE_SCALE = false, bool DUAL_ACCUM = false,
+          int BLOCK_SCALE_K = 32, bool BLOCK_TILE_SCALE = false,
+          int BLOCK_OUT_M = 64, int BLOCK_OUT_N = 64,
+          bool BLOCK_ACCUM = false,
+          bool SCALE_FP32 = false,
+          bool PERSISTENT = false>
 struct FP8GemmMMA
 {
+    // SCALE_FP32: when true, a_block_scale/b_block_scale are FP32
+    // (matched to the QMMA m16n8k32.f32.e4m3.e4m3 accumulator, which
+    // is FP32-only on sm_120 — there is no .f16/.bf16 variant). Use
+    // FP32 for fine-grained BLOCK_TILE_SCALE (e.g. 32×32 BLOCK_OUT
+    // = 32×32×32 = 32K FP8 elements per scale) where BF16's 7-bit
+    // mantissa can lose >1% relative precision on outlier magnitudes.
+    // For larger blocks (≥64×64 BLOCK_OUT, ≥ 128K elements/scale)
+    // BF16 scales are bit-exact convertible to FP32 (the conversion
+    // is lossless), so the default stays BF16 to halve the scale HBM
+    // bandwidth (2 bytes vs 4 bytes per scale).
+    //
+    // BLOCK_TILE_SCALE: one scale per (BLOCK_OUT_M rows × BLOCK_OUT_N
+    // cols × BLOCK_SCALE_K K). The scale is warp-constant (the compiler
+    // hoists the LDG + FMUL out of the (mi, ni) loops) iff each warp's
+    // WARP_M×WARP_N output region fits inside a single BLOCK_OUT tile
+    // — that is the entire perf win, so require the tile to be a
+    // multiple of the warp shape and aligned to the CTA grid.
+    static_assert(BLOCK_TILE_SCALE == false || BLOCK_OUT_M >= WARP_M,
+                  "BLOCK_TILE_SCALE requires BLOCK_OUT_M >= WARP_M");
+    static_assert(BLOCK_TILE_SCALE == false || BLOCK_OUT_N >= WARP_N,
+                  "BLOCK_TILE_SCALE requires BLOCK_OUT_N >= WARP_N");
+    static_assert(BLOCK_TILE_SCALE == false || BLOCK_OUT_M % WARP_M == 0,
+                  "BLOCK_TILE_SCALE requires BLOCK_OUT_M %% WARP_M == 0 (warp fits one tile)");
+    static_assert(BLOCK_TILE_SCALE == false || BLOCK_OUT_N % WARP_N == 0,
+                  "BLOCK_TILE_SCALE requires BLOCK_OUT_N %% WARP_N == 0 (warp fits one tile)");
     static_assert(BK == 128, "BK must be 128 (128B swizzle span per row)");
+    static_assert(!BLOCKWISE_SCALE || (BLOCK_SCALE_K % 32 == 0),
+                  "BLOCK_SCALE_K must be a multiple of 32 when BLOCKWISE_SCALE");
+    static_assert(!BLOCKWISE_SCALE || BLOCK_ACCUM || BLOCK_SCALE_K <= 128,
+                  "BLOCK_SCALE_K > 128 (cross-K-tile) requires BLOCK_ACCUM (native MMA accumulation within the scale-block)");
+    static_assert(!BLOCK_ACCUM || BLOCK_TILE_SCALE,
+                  "BLOCK_ACCUM currently only implemented with BLOCK_TILE_SCALE (warp-constant scale)");
+    static_assert(!SCALE_FP32 || BLOCK_TILE_SCALE,
+                  "SCALE_FP32 only meaningful for BLOCK_TILE_SCALE (warp-constant scale path)");
     static constexpr int WARPS_PER_WG = 4;
     static constexpr int THREADS_PER_WARP = 32;
     static constexpr int THREADS_PER_WG = WARPS_PER_WG * THREADS_PER_WARP;
@@ -192,6 +231,9 @@ struct FP8GemmMMA
     static constexpr int MMA_M = WARP_M / 16;
     static constexpr int MMA_N = WARP_N / 8;
     static constexpr int MMA_K = BK / 32;   // m16n8k32 e4m3: 32 K per MMA
+
+    static constexpr int SCALES_PER_K_TILE = BK / BLOCK_SCALE_K;
+    static constexpr int SUB_MMAS_PER_SCALE = BLOCK_SCALE_K / 32;
 
     static constexpr int WARPS_M = BM / WARP_M;
     static constexpr int WARPS_N = BN / WARP_N;
@@ -233,15 +275,26 @@ struct FP8GemmMMA
         int M, int N, int K,
         const fp8e4m3 *__restrict__ A,
         const fp8e4m3 *__restrict__ B,
-        const float  *__restrict__ a_scale,   // [M] FP32
-        const float  *__restrict__ b_scale,   // [N] FP32
+        const float  *__restrict__ a_scale,   // [M] FP32 or nullptr
+        const float  *__restrict__ b_scale,   // [N] FP32 or nullptr
+        // Block scales are passed as `void *` so the same kernel
+        // signature can serve both BF16 (default, halve HBM bandwidth)
+        // and FP32 (SCALE_FP32=true) layouts. The kernel casts to the
+        // appropriate type via `if constexpr (SCALE_FP32)` — see the
+        // SCALE_FP32 docstring above for the precision rationale.
+        const void   *__restrict__ a_block_scale, // BF16 or FP32, nullptr
+        const void   *__restrict__ b_block_scale, // BF16 or FP32, nullptr
         bf16         *__restrict__ Y,
+        // PERSISTENT-only: pointer to a uint32_t used as the global
+        // atomic tile counter. nullptr when PERSISTENT=false. The host
+        // must zero this before launch (entry file uses cudaMemsetAsync).
+        uint32_t     *__restrict__ tile_counter,
         cudaStream_t  stream = nullptr);
 };
 
 // ── FP8 MMA kernel ───────────────────────────────────────────────────
-template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE>
-__global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>::TOTAL_THREADS, 1, 1)
+template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT>
+__global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>::TOTAL_THREADS, 1, 1)
     fp8_gemm_mma_kernel(
         int M, int N, int K,
         int num_tiles_m, int num_tiles_n, int total_tiles,
@@ -250,9 +303,15 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
         __grid_constant__ const TMADescriptor tma_Y,
         const float *__restrict__ a_scale,
         const float *__restrict__ b_scale,
-        bf16 *__restrict__ Y)
+        const void *__restrict__ a_block_scale,
+        const void *__restrict__ b_block_scale,
+        bf16 *__restrict__ Y,
+        // PERSISTENT-only: global atomic counter for work-stealing
+        // tile distribution. nullptr when PERSISTENT=false. The host
+        // zero-initializes this in run() before launch.
+        uint32_t *__restrict__ tile_counter)
 {
-    using P = FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>;
+    using P = FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32>;
     using SmemStorage = typename P::SMemStorage;
 
     extern __shared__ __align__(128) char smem_raw[];
@@ -278,47 +337,94 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
+    // PERSISTENT: shared atomic counter; producer/consumer share tile_id
+    // via shared-memory broadcast (single fetch per CTA per iteration).
+    __shared__ uint32_t s_tile_id;
+
+    // Producer pipeline state (NUM_STAGES deep). Defined at the top of
+    // the kernel so both the non-persistent producer loop and the
+    // unified persistent loop can access them — only the producer
+    // thread (wg_id==0, warp_in_wg==0, lane_id==0) actually reads/writes.
+    int producer_stage = 0;
+    int producer_phase = 0;
+    int producer_total_k = 0;
+
+    // Producer TMA lambda: emits NUM_STAGES K-tile TMA loads for one
+    // output tile. Captures the pipeline state by reference so calls
+    // accumulate across iterations. Defined here (not inside the
+    // wg_id==0 branch) so the persistent loop can also call it.
+    auto run_producer_tile = [&](int tile_id) {
+        int bm, bn;
+        P::rasterize_tile(tile_id, num_tiles_m, num_tiles_n, bm, bn);
+
+        for (int k = 0; k < num_k_tiles; k++)
+        {
+            if (producer_total_k >= NUM_STAGES)
+            {
+                mbarrier_wait(smem_u32(&smem.empty_barrier[producer_stage]), producer_phase ^ 1);
+            }
+            mbarrier_expect_tx(smem_u32(&smem.full_barrier[producer_stage]), P::TX_BYTES);
+
+            // A: [M, K] row-major, box [BK, BM] (dim0=K contiguous)
+            tma_A.load_2d(
+                k * BK, bm * BM,
+                smem_u32(smem.A[producer_stage]),
+                smem_u32(&smem.full_barrier[producer_stage]));
+            // B: [N, K] row-major, box [BK, BN]
+            tma_B.load_2d(
+                k * BK, bn * BN,
+                smem_u32(smem.B[producer_stage]),
+                smem_u32(&smem.full_barrier[producer_stage]));
+
+            producer_stage++;
+            if (producer_stage == NUM_STAGES) { producer_stage = 0; producer_phase ^= 1; }
+            producer_total_k++;
+        }
+    };
+
+    // Initial fetch for the PERSISTENT path: thread 0 grabs the first
+    // tile_id BEFORE either warp group enters its main loop, so the
+    // consumer can't race ahead and read uninitialized s_tile_id. The
+    // host pre-loads tile_counter with num_blocks (gridDim.x) so each
+    // CTA starts at tile_id = blockIdx.x — without that, every CTA
+    // would atomicAdd 0,1,2,... and the FIRST iter would have all 36
+    // CTAs racing on tile 0.
+    if constexpr (PERSISTENT)
+    {
+        if (tid == 0)
+        {
+            s_tile_id = blockIdx.x;
+        }
+        __syncthreads();
+    }
+
     // ── Producer warp group: lane 0 of warp 0 issues TMA loads ────
     if (wg_id == 0)
     {
         if (warp_in_wg == 0 && lane_id == 0)
         {
-            int stage = 0;
-            int phase = 0;
-            int total_k = 0;
-
-            for (int tile_id = blockIdx.x; tile_id < total_tiles; tile_id += num_blocks)
+            if constexpr (PERSISTENT)
             {
-                int bm, bn;
-                P::rasterize_tile(tile_id, num_tiles_m, num_tiles_n, bm, bn);
-
-                for (int k = 0; k < num_k_tiles; k++)
+                // Persistent path is in the unified loop below — the
+                // producer thread participates there.
+            }
+            else
+            {
+                for (int tile_id = blockIdx.x; tile_id < total_tiles; tile_id += num_blocks)
                 {
-                    if (total_k >= NUM_STAGES)
-                    {
-                        mbarrier_wait(smem_u32(&smem.empty_barrier[stage]), phase ^ 1);
-                    }
-                    mbarrier_expect_tx(smem_u32(&smem.full_barrier[stage]), P::TX_BYTES);
-
-                    // A: [M, K] row-major, box [BK, BM] (dim0=K contiguous)
-                    tma_A.load_2d(
-                        k * BK, bm * BM,
-                        smem_u32(smem.A[stage]),
-                        smem_u32(&smem.full_barrier[stage]));
-                    // B: [N, K] row-major, box [BK, BN]
-                    tma_B.load_2d(
-                        k * BK, bn * BN,
-                        smem_u32(smem.B[stage]),
-                        smem_u32(&smem.full_barrier[stage]));
-
-                    stage++;
-                    if (stage == NUM_STAGES) { stage = 0; phase ^= 1; }
-                    total_k++;
+                    run_producer_tile(tile_id);
                 }
             }
         }
     }
     // ── Consumer warp groups ──────────────────────────────────────
+    // Guarded: the producer warp group (wg_id == 0) must NOT enter —
+    // its cwg_id would be -1 → negative m_warp_base/n_warp_base →
+    // negative smem/global offsets. Benign-ish with the smem epilogue
+    // (stmatrix lands inside the CTA's own smem), FATAL with
+    // DIRECT_STORE (global store at negative Y offset = illegal
+    // access). HEAD production kernel had this as `else`; the
+    // blockwise refactor dropped it, which is what crashed R7.
     else
     {
         const int cwg_id = wg_id - 1;
@@ -333,12 +439,23 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
         int phase = 0;
         bool has_tma_store_in_flight = false;
 
-        for (int tile_id = blockIdx.x; tile_id < total_tiles; tile_id += num_blocks)
-        {
+        // Helper lambda: run one tile's MMA loop + epilogue for
+        // `tile_id`. The producer and persistent consumers both
+        // route through this — producer pre-fills smem via TMA, the
+        // consumer races against it via mbarriers (per stage).
+        auto run_consumer_tile = [&](int tile_id) {
             int bm, bn;
             P::rasterize_tile(tile_id, num_tiles_m, num_tiles_n, bm, bn);
 
             float acc[P::MMA_M][P::MMA_N][4]{};
+            // R6 native-accumulate: raw (unscaled) partials for the
+            // current scale-block. The tensor core accumulates into
+            // acc_raw across all SUB_MMAS_PER_SCALE sub-MMAs of the block
+            // (no intervening FFMA), then one FFMA per (mi, ni) flushes
+            // acc_raw into acc at the block boundary and resets it.
+            constexpr int RAW_M = BLOCK_ACCUM ? P::MMA_M : 1;
+            constexpr int RAW_N = BLOCK_ACCUM ? P::MMA_N : 1;
+            float acc_raw[RAW_M][RAW_N][4]{};
 
             for (int k = 0; k < num_k_tiles; k++)
             {
@@ -405,18 +522,171 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
                         #pragma unroll
                         for (int ni = 0; ni < P::MMA_N; ni++)
                         {
-                            asm volatile(
-                                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                                "{%0, %1, %2, %3}, "
-                                "{%4, %5, %6, %7}, "
-                                "{%8, %9}, "
-                                "{%10, %11, %12, %13};\n"
-                                : "+f"(acc[mi][ni][0]), "+f"(acc[mi][ni][1]),
-                                  "+f"(acc[mi][ni][2]), "+f"(acc[mi][ni][3])
-                                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                                  "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
-                                  "f"(acc[mi][ni][0]), "f"(acc[mi][ni][1]),
-                                  "f"(acc[mi][ni][2]), "f"(acc[mi][ni][3]));
+                            if constexpr (BLOCK_ACCUM)
+                            {
+                                // R6: chain the sub-MMAs of one scale-block
+                                // with the tensor core's NATIVE accumulation
+                                // (mma writes acc_raw += A*B via the "+f"
+                                // accumulator operand — no FFMA between
+                                // consecutive MMAs), then flush once per
+                                // block. FFMA count drops from 4 per sub-MMA
+                                // to 4 per scale-block = 4·K/BLOCK_SCALE_K
+                                // total per (mi, ni).
+                                asm volatile(
+                                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                                    "{%0, %1, %2, %3}, "
+                                    "{%4, %5, %6, %7}, "
+                                    "{%8, %9}, "
+                                    "{%10, %11, %12, %13};\n"
+                                    : "+f"(acc_raw[mi][ni][0]), "+f"(acc_raw[mi][ni][1]),
+                                      "+f"(acc_raw[mi][ni][2]), "+f"(acc_raw[mi][ni][3])
+                                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                                      "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
+                                      "f"(acc_raw[mi][ni][0]), "f"(acc_raw[mi][ni][1]),
+                                      "f"(acc_raw[mi][ni][2]), "f"(acc_raw[mi][ni][3]));
+                                const int global_sub = k * P::MMA_K + ki;
+                                if ((global_sub + 1) % P::SUB_MMAS_PER_SCALE == 0)
+                                {
+                                    const int scale_cols = K / BLOCK_SCALE_K;
+                                    const int scale_k = global_sub / P::SUB_MMAS_PER_SCALE;
+                                    const int m_tile = (bm * BM + m_warp_base) / BLOCK_OUT_M;
+                                    const int n_tile = (bn * BN + n_warp_base) / BLOCK_OUT_N;
+                                    float a_s, b_s;
+                                    if constexpr (SCALE_FP32) {
+                                        a_s = reinterpret_cast<const float *>(a_block_scale)[m_tile * scale_cols + scale_k];
+                                        b_s = reinterpret_cast<const float *>(b_block_scale)[n_tile * scale_cols + scale_k];
+                                    } else {
+                                        a_s = __bfloat162float(reinterpret_cast<const bf16 *>(a_block_scale)[m_tile * scale_cols + scale_k]);
+                                        b_s = __bfloat162float(reinterpret_cast<const bf16 *>(b_block_scale)[n_tile * scale_cols + scale_k]);
+                                    }
+                                    const float s = a_s * b_s;
+                                    acc[mi][ni][0] = fmaf(acc_raw[mi][ni][0], s, acc[mi][ni][0]);
+                                    acc[mi][ni][1] = fmaf(acc_raw[mi][ni][1], s, acc[mi][ni][1]);
+                                    acc[mi][ni][2] = fmaf(acc_raw[mi][ni][2], s, acc[mi][ni][2]);
+                                    acc[mi][ni][3] = fmaf(acc_raw[mi][ni][3], s, acc[mi][ni][3]);
+                                    acc_raw[mi][ni][0] = 0.0f;
+                                    acc_raw[mi][ni][1] = 0.0f;
+                                    acc_raw[mi][ni][2] = 0.0f;
+                                    acc_raw[mi][ni][3] = 0.0f;
+                                }
+                            }
+                            else if constexpr (BLOCKWISE_SCALE && (DUAL_ACCUM || BLOCK_TILE_SCALE))
+                            {
+                                // mma-into-tmp path used by both R5
+                                // (1×N strip, DUAL_ACCUM) and R5b+ (64×64
+                                // BLOCK_TILE_SCALE). Both write tmp = A*B
+                                // + 0, then 4 fma into the running acc.
+                                // The scale indexing differs:
+                                //   - DUAL_ACCUM: per-row × per-col
+                                //     (lane-dependent out_row0, out_col0)
+                                //   - BLOCK_TILE_SCALE: per-(m_tile, n_tile)
+                                //     (warp-constant; a_s0==a_s1, b_s0==b_s1
+                                //     → 1 unique product per K-block per warp)
+                                float tmp[4];
+                                const float zero = 0.0f;
+                                asm volatile(
+                                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                                    "{%0, %1, %2, %3}, "
+                                    "{%4, %5, %6, %7}, "
+                                    "{%8, %9}, "
+                                    "{%10, %11, %12, %13};\n"
+                                    : "=f"(tmp[0]), "=f"(tmp[1]),
+                                      "=f"(tmp[2]), "=f"(tmp[3])
+                                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                                      "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
+                                      "f"(zero), "f"(zero), "f"(zero), "f"(zero));
+                                const int scale_cols = K / BLOCK_SCALE_K;
+                                const int scale_k = k * P::SCALES_PER_K_TILE + ki / P::SUB_MMAS_PER_SCALE;
+                                if constexpr (BLOCK_TILE_SCALE)
+                                {
+                                    // BLOCK_OUT_M × BLOCK_OUT_N scale: one
+                                    // scale per (m_tile, n_tile, k-block).
+                                    // BLOCK_OUT_M >= WARP_M and
+                                    // BLOCK_OUT_N >= WARP_N (asserted), so the
+                                    // whole warp maps to ONE tile → m_tile,
+                                    // n_tile are warp-constant across (mi, ni)
+                                    // and the compiler hoists the two LDGs +
+                                    // FMUL out of the inner loops.
+                                    const int m_tile = (bm * BM + m_warp_base) / BLOCK_OUT_M;
+                                    const int n_tile = (bn * BN + n_warp_base) / BLOCK_OUT_N;
+                                    float a_s, b_s;
+                                    if constexpr (SCALE_FP32) {
+                                        a_s = reinterpret_cast<const float *>(a_block_scale)[m_tile * scale_cols + scale_k];
+                                        b_s = reinterpret_cast<const float *>(b_block_scale)[n_tile * scale_cols + scale_k];
+                                    } else {
+                                        a_s = __bfloat162float(reinterpret_cast<const bf16 *>(a_block_scale)[m_tile * scale_cols + scale_k]);
+                                        b_s = __bfloat162float(reinterpret_cast<const bf16 *>(b_block_scale)[n_tile * scale_cols + scale_k]);
+                                    }
+                                    const float s = a_s * b_s;
+                                    acc[mi][ni][0] = fmaf(tmp[0], s, acc[mi][ni][0]);
+                                    acc[mi][ni][1] = fmaf(tmp[1], s, acc[mi][ni][1]);
+                                    acc[mi][ni][2] = fmaf(tmp[2], s, acc[mi][ni][2]);
+                                    acc[mi][ni][3] = fmaf(tmp[3], s, acc[mi][ni][3]);
+                                }
+                                else
+                                {
+                                    // 1×N strip: per-row × per-col.
+                                    const int out_row0 = bm * BM + m_base + (lane_id >> 2);
+                                    const int n_base = n_warp_base + ni * 8;
+                                    const int out_col0 = bn * BN + n_base + (lane_id & 3) * 2;
+                                    // 1×N strip path: scales stay BF16
+                                    // regardless of SCALE_FP32 (the
+                                    // SCALE_FP32 template arg is only
+                                    // meaningful for BLOCK_TILE_SCALE,
+                                    // asserted above).
+                                    const auto a_bs = reinterpret_cast<const bf16 *>(a_block_scale);
+                                    const auto b_bs = reinterpret_cast<const bf16 *>(b_block_scale);
+                                    const float a_s0 = __bfloat162float(a_bs[out_row0 * scale_cols + scale_k]);
+                                    const float a_s1 = __bfloat162float(a_bs[(out_row0 + 8) * scale_cols + scale_k]);
+                                    const float b_s0 = __bfloat162float(b_bs[out_col0 * scale_cols + scale_k]);
+                                    const float b_s1 = __bfloat162float(b_bs[(out_col0 + 1) * scale_cols + scale_k]);
+                                    acc[mi][ni][0] = fmaf(tmp[0], a_s0 * b_s0, acc[mi][ni][0]);
+                                    acc[mi][ni][1] = fmaf(tmp[1], a_s0 * b_s1, acc[mi][ni][1]);
+                                    acc[mi][ni][2] = fmaf(tmp[2], a_s1 * b_s0, acc[mi][ni][2]);
+                                    acc[mi][ni][3] = fmaf(tmp[3], a_s1 * b_s1, acc[mi][ni][3]);
+                                }
+                            }
+                            else
+                            {
+                                float prev0, prev1, prev2, prev3;
+                                if constexpr (BLOCKWISE_SCALE)
+                                {
+                                    prev0 = acc[mi][ni][0];
+                                    prev1 = acc[mi][ni][1];
+                                    prev2 = acc[mi][ni][2];
+                                    prev3 = acc[mi][ni][3];
+                                }
+                                asm volatile(
+                                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                                    "{%0, %1, %2, %3}, "
+                                    "{%4, %5, %6, %7}, "
+                                    "{%8, %9}, "
+                                    "{%10, %11, %12, %13};\n"
+                                    : "+f"(acc[mi][ni][0]), "+f"(acc[mi][ni][1]),
+                                      "+f"(acc[mi][ni][2]), "+f"(acc[mi][ni][3])
+                                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                                      "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
+                                      "f"(acc[mi][ni][0]), "f"(acc[mi][ni][1]),
+                                      "f"(acc[mi][ni][2]), "f"(acc[mi][ni][3]));
+                                if constexpr (BLOCKWISE_SCALE)
+                                {
+                                    const int scale_cols = K / BLOCK_SCALE_K;
+                                    const int scale_k = k * P::SCALES_PER_K_TILE + ki / P::SUB_MMAS_PER_SCALE;
+                                    const int out_row0 = bm * BM + m_base + (lane_id >> 2);
+                                    const int n_base = n_warp_base + ni * 8;
+                                    const int out_col0 = bn * BN + n_base + (lane_id & 3) * 2;
+                                    const auto a_bs = reinterpret_cast<const bf16 *>(a_block_scale);
+                                    const auto b_bs = reinterpret_cast<const bf16 *>(b_block_scale);
+                                    const float a_s0 = __bfloat162float(a_bs[out_row0 * scale_cols + scale_k]);
+                                    const float a_s1 = __bfloat162float(a_bs[(out_row0 + 8) * scale_cols + scale_k]);
+                                    const float b_s0 = __bfloat162float(b_bs[out_col0 * scale_cols + scale_k]);
+                                    const float b_s1 = __bfloat162float(b_bs[(out_col0 + 1) * scale_cols + scale_k]);
+                                    acc[mi][ni][0] = fmaf(acc[mi][ni][0] - prev0, a_s0 * b_s0, prev0);
+                                    acc[mi][ni][1] = fmaf(acc[mi][ni][1] - prev1, a_s0 * b_s1, prev1);
+                                    acc[mi][ni][2] = fmaf(acc[mi][ni][2] - prev2, a_s1 * b_s0, prev2);
+                                    acc[mi][ni][3] = fmaf(acc[mi][ni][3] - prev3, a_s1 * b_s1, prev3);
+                                }
+                            }
                         }
                     }
                 }
@@ -452,10 +722,10 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
                     {
                         const int n_base = n_warp_base + ni * 8;
                         const int out_col0 = bn * BN + n_base + (lane_id & 3) * 2;
-                        const float a_s0 = a_scale[out_row0];
-                        const float a_s1 = a_scale[out_row0 + 8];
-                        const float b_s0 = b_scale[out_col0];
-                        const float b_s1 = b_scale[out_col0 + 1];
+                        const float a_s0 = BLOCKWISE_SCALE ? 1.0f : a_scale[out_row0];
+                        const float a_s1 = BLOCKWISE_SCALE ? 1.0f : a_scale[out_row0 + 8];
+                        const float b_s0 = BLOCKWISE_SCALE ? 1.0f : b_scale[out_col0];
+                        const float b_s1 = BLOCKWISE_SCALE ? 1.0f : b_scale[out_col0 + 1];
 
                         uint32_t c01 = f32x2_to_bf16x2(
                             acc[mi][ni][0] * a_s0 * b_s0,
@@ -504,10 +774,10 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
 
                         const int out_row0 = bm * BM + m_base + (lane_id >> 2);
                         const int out_col0 = bn * BN + n_base + (lane_id & 3) * 2;
-                        const float a_s0 = a_scale[out_row0];
-                        const float a_s1 = a_scale[out_row0 + 8];
-                        const float b_s0 = b_scale[out_col0];
-                        const float b_s1 = b_scale[out_col0 + 1];
+                        const float a_s0 = BLOCKWISE_SCALE ? 1.0f : a_scale[out_row0];
+                        const float a_s1 = BLOCKWISE_SCALE ? 1.0f : a_scale[out_row0 + 8];
+                        const float b_s0 = BLOCKWISE_SCALE ? 1.0f : b_scale[out_col0];
+                        const float b_s1 = BLOCKWISE_SCALE ? 1.0f : b_scale[out_col0 + 1];
 
                         uint32_t c01 = f32x2_to_bf16x2(
                             acc[mi][ni][0] * a_s0 * b_s0,
@@ -535,7 +805,77 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
                 }
                 has_tma_store_in_flight = true;
             }
+        };
+
+        if constexpr (PERSISTENT)
+        {
+            // Unified persistent main loop. Producer (wg_id == 0,
+            // warp 0 lane 0) and consumer warps (wg_id >= 1) enter
+            // this single while(true) and share its CTA-wide
+            // __syncthreads() barriers — that's the only way producer
+            // and consumer can synchronize on the same barrier
+            // instance (separate code paths reach different barriers).
+            //
+            // Phase A: producer issues TMA, consumer does MMA + store
+            //          (both routed through the same iter boundary so
+            //          s_tile_id is read at a consistent point).
+            // PHASE A SYNC: producer's TMA + consumer's MMA both done.
+            // Producer updates s_tile_id to next tile_id via atomicAdd.
+            // PHASE B SYNC: s_tile_id update is visible to all.
+            //
+            // Exit: when atomicAdd returns >= total_tiles, s_tile_id is
+            // set to that value (the sentinel). The consumer reads it
+            // at the top of the next iter and breaks; the producer
+            // also breaks via the same s_tile_id >= total_tiles check.
+            //
+            // The non-producer WG-0 threads (other warps in wg 0) have
+            // nothing to do — they just spin-wait at both PHASE A and
+            // PHASE B barriers, which is required for the CTA-wide
+            // __syncthreads to release.
+            while (true)
+            {
+                // PHASE 1: producer does TMA, consumer does MMA.
+                int tile_id = (int)s_tile_id;
+                if (wg_id == 0)
+                {
+                    if (warp_in_wg == 0 && lane_id == 0)
+                    {
+                        if (tile_id < total_tiles)
+                        {
+                            run_producer_tile(tile_id);
+                        }
+                    }
+                }
+                else
+                {
+                    if (tile_id < total_tiles)
+                    {
+                        run_consumer_tile(tile_id);
+                    }
+                }
+                __syncthreads();   // PHASE A
+
+                // Producer thread publishes the next tile_id via the
+                // global atomic counter. s_tile_id == total_tiles
+                // (sentinel) signals exit on the next iter.
+                if (wg_id == 0 && warp_in_wg == 0 && lane_id == 0)
+                {
+                    uint32_t next = atomicAdd(tile_counter, 1);
+                    s_tile_id = next;
+                }
+                __syncthreads();   // PHASE B
+
+                if (s_tile_id >= (uint32_t)total_tiles) break;
+            }
         }
+        else
+        {
+            for (int tile_id = blockIdx.x; tile_id < total_tiles; tile_id += num_blocks)
+            {
+                run_consumer_tile(tile_id);
+            }
+        }
+
         if (cwg_id == 0 && warp_in_wg == 0 && lane_id == 0)
         {
             if (has_tma_store_in_flight) tma_store_wait();
@@ -554,14 +894,20 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
 }
 
 // ── Launch ───────────────────────────────────────────────────────────
-template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE>
-void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>::run(
+template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT>
+void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>::run(
     int M, int N, int K,
     const fp8e4m3 *__restrict__ A,
     const fp8e4m3 *__restrict__ B,
     const float  *__restrict__ a_scale,
     const float  *__restrict__ b_scale,
+    const void   *__restrict__ a_block_scale,
+    const void   *__restrict__ b_block_scale,
     bf16         *__restrict__ Y,
+    // PERSISTENT-only: pointer to a uint32_t used as the global
+    // atomic tile counter. The host zeros this before launch. Must
+    // be nullptr when PERSISTENT=false.
+    uint32_t     *__restrict__ tile_counter,
     cudaStream_t  stream)
 {
     if (M % BM != 0 || N % BN != 0 || K % BK != 0)
@@ -588,25 +934,45 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>::run(
     // default cap and returns occ=0 for the 96 KB configs (which
     // then launches grid(0) = invalid argument).
     CHECK_CUDA(cudaFuncSetAttribute(
-        fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>,
+        fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE));
 
-    // Occupancy-aware persistent grid: 2 blocks/SM when smem+regs
-    // allow — one block's epilogue overlaps the other's K loop
-    // (cuBLAS/nvjet runs 2 blocks/SM for the same reason).
-    int occ = 1;
-    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ,
-        fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>,
-        TOTAL_THREADS, SMEM_SIZE));
-    int num_blocks = min(num_sm * occ, total_tiles);
+    int num_blocks;
+    if constexpr (PERSISTENT)
+    {
+        // PERSISTENT: launch exactly 1 CTA per SM (no occ > 1
+        // overlap), each CTA work-steals tiles via the atomic
+        // counter. We pre-seed tile_counter with num_blocks so the
+        // FIRST atomicAdd returns num_blocks (not 0) — that way each
+        // CTA's first atomicAdd returns a tile > its blockIdx.x, so
+        // the post-init s_tile_id (set by the kernel to blockIdx.x)
+        // doesn't collide with what other CTAs atomicAdd next.
+        num_blocks = min(num_sm, total_tiles);
+        CHECK_CUDA(cudaMemsetAsync(tile_counter, 0, sizeof(uint32_t), stream));
+        uint32_t seed = (uint32_t)num_blocks;
+        CHECK_CUDA(cudaMemcpyAsync(tile_counter, &seed, sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice, stream));
+    }
+    else
+    {
+        // Occupancy-aware persistent grid: 2 blocks/SM when smem+regs
+        // allow — one block's epilogue overlaps the other's K loop
+        // (cuBLAS/nvjet runs 2 blocks/SM for the same reason).
+        int occ = 1;
+        CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ,
+            fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>,
+            TOTAL_THREADS, SMEM_SIZE));
+        num_blocks = min(num_sm * occ, total_tiles);
+    }
 
     dim3 grid(num_blocks);
     dim3 block(TOTAL_THREADS);
 
-    fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE>
+    fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>
         <<<grid, block, SMEM_SIZE, stream>>>(
             M, N, K, num_tiles_m, num_tiles_n, total_tiles,
-            tma_A, tma_B, tma_Y, a_scale, b_scale, Y);
+            tma_A, tma_B, tma_Y, a_scale, b_scale,
+            a_block_scale, b_block_scale, Y, tile_counter);
     CHECK_CUDA(cudaGetLastError());
 }

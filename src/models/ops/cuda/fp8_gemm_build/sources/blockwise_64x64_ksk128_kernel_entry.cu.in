@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: Apache-2.0
+// FP8 E4M3 GEMM with 64×64 output tile but a FULL-BK K-block scale
+// (BLOCK_SCALE_K=128) — LDG-floor sweep point.
+//
+// a_scale [M/64, K/128], b_scale [N/64, K/128]. One scale per K-tile
+// (SCALES_PER_K_TILE == 1), so the warp issues only 2 scale LDGs per
+// K-tile (a_s + b_s) instead of 4. This is the theoretical LDG floor
+// for software block scaling; it measures whether the remaining LDG
+// pair is on the critical path.
+#include "fp8_gemm.cuh"
+
+extern "C" void blockwise_64x64_ksk128_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const void *a_scale, const void *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE,
+               true, /*DUAL_ACCUM=*/false, /*BLOCK_SCALE_K=*/128,
+               /*BLOCK_TILE_SCALE=*/true, /*BLOCK_OUT_M=*/64,
+               /*BLOCK_OUT_N=*/64,
+               /*BLOCK_ACCUM=*/false,
+               /*SCALE_FP32=*/false,
+               /*PERSISTENT=*/false>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        nullptr, nullptr,
+        reinterpret_cast<const void *>(a_scale),
+        reinterpret_cast<const void *>(b_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}

@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: Apache-2.0
+// FP8 E4M3 GEMM with 64×64 BLOCK scales — R5b-square variant.
+//
+// a_scale [M/64, K/64] BF16, b_scale [N/64, K/64] BF16. ONE scale per
+// (m_tile, n_tile, k_block). Within a warp (32 M × 64 N for the
+// production BM=64 WARP_M=32 WARP_N=64 config), all lanes share the
+// same scale, so LDG count drops to ~4 per K-tile per warp and FMA
+// count drops to 4 per (mi, ni) per K-tile (a_s0==a_s1, b_s0==b_s1).
+//
+// Scales stay BF16 (SCALE_FP32=false default): BF16→FP32 conversion is
+// bit-exact (mantissa 7 bits ≤ 23 bits) so the FP32 path adds only
+// HBM cost (~1% perf) without precision benefit. The 64×64 BLOCK
+// covers 64×64×64 = 262K FP8 elements per scale, well past the BF16
+// mantissa precision floor. For finer-grained blocks (32×32 = 32K
+// elements/scale) where the per-block averaging base is small, use
+// SCALE_FP32=true via blockwise_32x32_kernel_entry.cu.in.
+//
+// PERSISTENT=false: each CTA processes a strided subset of tiles via
+// `for (tile_id = blockIdx.x; tile_id < total_tiles; tile_id += gridDim.x)`.
+// Grid is sized to `num_sm * occ` (occ=2 typically, so cross-CTA
+// epilogue/K-loop overlap). For the PERSISTENT variant (work-stealing
+// via global atomic counter, 1 CTA/SM), see
+// blockwise_64x64_persistent_kernel_entry.cu.in.
+#include "fp8_gemm.cuh"
+
+extern "C" void blockwise_64x64_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const void *a_scale, const void *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE,
+               true, /*DUAL_ACCUM=*/false, /*BLOCK_SCALE_K=*/64,
+               /*BLOCK_TILE_SCALE=*/true, /*BLOCK_OUT_M=*/64,
+               /*BLOCK_OUT_N=*/64,
+               /*BLOCK_ACCUM=*/false,
+               /*SCALE_FP32=*/false,
+               /*PERSISTENT=*/false>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        nullptr, nullptr,
+        reinterpret_cast<const bf16 *>(a_scale),
+        reinterpret_cast<const bf16 *>(b_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}
