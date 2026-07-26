@@ -29,6 +29,7 @@
 #pragma once
 #include "common.h"
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -182,12 +183,14 @@ template <int BM, int BN, int BK, int NUM_STAGES, int CWG,
           int BLOCK_OUT_M = 64, int BLOCK_OUT_N = 64,
           bool BLOCK_ACCUM = false,
           bool SCALE_FP32 = false,
-          bool PERSISTENT = false>
+          bool PERSISTENT = false,
+          bool ACC_RAW_F16 = false>
 struct FP8GemmMMA
 {
     // SCALE_FP32: when true, a_block_scale/b_block_scale are FP32
-    // (matched to the QMMA m16n8k32.f32.e4m3.e4m3 accumulator, which
-    // is FP32-only on sm_120 — there is no .f16/.bf16 variant). Use
+    // (the BLOCK_ACCUM chain accumulates in FP32 — ACC_RAW_F16=false;
+    // an .f16-acc variant exists on sm_120 and runs at 2x rate, see
+    // ACC_RAW_F16 below, but .bf16 does not). Use
     // FP32 for fine-grained BLOCK_TILE_SCALE (e.g. 32×32 BLOCK_OUT
     // = 32×32×32 = 32K FP8 elements per scale) where BF16's 7-bit
     // mantissa can lose >1% relative precision on outlier magnitudes.
@@ -217,6 +220,25 @@ struct FP8GemmMMA
                   "BLOCK_SCALE_K > 128 (cross-K-tile) requires BLOCK_ACCUM (native MMA accumulation within the scale-block)");
     static_assert(!BLOCK_ACCUM || BLOCK_TILE_SCALE,
                   "BLOCK_ACCUM currently only implemented with BLOCK_TILE_SCALE (warp-constant scale)");
+    static_assert(!ACC_RAW_F16 || BLOCK_ACCUM,
+                  "ACC_RAW_F16 only meaningful with BLOCK_ACCUM (F16 in-block accumulator chain)");
+    // ACC_RAW_F16: hold the in-scale-block accumulator chain (acc_raw)
+    // in F16 and issue mma...f16.e4m3.e4m3.f16 instead of the F32-acc
+    // variant. On sm_120 the F16-acc QMMA sustains ~2x the F32-acc
+    // issue rate (consumer Blackwell tensor core; measured 97.9 ->
+    // 168.3 TF @ 4096^3 = 1.72x, and the M>=4096/K>=8192 shapes go
+    // 54 -> 169 TF = 3.1x). Numerics: F16 mantissa 2^-11 ~= 0.05%
+    // per 128-elem block partial, ~100x below the FP8 quantization
+    // floor (med_rel 0.107% -> 0.114% on Gaussian data, stable under
+    // sharp 2^-4..2^4 block scales). acc_raw registers halve
+    // (32 vs 64). OVERFLOW BOUNDARY: acc_raw sums 128 raw FP8
+    // products before the FP32 flush, so |product| sums above 65504
+    // overflow to Inf — safe for scale-normalized data (|values|
+    // ~O(1) per element) but NOT for adversarial max-magnitude FP8
+    // inputs (448x448 products overflow F16 immediately). The FP32
+    // path (ACC_RAW_F16=false) has no such bound. Scales are always
+    // applied at the FP32 flush, so the bound only involves raw FP8
+    // magnitudes within one 128-K block.
     static_assert(!SCALE_FP32 || BLOCK_TILE_SCALE,
                   "SCALE_FP32 only meaningful for BLOCK_TILE_SCALE (warp-constant scale path)");
     static constexpr int WARPS_PER_WG = 4;
@@ -293,8 +315,8 @@ struct FP8GemmMMA
 };
 
 // ── FP8 MMA kernel ───────────────────────────────────────────────────
-template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT>
-__global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>::TOTAL_THREADS, 1, 1)
+template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT, bool ACC_RAW_F16>
+__global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>::TOTAL_THREADS, 1, 1)
     fp8_gemm_mma_kernel(
         int M, int N, int K,
         int num_tiles_m, int num_tiles_n, int total_tiles,
@@ -311,7 +333,7 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
         // zero-initializes this in run() before launch.
         uint32_t *__restrict__ tile_counter)
 {
-    using P = FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32>;
+    using P = FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>;
     using SmemStorage = typename P::SMemStorage;
 
     extern __shared__ __align__(128) char smem_raw[];
@@ -455,6 +477,8 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
             // acc_raw into acc at the block boundary and resets it.
             constexpr int RAW_M = BLOCK_ACCUM ? P::MMA_M : 1;
             constexpr int RAW_N = BLOCK_ACCUM ? P::MMA_N : 1;
+            // ACC_RAW_F16: 4 F16 accumulators packed as 2xuint32.
+            uint32_t acc_raw_f16[RAW_M][RAW_N][2]{};
             float acc_raw[RAW_M][RAW_N][4]{};
 
             for (int k = 0; k < num_k_tiles; k++)
@@ -532,18 +556,34 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
                                 // block. FFMA count drops from 4 per sub-MMA
                                 // to 4 per scale-block = 4·K/BLOCK_SCALE_K
                                 // total per (mi, ni).
-                                asm volatile(
-                                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                                    "{%0, %1, %2, %3}, "
-                                    "{%4, %5, %6, %7}, "
-                                    "{%8, %9}, "
-                                    "{%10, %11, %12, %13};\n"
-                                    : "+f"(acc_raw[mi][ni][0]), "+f"(acc_raw[mi][ni][1]),
-                                      "+f"(acc_raw[mi][ni][2]), "+f"(acc_raw[mi][ni][3])
-                                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                                      "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
-                                      "f"(acc_raw[mi][ni][0]), "f"(acc_raw[mi][ni][1]),
-                                      "f"(acc_raw[mi][ni][2]), "f"(acc_raw[mi][ni][3]));
+                                if constexpr (ACC_RAW_F16)
+                                {
+                                    asm volatile(
+                                        "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+                                        "{%0, %1}, "
+                                        "{%2, %3, %4, %5}, "
+                                        "{%6, %7}, "
+                                        "{%8, %9};\n"
+                                        : "+r"(acc_raw_f16[mi][ni][0]), "+r"(acc_raw_f16[mi][ni][1])
+                                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                                          "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
+                                          "r"(acc_raw_f16[mi][ni][0]), "r"(acc_raw_f16[mi][ni][1]));
+                                }
+                                else
+                                {
+                                    asm volatile(
+                                        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                                        "{%0, %1, %2, %3}, "
+                                        "{%4, %5, %6, %7}, "
+                                        "{%8, %9}, "
+                                        "{%10, %11, %12, %13};\n"
+                                        : "+f"(acc_raw[mi][ni][0]), "+f"(acc_raw[mi][ni][1]),
+                                          "+f"(acc_raw[mi][ni][2]), "+f"(acc_raw[mi][ni][3])
+                                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                                          "r"(b_frag[ni][0]), "r"(b_frag[ni][1]),
+                                          "f"(acc_raw[mi][ni][0]), "f"(acc_raw[mi][ni][1]),
+                                          "f"(acc_raw[mi][ni][2]), "f"(acc_raw[mi][ni][3]));
+                                }
                                 const int global_sub = k * P::MMA_K + ki;
                                 if ((global_sub + 1) % P::SUB_MMAS_PER_SCALE == 0)
                                 {
@@ -560,14 +600,28 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
                                         b_s = __bfloat162float(reinterpret_cast<const bf16 *>(b_block_scale)[n_tile * scale_cols + scale_k]);
                                     }
                                     const float s = a_s * b_s;
-                                    acc[mi][ni][0] = fmaf(acc_raw[mi][ni][0], s, acc[mi][ni][0]);
-                                    acc[mi][ni][1] = fmaf(acc_raw[mi][ni][1], s, acc[mi][ni][1]);
-                                    acc[mi][ni][2] = fmaf(acc_raw[mi][ni][2], s, acc[mi][ni][2]);
-                                    acc[mi][ni][3] = fmaf(acc_raw[mi][ni][3], s, acc[mi][ni][3]);
-                                    acc_raw[mi][ni][0] = 0.0f;
-                                    acc_raw[mi][ni][1] = 0.0f;
-                                    acc_raw[mi][ni][2] = 0.0f;
-                                    acc_raw[mi][ni][3] = 0.0f;
+                                    if constexpr (ACC_RAW_F16)
+                                    {
+                                        float2 f01 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][0]));
+                                        float2 f23 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][1]));
+                                        acc[mi][ni][0] = fmaf(f01.x, s, acc[mi][ni][0]);
+                                        acc[mi][ni][1] = fmaf(f01.y, s, acc[mi][ni][1]);
+                                        acc[mi][ni][2] = fmaf(f23.x, s, acc[mi][ni][2]);
+                                        acc[mi][ni][3] = fmaf(f23.y, s, acc[mi][ni][3]);
+                                        acc_raw_f16[mi][ni][0] = 0u;
+                                        acc_raw_f16[mi][ni][1] = 0u;
+                                    }
+                                    else
+                                    {
+                                        acc[mi][ni][0] = fmaf(acc_raw[mi][ni][0], s, acc[mi][ni][0]);
+                                        acc[mi][ni][1] = fmaf(acc_raw[mi][ni][1], s, acc[mi][ni][1]);
+                                        acc[mi][ni][2] = fmaf(acc_raw[mi][ni][2], s, acc[mi][ni][2]);
+                                        acc[mi][ni][3] = fmaf(acc_raw[mi][ni][3], s, acc[mi][ni][3]);
+                                        acc_raw[mi][ni][0] = 0.0f;
+                                        acc_raw[mi][ni][1] = 0.0f;
+                                        acc_raw[mi][ni][2] = 0.0f;
+                                        acc_raw[mi][ni][3] = 0.0f;
+                                    }
                                 }
                             }
                             else if constexpr (BLOCKWISE_SCALE && (DUAL_ACCUM || BLOCK_TILE_SCALE))
@@ -894,8 +948,8 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
 }
 
 // ── Launch ───────────────────────────────────────────────────────────
-template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT>
-void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>::run(
+template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT, bool ACC_RAW_F16>
+void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>::run(
     int M, int N, int K,
     const fp8e4m3 *__restrict__ A,
     const fp8e4m3 *__restrict__ B,
@@ -934,7 +988,7 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCK
     // default cap and returns occ=0 for the 96 KB configs (which
     // then launches grid(0) = invalid argument).
     CHECK_CUDA(cudaFuncSetAttribute(
-        fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>,
+        fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE));
 
     int num_blocks;
@@ -961,7 +1015,7 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCK
         int occ = 1;
         CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ,
-            fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>,
+            fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>,
             TOTAL_THREADS, SMEM_SIZE));
         num_blocks = min(num_sm * occ, total_tiles);
     }
@@ -969,7 +1023,7 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCK
     dim3 grid(num_blocks);
     dim3 block(TOTAL_THREADS);
 
-    fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT>
+    fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>
         <<<grid, block, SMEM_SIZE, stream>>>(
             M, N, K, num_tiles_m, num_tiles_n, total_tiles,
             tma_A, tma_B, tma_Y, a_scale, b_scale,

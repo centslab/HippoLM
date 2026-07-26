@@ -54,6 +54,10 @@ ENTRY_VARIANTS = {
     "accum_bsk256": ("blockwise_accum_bsk256_kernel_entry.cu.in", "blockwise_accum_bsk256_gemm_run", False, "_accum_bsk256"),
     "accum_bsk512": ("blockwise_accum_bsk512_kernel_entry.cu.in", "blockwise_accum_bsk512_gemm_run", False, "_accum_bsk512"),
     "accum_bsk1024": ("blockwise_accum_bsk1024_kernel_entry.cu.in", "blockwise_accum_bsk1024_gemm_run", False, "_accum_bsk1024"),
+    # R10: F16 in-block accumulator (ACC_RAW_F16). 2x QMMA issue rate on
+    # sm_120 → 168-169 TF at large shapes (1.7-3.1x over F32 R6/R7).
+    # Overflow boundary documented in the entry file.
+    "accum_bsk128_f16": ("blockwise_accum_bsk128_f16_kernel_entry.cu.in", "blockwise_accum_bsk128_f16_gemm_run", False, "_accum_bsk128_f16"),
     # 32×32 BLOCK_TILE_SCALE with FP32 scales (SCALE_FP32=true). Only
     # valid for the bm64_bn128_bk128_s2_cwg2_wm32_wn32 config because
     # the static_asserts require WARP_N >= BLOCK_OUT_N. See
@@ -76,7 +80,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--arch", default="sm_120")
     parser.add_argument(
-        "--variant", choices=["single", "dual", "1x64", "64x64", "64x64_persistent", "128x128", "256x256", "64x64_ksk128", "accum_bsk128", "accum_bsk256", "accum_bsk512", "accum_bsk1024", "32x32", "all"], default="all",
+        "--variant", choices=["single", "dual", "1x64", "64x64", "64x64_persistent", "128x128", "256x256", "64x64_ksk128", "accum_bsk128", "accum_bsk256", "accum_bsk512", "accum_bsk1024", "accum_bsk128_f16", "32x32", "all"], default="all",
         help="single=1×32 R0, dual=1×32 R5 (dual-accumulator), 1x64=R5b-strip (1×64 per-row×per-col), 64x64=R5b-square (per-(m_tile, n_tile), **production pick**), 64x64_persistent=PERSISTENT work-stealing variant of 64x64 (1 CTA/SM, atomic tile counter — **experimental, REJECTED 2026-07-25: 0.96× strided + 74% med_rel**, see memory project_fp8_persistent_rejected), 128x128/256x256=coarser 2D-block sweep points, 64x64_ksk128=64×64 tile with full-BK K-block (LDG floor), 32x32=fine-grained 32×32 BLOCK + FP32 scales (precision-tight, see blockwise_32x32_kernel_entry.cu.in), all=all variants",
     )
     parser.add_argument("--config", choices=["all", *BASE_CONFIGS], default="all")
