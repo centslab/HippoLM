@@ -1,0 +1,48 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "MEMORY.md",
+    ".claude/rules/dont-target-v100.md",
+    ".claude/rules/einsum-noncontig-triton.md",
+    ".claude/rules/saved-tensors-not-hwm.md",
+    ".claude/rules/shim-deletion-protocol.md"
+  ],
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "python *": "allow",
+      "python3 *": "allow",
+      "nvidia-smi*": "allow",
+      "git *": "allow",
+      "pkill *": "allow",
+      "kill *": "allow",
+      "find *": "allow",
+      "ls *": "allow",
+      "pip *": "ask",
+      "pip install *": "deny",
+      "pip install --user *": "ask",
+      "curl *": "ask",
+      "sudo *": "deny",
+      "apt-get *": "deny",
+      "dpkg *": "deny",
+      "rm *": "ask",
+      "rm -rf *": "deny",
+      "sed *": "ask",
+      "sed -i*": "deny",
+      "mount *": "deny",
+      "apt *": "deny",
+      "setcap *": "deny",
+      "nvcc *": "ask"
+    },
+    "webfetch": {
+      "*": "ask",
+      "raw.githubusercontent.com/*": "allow",
+      "api.github.com/*": "allow"
+    }
+  },
+  "compaction": {
+    "auto": true
+  }
+}

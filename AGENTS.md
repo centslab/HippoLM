@@ -1,9 +1,9 @@
 # HippoLM Agent Instructions
 
-This file is the project orientation for AI coding agents (Claude
-Code, etc.). For development workflow conventions, see
+This file is the project orientation for AI coding agents (opencode
+and compatible tools). For development workflow conventions, see
 [`CONTRIBUTING.md`](CONTRIBUTING.md). Historical incidents and
-one-off debugging notes live in the project's auto-memory.
+one-off debugging notes live in [`MEMORY.md`](MEMORY.md).
 
 ## Overview
 
@@ -16,8 +16,8 @@ residual-aggregation scheme over block-level representations.
 June 2026). The earlier GDN2 (Gated DeltaNet 2) implementation
 has been fully removed. See
 [`docs/kda_kernel_structure.md`](docs/kda_kernel_structure.md)
-for the kernel-level design and the auto-memory for the historical
-EFKDA debugging notes that informed the production pin.
+for the kernel-level design and [`MEMORY.md`](MEMORY.md#efkda) for the
+historical EFKDA debugging notes that informed the production pin.
 
 The current design is intentionally experimental — see *Notes*
 at the bottom. Treat any specific architectural claim in the code
@@ -45,8 +45,9 @@ counts, block sizes, and precision flags.
   or single 5060 Ti 16G (sm_120, dev box). V100 (sm_70) was
   dropped on 2026-07-08 — Marlin FP4 + W4A16 NVFP4 FFN both
   require sm_80+ BF16 MMA, which V100 lacks. For the smoke-test
-  command and the 16 GB ceiling constraint, see the auto-memory
-  `project_hardware.md`. (See also `.claude/rules/dont-target-v100.md`.)
+  command and the 16 GB ceiling constraint, see
+  [`MEMORY.md`](MEMORY.md#hardware). (See also
+  `.claude/rules/dont-target-v100.md`.)
 - Training is data-parallel-style across the TP group: forward
   and backward on GPU, optimizer state on CPU pinned memory
   (BF16 for both AdamW and Muon; int8/mxfp8 Muon storage was
@@ -84,7 +85,8 @@ Marlin FP4 build and runtime notes live in
 FP8 E4M3 GEMM build + cross-arch dispatch in
 [`docs/fp8_gemm_kernel_pipeline.md`](docs/fp8_gemm_kernel_pipeline.md).
 For the correctness gate when sweeping kernel parameters, see
-[`.claude/skills/kda-correctness-sweep/SKILL.md`](.claude/skills/kda-correctness-sweep/SKILL.md).
+[`.claude/skills/kda-correctness-sweep/SKILL.md`](.claude/skills/kda-correctness-sweep/SKILL.md)
+(opencode loads skills from `.claude/skills/` automatically).
 
 ## Development Roadmap
 
@@ -115,9 +117,10 @@ HippoLM/
 ├── configs/
 │   ├── base.yml            # Canonical run configuration
 │   └── test/               # One .yml per e2e test scenario
+├── opencode.json            # opencode configuration (instructions, permissions)
 ├── .claude/
-│   ├── skills/             # Repo-local task workflows (indexed below)
-│   └── rules/              # Auto-injected scoped coding rules (indexed below)
+│   ├── skills/             # Repo-local task workflows (indexed below; opencode loads from here)
+│   └── rules/              # Scoped coding rules (loaded via opencode.json instructions)
 └── output/                 # Smoke runs write here (gitignored)
 ```
 
