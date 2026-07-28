@@ -5,6 +5,9 @@
 // rate on sm_120's consumer Blackwell tensor core:
 //   4096^3: 97.9 -> 168.3 TF (1.72x); M=8192/K=8192 shapes: 54 -> 169 TF (3.1x)
 // (= 96% of cuBLASLt nvjet TensorWise scalar at the same shapes).
+// NOTE (2026-07-27 audit): TF numbers used the buggy cudaEvent single-event
+// timing; real ~81 TF (1.74x ratio to R7 ~47 TF preserved). See memory
+// `feedback_cudaevent_2x_underreport_2026_07_27.md`.
 // Numerics: med_rel 0.107% -> 0.114% (Gaussian + sharp 2^-4..2^4
 // scales), ~100x below the FP8 floor. OVERFLOW BOUNDARY: acc_raw sums
 // 128 raw FP8 products in F16 (max 65504) before the FP32 flush —

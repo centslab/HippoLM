@@ -157,19 +157,28 @@ __device__ __forceinline__ uint32_t smem_u32(const void *smem_ptr)
     return static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
 }
 
-// 128B shared-memory swizzle offset. Each smem row must be 128 bytes
-// (BK=128 fp8) so one row = one swizzle span, matching the BF16
-// reference's 64-elem rows.
+// Shared-memory swizzle offset. row_elems = BK (row width in fp8 elements).
+// BK >= 128 → 128B swizzle (each row is one 128B swizzle segment,
+// XOR with (row & 7)).
+// BK < 128 → 64B swizzle (each row is one 64B swizzle segment,
+// BK=64 case, XOR with (row & 3)).
+// The row_elems parameter is always a compile-time constant (BK template
+// argument), so the branch is resolved at compile time.
 __device__ __forceinline__ int swizzle_smem_offset(int row, int col, int row_elems)
 {
-    constexpr int SWIZZLE_BYTES = 128;
-    int col_bytes = col;                       // ELEM_BYTES = 1
-    int seg = col_bytes / SWIZZLE_BYTES;
-    int in_seg = col_bytes % SWIZZLE_BYTES;
+    // BK=128: SWIZZLE_128B, 128B segments, 8 banks, XOR with (row & 7).
+    // BK=64:  SWIZZLE_NONE (sm_120 ldmatrix .aligned incompatibility
+    // with SWIZZLE_64B — ldmatrix uses hardcoded 8-bank XOR even with
+    // 64B TMA swizzle, which overflows 64B rows). Use no-swizzle layout.
+    if (row_elems < 128) {
+        return row * row_elems + col;  // no swizzle for BK=64
+    }
+    int seg = col / 128;
+    int in_seg = col % 128;
     int bank = in_seg >> 4;
     int off = in_seg & 0xF;
     int sw_bank = bank ^ (row & 7);
-    int sw_col = seg * SWIZZLE_BYTES + sw_bank * 16 + off;
+    int sw_col = seg * 128 + sw_bank * 16 + off;
     return row * row_elems + sw_col;
 }
 
@@ -213,7 +222,12 @@ struct FP8GemmMMA
                   "BLOCK_TILE_SCALE requires BLOCK_OUT_M %% WARP_M == 0 (warp fits one tile)");
     static_assert(BLOCK_TILE_SCALE == false || BLOCK_OUT_N % WARP_N == 0,
                   "BLOCK_TILE_SCALE requires BLOCK_OUT_N %% WARP_N == 0 (warp fits one tile)");
-    static_assert(BK == 128, "BK must be 128 (128B swizzle span per row)");
+    // BK: determines TMA swizzle mode.
+    // BK=128 → SWIZZLE_128B (8 banks per 128B segment, XOR with 3 row bits).
+    // BK=64  → SWIZZLE_64B (4 banks per 64B segment, XOR with 2 row bits).
+    // BK < 64 not supported (smem too narrow for ldmatrix + swizzle).
+    static_assert(BK == 64 || BK == 128,
+                  "BK must be 64 (SWIZZLE_64B) or 128 (SWIZZLE_128B)");
     static_assert(!BLOCKWISE_SCALE || (BLOCK_SCALE_K % 32 == 0),
                   "BLOCK_SCALE_K must be a multiple of 32 when BLOCKWISE_SCALE");
     static_assert(!BLOCKWISE_SCALE || BLOCK_ACCUM || BLOCK_SCALE_K <= 128,
@@ -227,7 +241,14 @@ struct FP8GemmMMA
     // variant. On sm_120 the F16-acc QMMA sustains ~2x the F32-acc
     // issue rate (consumer Blackwell tensor core; measured 97.9 ->
     // 168.3 TF @ 4096^3 = 1.72x, and the M>=4096/K>=8192 shapes go
-    // 54 -> 169 TF = 3.1x). Numerics: F16 mantissa 2^-11 ~= 0.05%
+    // 54 -> 169 TF = 3.1x).
+    //
+    // NOTE (2026-07-27 audit): the absolute TF numbers above used the
+    // buggy cudaEvent single-event timing pattern, which under-reports
+    // ctypes-loaded .so kernel time by ~2.07x on sm_120. Real numbers
+    // (via batched cudaEvent / torch.profiler): F32-acc ~47 TF, F16-acc
+    // ~81 TF, ratio 1.72x still holds. See memory
+    // `feedback_cudaevent_2x_underreport_2026_07_27.md` for the audit. Numerics: F16 mantissa 2^-11 ~= 0.05%
     // per 128-elem block partial, ~100x below the FP8 quantization
     // floor (med_rel 0.107% -> 0.114% on Gaussian data, stable under
     // sharp 2^-4..2^4 block scales). acc_raw registers halve
@@ -969,8 +990,18 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCK
         throw std::runtime_error("M, N, K must be divisible by BM, BN, BK respectively.");
     }
 
-    TMADescriptor tma_A = create_tma_desc_2d<fp8e4m3>(A, K, M, BK, BM, CU_TENSOR_MAP_SWIZZLE_128B);
-    TMADescriptor tma_B = create_tma_desc_2d<fp8e4m3>(B, K, N, BK, BN, CU_TENSOR_MAP_SWIZZLE_128B);
+    // TMA swizzle: BK=128 → SWIZZLE_128B (current production R10).
+    // BK=64 path is experimental (R11): SWIZZLE_NONE because
+    // sm_120 ldmatrix .aligned is hardwired to 8-bank XOR which
+    // overflows 64B rows with the matching 4-bank SWIZZLE_64B.
+    // The R11 path is documented in MEMORY.md as a dead end
+    // (R10 is already at ~95% of nvjet hardware ceiling).
+    TMADescriptor tma_A = create_tma_desc_2d<fp8e4m3>(
+        A, K, M, BK, BM,
+        BK >= 128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE);
+    TMADescriptor tma_B = create_tma_desc_2d<fp8e4m3>(
+        B, K, N, BK, BN,
+        BK >= 128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE);
     // Y row is BN bf16 = 256 bytes > 128B swizzle limit → no swizzle.
     // (Unused in DIRECT_STORE mode; created unconditionally to keep
     // the kernel signature fixed.)
