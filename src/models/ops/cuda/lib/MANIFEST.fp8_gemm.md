@@ -1,3 +1,10 @@
+
+> **⚠️ 2026-07-27 audit**: TF claims in this file may have used the
+> buggy cudaEvent single-event timing pattern (2.07x under-report on
+> sm_120 for ctypes-loaded .so kernels). Real numbers via batched
+> cudaEvent / torch.profiler are roughly half the absolute TF values.
+> See memory `feedback_cudaevent_2x_underreport_2026_07_27.md` and
+> skill `.claude/skills/bench-flops/SKILL.md`.
 # FP8 E4M3 GEMM — per-config `.so` manifest
 
 This directory holds **prebuilt FP8 E4M3 GEMM kernels** used as an
@@ -28,7 +35,6 @@ paying a ~30 s `nvcc` compile cost per config.
 | `fp8_gemm_sm_120_bm64_bn64_bk128_s2_cwg1_wm32_wn32.so`      | reference                                       | `gemm_run`     |
 | `fp8_gemm_sm_120_bm128_bn64_bk128_s3_cwg1_wm32_wn64_ds.so`  | reference                                       | `gemm_run`     |
 | `fp8_gemm_sm_120_bm64_bn128_bk128_s3_cwg1_wm32_wn64_ds.so`  | reference                                       | `gemm_run`     |
-| `fp8_gemm_cutlass_sm_120.so`                                 | **CUTLASS-based** (sm_120 blockwise path, mirrors official 87a). Per-MmaTile 128x128x128 scales; reference / future option. Not on prod path. | `cutlass_fp8_blockwise_gemm_run` |
 
 Naming: `{sm}_{tile-config}` where the tile config encodes the warp
 specialization layout. The `_ds` suffix means DIRECT_STORE epilogue

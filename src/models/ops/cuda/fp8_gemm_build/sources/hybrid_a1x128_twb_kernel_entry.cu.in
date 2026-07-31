@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: Apache-2.0
+// Hybrid GEMM with **per-row 1×128 A scale** + **TensorWise B scale**.
+// Removes the n_tile dimension from B scale (b_scale shape = [K/128],
+// scalar per K-block instead of [N/64, K/128]).
+//
+//   A : [M, K] FP8 E4M3, per-row 1×128 scale (BF16 or E8M0)
+//   B : [N, K] FP8 E4M3, **per-K-block scalar** (BF16 or E8M0)
+//
+// vs the 2D B scale variant (hybrid_a1x128):
+//   + Halves B scale tensor HBM (no N-tile dim).
+//   + Removes n_tile indexing from the B flush load (1 fewer multiply
+//     per (mi, ni) per K-block).
+//   + b_s broadcast across the entire CTA (still warp-constant via
+//     BLOCK_TILE_SCALE).
+//   - B precision drops: 1 scalar per K-block = much coarser than
+//     2D 64×128. Use only if 1 scalar per K-block is acceptable.
+//
+// Same R10 strategy everywhere else: BK=128, BLOCK_ACCUM=true (chain=4),
+// ACC_RAW_F16=true, DIRECT_STORE=true.
+#include "fp8_gemm.cuh"
+
+extern "C" void hybrid_a1x128_twb_bf16_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const void *a_scale, const void *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE,
+               /*BLOCKWISE_SCALE=*/true, /*DUAL_ACCUM=*/false,
+               /*BLOCK_SCALE_K=*/128,
+               /*BLOCK_TILE_SCALE=*/true, /*BLOCK_OUT_M=*/64,
+               /*BLOCK_OUT_N=*/64, /*BLOCK_ACCUM=*/true,
+               /*SCALE_FP32=*/false, /*PERSISTENT=*/false,
+               /*ACC_RAW_F16=*/true,
+               /*A_SCALE_1D_BLOCK=*/true, /*A_BLOCK_SCALE_K=*/128,
+               /*B_BLOCK_SCALE_K=*/128,
+               /*A_SCALE_E8M0=*/false,
+               /*A_SCALE_K_MAJOR=*/false,
+               /*A_SCALE_ROW_PAIR=*/false,
+               /*B_SCALE_TENSORWISE=*/true>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        nullptr, nullptr,
+        reinterpret_cast<const void *>(a_scale),
+        reinterpret_cast<const void *>(b_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}
+
+extern "C" void hybrid_a1x128_twb_e8m0_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const void *a_scale, const void *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE,
+               /*BLOCKWISE_SCALE=*/true, /*DUAL_ACCUM=*/false,
+               /*BLOCK_SCALE_K=*/128,
+               /*BLOCK_TILE_SCALE=*/true, /*BLOCK_OUT_M=*/64,
+               /*BLOCK_OUT_N=*/64, /*BLOCK_ACCUM=*/true,
+               /*SCALE_FP32=*/false, /*PERSISTENT=*/false,
+               /*ACC_RAW_F16=*/true,
+               /*A_SCALE_1D_BLOCK=*/true, /*A_BLOCK_SCALE_K=*/128,
+               /*B_BLOCK_SCALE_K=*/128,
+               /*A_SCALE_E8M0=*/true,
+               /*A_SCALE_K_MAJOR=*/false,
+               /*A_SCALE_ROW_PAIR=*/false,
+               /*B_SCALE_TENSORWISE=*/true>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        nullptr, nullptr,
+        reinterpret_cast<const void *>(a_scale),
+        reinterpret_cast<const void *>(b_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}

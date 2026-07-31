@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: Apache-2.0
+// W8A8 (1×128 A + tensorwise B) with **F32 accumulator** for overflow safety.
+//
+// Same shape as hybrid_a1x128_twb (per-row 1×128 A scale + scalar B
+// scale) but with ACC_RAW_F16=false. R10's F16 in-block accumulator
+// has a provable overflow boundary (sum of 128 raw FP8 products in
+// F16 — max 25.7M vs F16 max 65504) that only holds for well-behaved
+// Gaussian data; adversarial max-magnitude inputs NaN out. The F32
+// path is provably safe and ~58% of R10's speed (~47 TF vs ~81 TF at
+// 4096³ on sm_120 post-audit 2026-07-27). This is the right default
+// for production W8A8 training. See MEMORY.md "W8A8 F16-acc
+// overflow — strategy" (2026-07-31).
+//
+//   A : [M, K] FP8 E4M3, per-row 1×128 scale (BF16 or E8M0)
+//   B : [N, K] FP8 E4M3, per-K-block scalar (BF16 or E8M0)
+//   Y : [M, N] BF16
+//
+// Same R10 strategy everywhere else: BK=128, BLOCK_ACCUM=true (chain=4),
+// DIRECT_STORE=true.
+#include "fp8_gemm.cuh"
+
+extern "C" void hybrid_a1x128_twb_f32_bf16_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const void *a_scale, const void *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE,
+               /*BLOCKWISE_SCALE=*/true, /*DUAL_ACCUM=*/false,
+               /*BLOCK_SCALE_K=*/128,
+               /*BLOCK_TILE_SCALE=*/true, /*BLOCK_OUT_M=*/64,
+               /*BLOCK_OUT_N=*/64, /*BLOCK_ACCUM=*/true,
+               /*SCALE_FP32=*/false, /*PERSISTENT=*/false,
+               /*ACC_RAW_F16=*/false,
+               /*A_SCALE_1D_BLOCK=*/true, /*A_BLOCK_SCALE_K=*/128,
+               /*B_BLOCK_SCALE_K=*/128,
+               /*A_SCALE_E8M0=*/false,
+               /*A_SCALE_K_MAJOR=*/false,
+               /*A_SCALE_ROW_PAIR=*/false,
+               /*B_SCALE_TENSORWISE=*/true>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        nullptr, nullptr,
+        reinterpret_cast<const void *>(a_scale),
+        reinterpret_cast<const void *>(b_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}
+
+extern "C" void hybrid_a1x128_twb_f32_e8m0_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B, void *Y,
+    const void *a_scale, const void *b_scale,
+    void *workspace, cudaStream_t stream)
+{
+    (void)workspace;
+    FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE,
+               /*BLOCKWISE_SCALE=*/true, /*DUAL_ACCUM=*/false,
+               /*BLOCK_SCALE_K=*/128,
+               /*BLOCK_TILE_SCALE=*/true, /*BLOCK_OUT_M=*/64,
+               /*BLOCK_OUT_N=*/64, /*BLOCK_ACCUM=*/true,
+               /*SCALE_FP32=*/false, /*PERSISTENT=*/false,
+               /*ACC_RAW_F16=*/false,
+               /*A_SCALE_1D_BLOCK=*/true, /*A_BLOCK_SCALE_K=*/128,
+               /*B_BLOCK_SCALE_K=*/128,
+               /*A_SCALE_E8M0=*/true,
+               /*A_SCALE_K_MAJOR=*/false,
+               /*A_SCALE_ROW_PAIR=*/false,
+               /*B_SCALE_TENSORWISE=*/true>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const fp8e4m3 *>(B),
+        nullptr, nullptr,
+        reinterpret_cast<const void *>(a_scale),
+        reinterpret_cast<const void *>(b_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}

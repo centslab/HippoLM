@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: Apache-2.0
+// W4A8 native GEMM entry — FP8 A (1×128 BF16 scale) + NVFP4 B + FP8 MMA
+// → BF16 output, with NVFP4→FP8 dequant inside the GEMM pipeline.
+//
+// Smem: BF16 A would cost 32 KB/stage; this variant uses pre-quantized
+// FP8 A (16 KB/stage) and instead dequantizes NVFP4 B in the consumer.
+// B HBM drops from 2.5 MK (NVFP4 read + FP8 dequant write + FP8 read)
+// to 0.5 MK (NVFP4 read in GEMM only) — the dominant savings of the
+// W4A8 fusion plan. See MEMORY.md "W4A8 native — plan" (2026-07-31).
+//
+// Stage-2 (BF16 A input + in-pipeline A quant) is a follow-up — same
+// template + A_BF16_INPUT=true once we prove this stage works.
+//
+// F32 acc (overflow-safe default per MEMORY.md "W8A8 F16-acc overflow
+// — strategy" 2026-07-31). B scale (per-microblock E4M3 + global
+// scalar) is folded into the dequant; only the per-row × per-K-block
+// A scale (1×128 BF16) is applied at the chain flush.
+//
+// Args:
+//   M, N, K    : GEMM dimensions (must be multiples of 128)
+//   A          : [M, K]     fp8_e4m3fn (per-row 1×128 BF16-quantized)
+//   B_packed   : [N, K/2]   uint8 NVFP4 packed (2 nibbles/byte)
+//   B_scales   : [N, K/16]  fp8_e4m3fn E4M3 microblock scales
+//   B_global   : [1]        FP32 scalar global scale
+//   a_scale_row: [M]        FP32 per-row amax/E4M3_MAX (kept for API compat)
+//   a_block_scale: [M, K/128] BF16 per-row 1×128 scale
+//   b_block_scale: [K/128]   BF16 tensorwise B scale (NOT USED — b scale
+//                            folded into the dequant. Kept for API compat.)
+//   Y          : [M, N]     BF16 output
+// Hard-coded tile config (sm_120 sweet spot, see w4a8_gemm.cuh header)
+#ifndef W4A8_BM
+#define W4A8_BM 128
+#endif
+#ifndef W4A8_BN
+#define W4A8_BN 128
+#endif
+#ifndef W4A8_BK
+#define W4A8_BK 128
+#endif
+#ifndef W4A8_NUM_STAGES
+#define W4A8_NUM_STAGES 2
+#endif
+#ifndef W4A8_CWG
+#define W4A8_CWG 2
+#endif
+#ifndef W4A8_WARP_M
+#define W4A8_WARP_M 32
+#endif
+#ifndef W4A8_WARP_N
+#define W4A8_WARP_N 64
+#endif
+#ifndef W4A8_DIRECT_STORE
+#define W4A8_DIRECT_STORE true
+#endif
+
+#include "w4a8_gemm.cuh"
+
+extern "C" void w4a8_gemm_run(
+    int M, int N, int K,
+    const void *A, const void *B_packed, const void *B_scales, const void *B_global,
+    const void *a_scale_row,
+    const void *a_block_scale, const void *b_block_scale,
+    void *Y, void *workspace, void *unused_dbg, cudaStream_t stream)
+{
+    (void)workspace;
+    (void)unused_dbg;
+    (void)b_block_scale;  // B scale is folded into the dequant; arg kept for API parity
+    W4A8GemmMMA<W4A8_BM, W4A8_BN, W4A8_BK, W4A8_NUM_STAGES, W4A8_CWG,
+                W4A8_WARP_M, W4A8_WARP_N, W4A8_DIRECT_STORE,
+                /*BLOCK_SCALE_K=*/128, /*BLOCK_OUT_M=*/64, /*BLOCK_OUT_N=*/64,
+                /*BLOCK_ACCUM=*/true, /*PERSISTENT=*/false>::run(
+        M, N, K,
+        reinterpret_cast<const fp8e4m3 *>(A),
+        reinterpret_cast<const uint8_t *>(B_packed),
+        reinterpret_cast<const fp8e4m3 *>(B_scales),
+        reinterpret_cast<const float *>(B_global),
+        reinterpret_cast<const float *>(a_scale_row),
+        reinterpret_cast<const bf16 *>(a_block_scale),
+        reinterpret_cast<const bf16 *>(b_block_scale),
+        reinterpret_cast<bf16 *>(Y),
+        /*tile_counter=*/nullptr,
+        stream);
+}

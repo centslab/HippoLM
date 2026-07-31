@@ -28,6 +28,7 @@
 //     are loaded per-lane and multiplied before the BF16 RNE narrow.
 #pragma once
 #include "common.h"
+#include "gemm_helpers.cuh"
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -37,150 +38,6 @@
 using fp8e4m3 = __nv_fp8_e4m3;
 using bf16 = __nv_bfloat16;
 using bf16_2 = __nv_bfloat162;
-
-__device__ __forceinline__ uint32_t f32x2_to_bf16x2(float a, float b)
-{
-    bf16_2 v = __floats2bfloat162_rn(a, b);
-    uint32_t r;
-    memcpy(&r, &v, 4);
-    return r;
-}
-
-// ── TMA descriptor (host-side, 128 bytes = CUtensorMap) ─────────────
-struct TMADescriptor
-{
-    alignas(64) uint64_t raw[16];
-
-    __device__ __forceinline__ void load_2d(uint32_t tile_coord0, uint32_t tile_coord1,
-                                            uint64_t smem_addr, uint64_t mbar_addr) const
-    {
-        asm volatile(
-            "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
-            " [%0], [%1, {%2, %3}], [%4];"
-            :
-            : "l"(smem_addr), "l"((const uint64_t *)raw), "r"(tile_coord0), "r"(tile_coord1),
-              "r"((uint32_t)mbar_addr)
-            : "memory");
-    }
-};
-
-__device__ __forceinline__ void tma_store_2d(
-    const uint64_t *tma_desc,
-    uint32_t tile_coord0, uint32_t tile_coord1,
-    uint64_t smem_addr)
-{
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group"
-        " [%0, {%1, %2}], [%3];" ::
-            "l"(tma_desc),
-        "r"(tile_coord0), "r"(tile_coord1),
-        "l"(smem_addr)
-        : "memory");
-}
-
-__device__ __forceinline__ void tma_store_arrive()
-{
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-
-__device__ __forceinline__ void tma_store_wait()
-{
-    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-}
-
-// Host-side: create a 2D TMA descriptor.
-//   globalDim0 = inner-most (contiguous) dim, globalDim1 = outer dim
-//   boxDim0/1  = tile sizes along each dim
-template <typename T>
-static inline TMADescriptor create_tma_desc_2d(
-    const T *gmem_ptr,
-    uint32_t globalDim0, uint32_t globalDim1,
-    uint32_t boxDim0, uint32_t boxDim1,
-    CUtensorMapSwizzle swizzle)
-{
-    TMADescriptor desc{};
-    CUtensorMap *map = reinterpret_cast<CUtensorMap *>(&desc.raw);
-
-    uint64_t globalDims[2] = {globalDim0, globalDim1};
-    uint64_t globalStrides[1] = {globalDim0 * sizeof(T)};
-    uint32_t boxDims[2] = {boxDim0, boxDim1};
-    uint32_t elementStrides[2] = {1, 1};
-
-    CUresult res = cuTensorMapEncodeTiled(
-        map,
-        std::is_same<T, fp8e4m3>::value ? CU_TENSOR_MAP_DATA_TYPE_UINT8
-                                        : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        2, (void *)gmem_ptr, globalDims, globalStrides, boxDims, elementStrides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    if (res != CUDA_SUCCESS)
-    {
-        const char *errStr = nullptr;
-        cuGetErrorString(res, &errStr);
-        fprintf(stderr, "cuTensorMapEncodeTiled failed: %s\n", errStr ? errStr : "unknown");
-        exit(EXIT_FAILURE);
-    }
-    return desc;
-}
-
-// ── mbarrier helpers ───────────────────────────────────────────────
-__device__ __forceinline__ void mbarrier_init(uint64_t *mbar, uint32_t count)
-{
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"l"(mbar), "r"(count) : "memory");
-}
-__device__ __forceinline__ void mbarrier_inval(uint64_t *mbar)
-{
-    asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"l"(mbar) : "memory");
-}
-__device__ __forceinline__ void mbarrier_expect_tx(uint64_t smem_mbar_addr, uint32_t bytes)
-{
-    asm volatile(
-        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"l"(smem_mbar_addr), "r"(bytes) : "memory");
-}
-__device__ __forceinline__ void mbarrier_arrive(uint64_t smem_mbar_addr)
-{
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"l"(smem_mbar_addr) : "memory");
-}
-__device__ __forceinline__ void mbarrier_wait(uint64_t smem_mbar_addr, uint32_t phase)
-{
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        "WAIT_LOOP:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-        "@!p bra WAIT_LOOP;\n"
-        "}\n" ::"l"(smem_mbar_addr),
-        "r"(phase) : "memory");
-}
-__device__ __forceinline__ uint32_t smem_u32(const void *smem_ptr)
-{
-    return static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-}
-
-// Shared-memory swizzle offset. row_elems = BK (row width in fp8 elements).
-// BK >= 128 → 128B swizzle (each row is one 128B swizzle segment,
-// XOR with (row & 7)).
-// BK < 128 → 64B swizzle (each row is one 64B swizzle segment,
-// BK=64 case, XOR with (row & 3)).
-// The row_elems parameter is always a compile-time constant (BK template
-// argument), so the branch is resolved at compile time.
-__device__ __forceinline__ int swizzle_smem_offset(int row, int col, int row_elems)
-{
-    // BK=128: SWIZZLE_128B, 128B segments, 8 banks, XOR with (row & 7).
-    // BK=64:  SWIZZLE_NONE (sm_120 ldmatrix .aligned incompatibility
-    // with SWIZZLE_64B — ldmatrix uses hardcoded 8-bank XOR even with
-    // 64B TMA swizzle, which overflows 64B rows). Use no-swizzle layout.
-    if (row_elems < 128) {
-        return row * row_elems + col;  // no swizzle for BK=64
-    }
-    int seg = col / 128;
-    int in_seg = col % 128;
-    int bank = in_seg >> 4;
-    int off = in_seg & 0xF;
-    int sw_bank = bank ^ (row & 7);
-    int sw_col = seg * 128 + sw_bank * 16 + off;
-    return row * row_elems + sw_col;
-}
 
 // ════════════════════════════════════════════════════════════════════════
 // FP8GemmMMA — TMA + warp specialization + m16n8k16 FP8 MMA
@@ -193,9 +50,108 @@ template <int BM, int BN, int BK, int NUM_STAGES, int CWG,
           bool BLOCK_ACCUM = false,
           bool SCALE_FP32 = false,
           bool PERSISTENT = false,
-          bool ACC_RAW_F16 = false>
+          bool ACC_RAW_F16 = false,
+          // Hybrid (FSFP8) GEMM: per-tensor scale format
+          //   A_SCALE_1D_BLOCK=true  → A is per-row × per-A_BLOCK_SCALE_K (1D).
+          //   A_BLOCK_SCALE_K        → A's K-block granularity (= BLOCK_SCALE_K
+          //                             today; the chain is one BLOCK_SCALE_K
+          //                             window).
+          //   B_BLOCK_SCALE_K        → B's natural 2D scale K-block granularity.
+          //                             Defaults to BLOCK_SCALE_K (uniform).
+          //                             For hybrid (FSFP8), B_BLOCK_SCALE_K=128
+          //                             (2D 64×128) while BLOCK_SCALE_K=64.
+          //                             Also valid: B_BLOCK_SCALE_K=64 for the
+          //                             finer hybrid_b64 variant.
+          //   A_SCALE_E8M0           → A scale is 1 byte OCP MX 1.0 E8M0.
+          // Only meaningful with BLOCKWISE_SCALE=true and BLOCK_ACCUM=true.
+          // B side stays 2D (BLOCK_OUT_M × BLOCK_OUT_N × B_BLOCK_SCALE_K, BF16).
+          bool A_SCALE_1D_BLOCK = false,
+          int  A_BLOCK_SCALE_K = 0,
+          int  B_BLOCK_SCALE_K = -1,
+          bool A_SCALE_E8M0 = false,
+          // A_SCALE_K_MAJOR: when true with A_SCALE_1D_BLOCK, the
+          // host passes a_block_scale in per-K-major layout
+          // [K/A_BLOCK_SCALE_K, M] (instead of per-row-major
+          // [M, K/A_BLOCK_SCALE_K]). The K-major layout means all M
+          // rows of one K-block live in one contiguous row of the
+          // scale tensor — the entire m16 tile's 16 rows of a_s are
+          // 32 contiguous BF16 (or 16 contiguous E8M0 bytes),
+          // enabling 1 LDG.b64 / LDG.b32 per warp per K-block
+          // (replacing the per-row-major path's 2 LDG.b16). Stride
+          // computation: per-row-major → row stride = scale_cols =
+          // K/A_BLOCK_SCALE_K; per-K-major → row stride = M. Only
+          // meaningful with A_SCALE_1D_BLOCK=true (BLOCK_TILE_SCALE
+          // path keeps per-row-major indexing since a_s is warp-
+          // constant there).
+          bool A_SCALE_K_MAJOR = false,
+          // A_SCALE_ROW_PAIR: when true with A_SCALE_1D_BLOCK and
+          // A_BLOCK_SCALE_K=128, the host passes a_block_scale in
+          // per-row-pair packed layout [K/128, M/16, 2] (BF16 or
+          // E8M0). a_s0[m_pair] and a_s1[m_pair+8] (the two scales
+          // for one row pair (g, g+8) within the m16 tile) sit in
+          // 2 adjacent bytes, so 1 LDG.b32 (or LDG.b16 for E8M0)
+          // loads both — cutting LDG instruction count in half vs
+          // A_SCALE_K_MAJOR=false (current row-major path, 2 LDG.b16
+          // per row pair). Convert via __bfloat1622float2 instead of
+          // 2 × __bfloat162float. Stride computation: row-pair stride
+          // = 2 (within one K-block), K-stride = (M/16) * 2 (between
+          // K-blocks). Only meaningful with A_SCALE_1D_BLOCK=true.
+          bool A_SCALE_ROW_PAIR = false,
+          // B_SCALE_TENSORWISE: when true, the host passes
+          // b_block_scale as a per-K-block scalar [K/B_BLOCK_SCALE_K]
+          // instead of the 2D layout [N/64, K/B_BLOCK_SCALE_K].
+          // Combined with A_SCALE_1D_BLOCK=true, gives a true mixed
+          // FSFP8 scheme: per-row 1×128 A scale + scalar B scale.
+          // Removes the n_tile dim from the B flush load (1 fewer
+          // multiply per (mi, ni) per K-block), and halves the B
+          // scale tensor HBM. Only meaningful with BLOCK_TILE_SCALE
+          // (b_s remains warp-constant since it's broadcast across
+          // the entire CTA).
+          bool B_SCALE_TENSORWISE = false,
+          // B_SCALE_E8M0: when true, b_block_scale is uint8 E8M0
+          // (1 byte per scale, decoded via e8m0_to_float() on load).
+          // Default B scale dtype is BF16 (2 bytes). E8M0 halves B
+          // scale HBM but is power-of-2 quantized (coarser). Only
+          // meaningful with BLOCKWISE_SCALE (blockwise/tensorwise
+          // B scale layout).
+          bool B_SCALE_E8M0 = false>
 struct FP8GemmMMA
 {
+    // A_SCALE_1D_BLOCK: A scale is 1D (per-row, per-A_BLOCK_SCALE_K),
+    // B scale is 2D (per-(m_tile, n_tile), per-B_BLOCK_SCALE_K).
+    // The BLOCK_ACCUM flush combines them: a_s varies per lane (per-row),
+    // b_s is warp-constant (per-N-tile, since WARP_N >= BLOCK_OUT_N).
+    // The BLOCK_ACCUM chain spans BLOCK_SCALE_K elements (= A_BLOCK_SCALE_K
+    // in the hybrid); B's 2D scale granularity B_BLOCK_SCALE_K may be
+    // coarser (B_BLOCK_SCALE_K >= BLOCK_SCALE_K). When B_BLOCK_SCALE_K >
+    // BLOCK_SCALE_K, multiple chain flushes within a B-block share the same
+    // B scale value.
+    static_assert(!A_SCALE_1D_BLOCK || BLOCKWISE_SCALE,
+                  "A_SCALE_1D_BLOCK requires BLOCKWISE_SCALE");
+    static_assert(!A_SCALE_1D_BLOCK || BLOCK_ACCUM,
+                  "A_SCALE_1D_BLOCK requires BLOCK_ACCUM (chain within block)");
+    static_assert(!A_SCALE_1D_BLOCK || BLOCK_TILE_SCALE,
+                  "A_SCALE_1D_BLOCK requires BLOCK_TILE_SCALE on B side");
+    static_assert(!A_SCALE_1D_BLOCK || A_BLOCK_SCALE_K == BLOCK_SCALE_K,
+                  "A_BLOCK_SCALE_K must equal BLOCK_SCALE_K (single chain window)");
+    static_assert(B_BLOCK_SCALE_K == -1 || B_BLOCK_SCALE_K >= BLOCK_SCALE_K,
+                  "B_BLOCK_SCALE_K must be >= BLOCK_SCALE_K (or -1 for default)");
+    static_assert(B_BLOCK_SCALE_K == -1 || B_BLOCK_SCALE_K % BLOCK_SCALE_K == 0,
+                  "B_BLOCK_SCALE_K must be a multiple of BLOCK_SCALE_K (or -1 for default)");
+    static_assert(!A_SCALE_E8M0  || A_SCALE_1D_BLOCK,
+                  "A_SCALE_E8M0 only meaningful with A_SCALE_1D_BLOCK");
+    static_assert(!A_SCALE_K_MAJOR || A_SCALE_1D_BLOCK,
+                  "A_SCALE_K_MAJOR only meaningful with A_SCALE_1D_BLOCK (per-row A scale)");
+    static_assert(!A_SCALE_ROW_PAIR || A_SCALE_1D_BLOCK,
+                  "A_SCALE_ROW_PAIR only meaningful with A_SCALE_1D_BLOCK (per-row A scale)");
+    static_assert(!B_SCALE_TENSORWISE || BLOCK_TILE_SCALE,
+                  "B_SCALE_TENSORWISE only meaningful with BLOCK_TILE_SCALE (b_s warp-constant path)");
+    static_assert(!B_SCALE_E8M0 || BLOCKWISE_SCALE,
+                  "B_SCALE_E8M0 only meaningful with BLOCKWISE_SCALE (block scale B)");
+
+    // Effective B_BLOCK_SCALE_K (uniform path → BLOCK_SCALE_K).
+    static constexpr int EFFECTIVE_B_BLOCK_SCALE_K =
+        (B_BLOCK_SCALE_K == -1) ? BLOCK_SCALE_K : B_BLOCK_SCALE_K;
     // SCALE_FP32: when true, a_block_scale/b_block_scale are FP32
     // (the BLOCK_ACCUM chain accumulates in FP32 — ACC_RAW_F16=false;
     // an .f16-acc variant exists on sm_120 and runs at 2x rate, see
@@ -336,8 +292,8 @@ struct FP8GemmMMA
 };
 
 // ── FP8 MMA kernel ───────────────────────────────────────────────────
-template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT, bool ACC_RAW_F16>
-__global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>::TOTAL_THREADS, 1, 1)
+template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT, bool ACC_RAW_F16, bool A_SCALE_1D_BLOCK, int A_BLOCK_SCALE_K, int B_BLOCK_SCALE_K, bool A_SCALE_E8M0, bool A_SCALE_K_MAJOR, bool A_SCALE_ROW_PAIR, bool B_SCALE_TENSORWISE, bool B_SCALE_E8M0>
+__global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16, A_SCALE_1D_BLOCK, A_BLOCK_SCALE_K, B_BLOCK_SCALE_K, A_SCALE_E8M0, A_SCALE_K_MAJOR, A_SCALE_ROW_PAIR, B_SCALE_TENSORWISE, B_SCALE_E8M0>::TOTAL_THREADS, 1, 1)
     fp8_gemm_mma_kernel(
         int M, int N, int K,
         int num_tiles_m, int num_tiles_n, int total_tiles,
@@ -354,7 +310,7 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
         // zero-initializes this in run() before launch.
         uint32_t *__restrict__ tile_counter)
 {
-    using P = FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>;
+    using P = FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16, A_SCALE_1D_BLOCK, A_BLOCK_SCALE_K, B_BLOCK_SCALE_K, A_SCALE_E8M0, A_SCALE_K_MAJOR, A_SCALE_ROW_PAIR, B_SCALE_TENSORWISE, B_SCALE_E8M0>;
     using SmemStorage = typename P::SMemStorage;
 
     extern __shared__ __align__(128) char smem_raw[];
@@ -610,38 +566,182 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
                                 {
                                     const int scale_cols = K / BLOCK_SCALE_K;
                                     const int scale_k = global_sub / P::SUB_MMAS_PER_SCALE;
-                                    const int m_tile = (bm * BM + m_warp_base) / BLOCK_OUT_M;
-                                    const int n_tile = (bn * BN + n_warp_base) / BLOCK_OUT_N;
-                                    float a_s, b_s;
-                                    if constexpr (SCALE_FP32) {
-                                        a_s = reinterpret_cast<const float *>(a_block_scale)[m_tile * scale_cols + scale_k];
-                                        b_s = reinterpret_cast<const float *>(b_block_scale)[n_tile * scale_cols + scale_k];
-                                    } else {
-                                        a_s = __bfloat162float(reinterpret_cast<const bf16 *>(a_block_scale)[m_tile * scale_cols + scale_k]);
-                                        b_s = __bfloat162float(reinterpret_cast<const bf16 *>(b_block_scale)[n_tile * scale_cols + scale_k]);
-                                    }
-                                    const float s = a_s * b_s;
-                                    if constexpr (ACC_RAW_F16)
+                                    if constexpr (A_SCALE_1D_BLOCK)
                                     {
-                                        float2 f01 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][0]));
-                                        float2 f23 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][1]));
-                                        acc[mi][ni][0] = fmaf(f01.x, s, acc[mi][ni][0]);
-                                        acc[mi][ni][1] = fmaf(f01.y, s, acc[mi][ni][1]);
-                                        acc[mi][ni][2] = fmaf(f23.x, s, acc[mi][ni][2]);
-                                        acc[mi][ni][3] = fmaf(f23.y, s, acc[mi][ni][3]);
-                                        acc_raw_f16[mi][ni][0] = 0u;
-                                        acc_raw_f16[mi][ni][1] = 0u;
+                                        // Hybrid: per-row A scale (1D, varies by
+                                        // lane_id>>2), per-N-tile B scale (warp-
+                                        // constant since WARP_N >= BLOCK_OUT_N).
+                                        // Layouts:
+                                        //   A [M, K / A_BLOCK_SCALE_K]            (per-row-major, default)
+                                        //   A [K / A_BLOCK_SCALE_K, M]            (per-K-major, A_SCALE_K_MAJOR=true)
+                                        //   A [K / A_BLOCK_SCALE_K, M/16, 2]      (per-row-pair packed, A_SCALE_ROW_PAIR=true)
+                                        //   B [N/64, K / B_BLOCK_SCALE_K]         BF16
+                                        // B's natural 2D scale (B_BLOCK_SCALE_K) may be
+                                        // coarser than the chain granularity BLOCK_SCALE_K
+                                        // (= A_BLOCK_SCALE_K here): when
+                                        // B_BLOCK_SCALE_K > BLOCK_SCALE_K, multiple chain
+                                        // flushes within a B-block share the same b_s.
+                                        const int out_row0 = bm * BM + m_base + (lane_id >> 2);
+                                        const int n_tile = (bn * BN + n_warp_base) / BLOCK_OUT_N;
+                                        // B's natural scale stride is EFFECTIVE_B_BLOCK_SCALE_K,
+                                        // which may differ from BLOCK_SCALE_K when B is coarser.
+                                        constexpr int B_SCALE_REPEAT = P::EFFECTIVE_B_BLOCK_SCALE_K / BLOCK_SCALE_K;
+                                        const int b_scale_cols = K / P::EFFECTIVE_B_BLOCK_SCALE_K;
+                                        const int b_scale_k = scale_k / B_SCALE_REPEAT;
+                                        // A scale base index: per-row-major uses (row, k)
+                                        // with row stride = scale_cols; per-K-major uses
+                                        // (k, row) with row stride = 1; per-row-pair
+                                        // packed uses (k, m_pair, 0/1) where m_pair =
+                                        // (bm*BM + m_base) / 16 + g — a_s0[m_pair]
+                                        // and a_s1[m_pair] (the two scales for one row
+                                        // pair (g, g+8) within the m16 tile) sit in 2
+                                        // adjacent bytes, so 1 LDG.b32 loads both.
+                                        // m_pair = (bm * BM + m_base) / 16 + (lane_id >> 2) had a bug:
+// mi=0 g=1 and mi=1 g=0 collided on m_pair=bm*BM/16+1 but accessed
+// different rows (1+9 vs 16+24). Replace with explicit pair_row /
+// pair_idx decomposition: pair_row indexes 16-row groups in M, pair_idx
+// indexes the 8 sub-pairs within one group. (a_s0, a_s1) of sub-pair g
+// are at packed[k, pair_row, pair_idx*2 + 0/1] = 2 adjacent bytes.
+                                        const int r_for_pair = bm * BM + m_base + (lane_id >> 2);
+                                        const int pair_row = r_for_pair >> 4;  // /16
+                                        const int pair_idx = r_for_pair & 7;  // %8
+                                        const int a_pair_byte = A_SCALE_ROW_PAIR
+                                            ? ((scale_k * M + (pair_row << 4) + (pair_idx << 1)) * 2)
+                                            : 0;
+                                        const int a_row0_idx = A_SCALE_K_MAJOR
+                                            ? (scale_k * M + out_row0)
+                                            : (out_row0 * scale_cols + scale_k);
+                                        const int a_row1_idx = A_SCALE_K_MAJOR
+                                            ? (scale_k * M + out_row0 + 8)
+                                            : ((out_row0 + 8) * scale_cols + scale_k);
+                                        float a_s0, a_s1, b_s;
+                                        if constexpr (A_SCALE_E8M0) {
+                                            const auto a_es = reinterpret_cast<const uint8_t *>(a_block_scale);
+                                            const auto b_bs = reinterpret_cast<const bf16 *>(b_block_scale);
+                                            if constexpr (A_SCALE_ROW_PAIR) {
+                                                // 1 byte per scale; row-pair packed is
+                                                // still 2 bytes adjacent (uint8x2).
+                                                const uint16_t packed = *reinterpret_cast<const uint16_t *>(a_es + a_pair_byte);
+                                                a_s0 = e8m0_to_float((uint8_t)(packed & 0xff));
+                                                a_s1 = e8m0_to_float((uint8_t)(packed >> 8));
+                                            } else {
+                                                a_s0 = e8m0_to_float(a_es[a_row0_idx]);
+                                                a_s1 = e8m0_to_float(a_es[a_row1_idx]);
+                                            }
+                                            if constexpr (B_SCALE_E8M0) {
+                                                const auto b_es = reinterpret_cast<const uint8_t *>(b_block_scale);
+                                                if constexpr (B_SCALE_TENSORWISE) {
+                                                    b_s = e8m0_to_float(b_es[b_scale_k]);
+                                                } else {
+                                                    b_s = e8m0_to_float(b_es[n_tile * b_scale_cols + b_scale_k]);
+                                                }
+                                            } else {
+                                                if constexpr (B_SCALE_TENSORWISE) {
+                                                    b_s = __bfloat162float(b_bs[b_scale_k]);
+                                                } else {
+                                                    b_s = __bfloat162float(b_bs[n_tile * b_scale_cols + b_scale_k]);
+                                                }
+                                            }
+                                        } else if constexpr (SCALE_FP32) {
+                                            const auto a_fs = reinterpret_cast<const float *>(a_block_scale);
+                                            const auto b_fs = reinterpret_cast<const float *>(b_block_scale);
+                                            a_s0 = a_fs[a_row0_idx];
+                                            a_s1 = a_fs[a_row1_idx];
+                                            if constexpr (B_SCALE_TENSORWISE) {
+                                                b_s = b_fs[b_scale_k];
+                                            } else {
+                                                b_s = b_fs[n_tile * b_scale_cols + b_scale_k];
+                                            }
+                                        } else {
+                                            const auto a_bs = reinterpret_cast<const bf16 *>(a_block_scale);
+                                            const auto b_bs = reinterpret_cast<const bf16 *>(b_block_scale);
+                                            if constexpr (A_SCALE_ROW_PAIR) {
+                                                // 1 LDG.b32 (4 bytes) loads (a_s0, a_s1)
+                                                // packed as __nv_bfloat162; one
+                                                // __bfloat1622float2 convert gives 2 FP32.
+                                                const __nv_bfloat162 a_s01 = *reinterpret_cast<const __nv_bfloat162 *>(a_bs + a_pair_byte);
+                                                const float2 a_s01_f = __bfloat1622float2(a_s01);
+                                                a_s0 = a_s01_f.x;
+                                                a_s1 = a_s01_f.y;
+                                            } else {
+                                                a_s0 = __bfloat162float(a_bs[a_row0_idx]);
+                                                a_s1 = __bfloat162float(a_bs[a_row1_idx]);
+                                            }
+                                            if constexpr (B_SCALE_E8M0) {
+                                                const auto b_es = reinterpret_cast<const uint8_t *>(b_block_scale);
+                                                if constexpr (B_SCALE_TENSORWISE) {
+                                                    b_s = e8m0_to_float(b_es[b_scale_k]);
+                                                } else {
+                                                    b_s = e8m0_to_float(b_es[n_tile * b_scale_cols + b_scale_k]);
+                                                }
+                                            } else {
+                                                if constexpr (B_SCALE_TENSORWISE) {
+                                                    b_s = __bfloat162float(b_bs[b_scale_k]);
+                                                } else {
+                                                    b_s = __bfloat162float(b_bs[n_tile * b_scale_cols + b_scale_k]);
+                                                }
+                                            }
+                                        }
+                                        const float s0 = a_s0 * b_s;
+                                        const float s1 = a_s1 * b_s;
+                                        if constexpr (ACC_RAW_F16)
+                                        {
+                                            float2 f01 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][0]));
+                                            float2 f23 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][1]));
+                                            acc[mi][ni][0] = fmaf(f01.x, s0, acc[mi][ni][0]);
+                                            acc[mi][ni][1] = fmaf(f01.y, s0, acc[mi][ni][1]);
+                                            acc[mi][ni][2] = fmaf(f23.x, s1, acc[mi][ni][2]);
+                                            acc[mi][ni][3] = fmaf(f23.y, s1, acc[mi][ni][3]);
+                                            acc_raw_f16[mi][ni][0] = 0u;
+                                            acc_raw_f16[mi][ni][1] = 0u;
+                                        }
+                                        else
+                                        {
+                                            acc[mi][ni][0] = fmaf(acc_raw[mi][ni][0], s0, acc[mi][ni][0]);
+                                            acc[mi][ni][1] = fmaf(acc_raw[mi][ni][1], s0, acc[mi][ni][1]);
+                                            acc[mi][ni][2] = fmaf(acc_raw[mi][ni][2], s1, acc[mi][ni][2]);
+                                            acc[mi][ni][3] = fmaf(acc_raw[mi][ni][3], s1, acc[mi][ni][3]);
+                                            acc_raw[mi][ni][0] = 0.0f;
+                                            acc_raw[mi][ni][1] = 0.0f;
+                                            acc_raw[mi][ni][2] = 0.0f;
+                                            acc_raw[mi][ni][3] = 0.0f;
+                                        }
                                     }
                                     else
                                     {
-                                        acc[mi][ni][0] = fmaf(acc_raw[mi][ni][0], s, acc[mi][ni][0]);
-                                        acc[mi][ni][1] = fmaf(acc_raw[mi][ni][1], s, acc[mi][ni][1]);
-                                        acc[mi][ni][2] = fmaf(acc_raw[mi][ni][2], s, acc[mi][ni][2]);
-                                        acc[mi][ni][3] = fmaf(acc_raw[mi][ni][3], s, acc[mi][ni][3]);
-                                        acc_raw[mi][ni][0] = 0.0f;
-                                        acc_raw[mi][ni][1] = 0.0f;
-                                        acc_raw[mi][ni][2] = 0.0f;
-                                        acc_raw[mi][ni][3] = 0.0f;
+                                        const int m_tile = (bm * BM + m_warp_base) / BLOCK_OUT_M;
+                                        const int n_tile = (bn * BN + n_warp_base) / BLOCK_OUT_N;
+                                        float a_s, b_s;
+                                        if constexpr (SCALE_FP32) {
+                                            a_s = reinterpret_cast<const float *>(a_block_scale)[m_tile * scale_cols + scale_k];
+                                            b_s = reinterpret_cast<const float *>(b_block_scale)[n_tile * scale_cols + scale_k];
+                                        } else {
+                                            a_s = __bfloat162float(reinterpret_cast<const bf16 *>(a_block_scale)[m_tile * scale_cols + scale_k]);
+                                            b_s = __bfloat162float(reinterpret_cast<const bf16 *>(b_block_scale)[n_tile * scale_cols + scale_k]);
+                                        }
+                                        const float s = a_s * b_s;
+                                        if constexpr (ACC_RAW_F16)
+                                        {
+                                            float2 f01 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][0]));
+                                            float2 f23 = __half22float2(*reinterpret_cast<__half2 *>(&acc_raw_f16[mi][ni][1]));
+                                            acc[mi][ni][0] = fmaf(f01.x, s, acc[mi][ni][0]);
+                                            acc[mi][ni][1] = fmaf(f01.y, s, acc[mi][ni][1]);
+                                            acc[mi][ni][2] = fmaf(f23.x, s, acc[mi][ni][2]);
+                                            acc[mi][ni][3] = fmaf(f23.y, s, acc[mi][ni][3]);
+                                            acc_raw_f16[mi][ni][0] = 0u;
+                                            acc_raw_f16[mi][ni][1] = 0u;
+                                        }
+                                        else
+                                        {
+                                            acc[mi][ni][0] = fmaf(acc_raw[mi][ni][0], s, acc[mi][ni][0]);
+                                            acc[mi][ni][1] = fmaf(acc_raw[mi][ni][1], s, acc[mi][ni][1]);
+                                            acc[mi][ni][2] = fmaf(acc_raw[mi][ni][2], s, acc[mi][ni][2]);
+                                            acc[mi][ni][3] = fmaf(acc_raw[mi][ni][3], s, acc[mi][ni][3]);
+                                            acc_raw[mi][ni][0] = 0.0f;
+                                            acc_raw[mi][ni][1] = 0.0f;
+                                            acc_raw[mi][ni][2] = 0.0f;
+                                            acc_raw[mi][ni][3] = 0.0f;
+                                        }
                                     }
                                 }
                             }
@@ -969,8 +1069,8 @@ __global__ void __launch_bounds__(FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M
 }
 
 // ── Launch ───────────────────────────────────────────────────────────
-template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT, bool ACC_RAW_F16>
-void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>::run(
+template <int BM, int BN, int BK, int NUM_STAGES, int CWG, int WARP_M, int WARP_N, bool DIRECT_STORE, bool BLOCKWISE_SCALE, bool DUAL_ACCUM, int BLOCK_SCALE_K, bool BLOCK_TILE_SCALE, int BLOCK_OUT_M, int BLOCK_OUT_N, bool BLOCK_ACCUM, bool SCALE_FP32, bool PERSISTENT, bool ACC_RAW_F16, bool A_SCALE_1D_BLOCK, int A_BLOCK_SCALE_K, int B_BLOCK_SCALE_K, bool A_SCALE_E8M0, bool A_SCALE_K_MAJOR, bool A_SCALE_ROW_PAIR, bool B_SCALE_TENSORWISE, bool B_SCALE_E8M0>
+void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16, A_SCALE_1D_BLOCK, A_BLOCK_SCALE_K, B_BLOCK_SCALE_K, A_SCALE_E8M0, A_SCALE_K_MAJOR, A_SCALE_ROW_PAIR, B_SCALE_TENSORWISE, B_SCALE_E8M0>::run(
     int M, int N, int K,
     const fp8e4m3 *__restrict__ A,
     const fp8e4m3 *__restrict__ B,
@@ -1019,7 +1119,7 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCK
     // default cap and returns occ=0 for the 96 KB configs (which
     // then launches grid(0) = invalid argument).
     CHECK_CUDA(cudaFuncSetAttribute(
-        fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>,
+        fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16, A_SCALE_1D_BLOCK, A_BLOCK_SCALE_K, B_BLOCK_SCALE_K, A_SCALE_E8M0, A_SCALE_K_MAJOR, A_SCALE_ROW_PAIR, B_SCALE_TENSORWISE, B_SCALE_E8M0>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE));
 
     int num_blocks;
@@ -1046,7 +1146,7 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCK
         int occ = 1;
         CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ,
-            fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>,
+            fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16, A_SCALE_1D_BLOCK, A_BLOCK_SCALE_K, B_BLOCK_SCALE_K, A_SCALE_E8M0, A_SCALE_K_MAJOR, A_SCALE_ROW_PAIR, B_SCALE_TENSORWISE, B_SCALE_E8M0>,
             TOTAL_THREADS, SMEM_SIZE));
         num_blocks = min(num_sm * occ, total_tiles);
     }
@@ -1054,7 +1154,7 @@ void FP8GemmMMA<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCK
     dim3 grid(num_blocks);
     dim3 block(TOTAL_THREADS);
 
-    fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16>
+    fp8_gemm_mma_kernel<BM, BN, BK, NUM_STAGES, CWG, WARP_M, WARP_N, DIRECT_STORE, BLOCKWISE_SCALE, DUAL_ACCUM, BLOCK_SCALE_K, BLOCK_TILE_SCALE, BLOCK_OUT_M, BLOCK_OUT_N, BLOCK_ACCUM, SCALE_FP32, PERSISTENT, ACC_RAW_F16, A_SCALE_1D_BLOCK, A_BLOCK_SCALE_K, B_BLOCK_SCALE_K, A_SCALE_E8M0, A_SCALE_K_MAJOR, A_SCALE_ROW_PAIR, B_SCALE_TENSORWISE, B_SCALE_E8M0>
         <<<grid, block, SMEM_SIZE, stream>>>(
             M, N, K, num_tiles_m, num_tiles_n, total_tiles,
             tma_A, tma_B, tma_Y, a_scale, b_scale,
