@@ -1,3 +1,10 @@
+
+> **⚠️ 2026-07-27 audit**: TF claims in this file may have used the
+> buggy cudaEvent single-event timing pattern (2.07x under-report on
+> sm_120 for ctypes-loaded .so kernels). Real numbers via batched
+> cudaEvent / torch.profiler are roughly half the absolute TF values.
+> See memory `feedback_cudaevent_2x_underreport_2026_07_27.md` and
+> skill `.claude/skills/bench-flops/SKILL.md`.
 > **Rules**: [`saved-tensors-not-hwm`](../.claude/rules/saved-tensors-not-hwm.md) · [`dont-target-v100`](../.claude/rules/dont-target-v100.md) — NVFP4 FFN 走 sm_80+ BF16 MMA；VRAM 改动以 `max_memory_allocated()` 而非 `saved_tensors` 为准。**Skill**: [`step-perf-remeasure`](../.claude/skills/step-perf-remeasure/SKILL.md) — re-measure step time after any change to the FFN path. **Doc**: [`optimizer_kernel_design.md`](optimizer_kernel_design.md) — Triton pack + Marlin + in-backward D2H design patterns.
 
 # W4A16 NVFP4 FFN — design notes (mode-3 production state, 2026-07-15)

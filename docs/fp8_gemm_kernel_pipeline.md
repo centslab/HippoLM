@@ -1,3 +1,16 @@
+
+
+> **⚠️ 2026-07-27 audit**: TF claims in this document were measured with
+> the buggy cudaEvent single-event pattern, which under-reports
+> ctypes-loaded .so kernel time by ~2.07x on sm_120. **Real numbers**
+> (verified via batched cudaEvent + torch.profiler): R10 ~81 TF,
+> nvjet TensorWise ~85 TF (real, not buggy), CUTLASS MXFP8 ~85 TF
+> in practice (theoretical 112 TF). Cross-kernel ratios preserved.
+> NVIDIA vendor specs (188 TF, 209 TF) are unaffected — they come
+> from NVIDIA datasheets, not local measurements. See memory
+> `feedback_cudaevent_2x_underreport_2026_07_27.md` and the
+> `.claude/skills/bench-flops/SKILL.md` skill for the audit + correct
+> methodology.
 # FP8 E4M3 GEMM kernel pipeline
 
 How the FP8 GEMM custom kernel is built, why we ship prebuilt `.so`

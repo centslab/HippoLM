@@ -66,6 +66,10 @@ scales that may saturate at 448 (effectively global_scale = 1). For
 Marlin, we need the explicit ``global_scale`` — see
 :func:`quantize_nvfp4_with_global_scale` below.
 """
+# NOTE (2026-07-27 audit): TF numbers in this file used the buggy
+# cudaEvent single-event pattern; real ~6-25 TFLOPS via batched aggregate.
+# See memory `feedback_cudaevent_2x_underreport_2026_07_27.md`.
+
 from __future__ import annotations
 
 import ctypes

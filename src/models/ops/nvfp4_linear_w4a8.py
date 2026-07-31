@@ -14,6 +14,8 @@ Two-pass forward:
 
 The pass-2 GEMM has two backends:
   - ``torch._scaled_mm`` (default, routes to cuBLAS nvjet) — 96-100 TFLOPS
+# NOTE (2026-07-27 audit): 96-100 TFLOPS claim used buggy cudaEvent
+# single-event timing; real ~46-50 TFLOPS via batched aggregate.
     on sm_120 at prod FFN shapes (~30% of 400 TFLOPS fp8 spec).
   - ``fp8_gemm_scaled`` from :mod:`src.models.ops.cuda.fp8_gemm` (opt-in
     via ``use_custom_gemm=True``) — custom CUDA C++ TMA + warp

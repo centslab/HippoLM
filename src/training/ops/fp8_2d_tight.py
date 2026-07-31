@@ -90,18 +90,19 @@ DEFAULT_BLOCK = 32
 def quantize_2d(
     x: torch.Tensor,
     block: int = DEFAULT_BLOCK,
+    scale_dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """2D tight-scale E4M3 quantization of a 2D FP32 tensor.
 
     Returns ``(q, scale_dim1, scale_dim2, tight)`` where:
 
       * ``q`` is a flat E4M3 tensor of shape ``(rows * cols,)``.
-      * ``scale_dim1`` is FP32, shape ``(rows, cols // block)``
-        — the per-row × per-col-block amax divided by
-        ``E4M3_MAX``.
-      * ``scale_dim2`` is FP32, shape ``(cols, rows // block)``
-        — the per-col × per-row-block amax divided by
-        ``E4M3_MAX``.
+      * ``scale_dim1`` is FP32 (or ``scale_dtype``), shape
+        ``(rows, cols // block)`` — the per-row × per-col-block
+        amax divided by ``E4M3_MAX``.
+      * ``scale_dim2`` is FP32 (or ``scale_dtype``), shape
+        ``(cols, rows // block)`` — the per-col × per-row-block
+        amax divided by ``E4M3_MAX``.
       * ``tight`` is FP32, shape ``(rows, cols)`` — the
         per-element scale ``min(scale_dim1_broadcast,
         scale_dim2_broadcast)``. Returned so
@@ -115,6 +116,15 @@ def quantize_2d(
         optimizer only sees production shapes which are
         multiples of 32).
     block : E4M3 block size along each axis (default 32).
+    scale_dtype : torch.dtype
+        Storage dtype for ``scale_dim1`` and ``scale_dim2``.
+        Default ``torch.float32`` (Muon's prod setting — see
+        ``docs/auto-memory/project_2d_tight_scale.md``).
+        ``torch.bfloat16`` is the cheap-scale alternative —
+        BF16 has 7-bit mantissa vs FP32's 23-bit; whether
+        that matters for gradient-accumulation precision is
+        tested in
+        ``test/_tmp/probe_grad_accum_quant_sweep.py``.
 
     Notes
     -----
@@ -135,6 +145,9 @@ def quantize_2d(
     """
     assert x.dim() == 2, f"quantize_2d expects 2D, got {x.dim()}D"
     assert block >= 1
+    assert scale_dtype in (torch.float32, torch.bfloat16), (
+        f"scale_dtype must be float32 or bfloat16, got {scale_dtype}"
+    )
     xf = x.to(torch.float32)
     rows, cols = xf.shape
     assert rows % block == 0, (
@@ -158,6 +171,8 @@ def quantize_2d(
     amax_r = g_r.abs().max(dim=-1, keepdim=True)[0]  # (rows * n_col_blocks, 1)
     scale_dim1 = (amax_r / E4M3_MAX).clamp(min=E4M3_MIN_NORMAL / E4M3_MAX)
     scale_dim1 = scale_dim1.reshape(rows, n_col_blocks).contiguous()
+    if scale_dtype == torch.bfloat16:
+        scale_dim1 = scale_dim1.to(torch.bfloat16)
 
     # ---- scale_dim2: per-col × per-row-block amax ----
     # Transpose then group consecutive `block` elements along
@@ -168,15 +183,20 @@ def quantize_2d(
     amax_c = g_c.abs().max(dim=-1, keepdim=True)[0]  # (cols * n_row_blocks, 1)
     scale_dim2 = (amax_c / E4M3_MAX).clamp(min=E4M3_MIN_NORMAL / E4M3_MAX)
     scale_dim2 = scale_dim2.reshape(cols, n_row_blocks).contiguous()
+    if scale_dtype == torch.bfloat16:
+        scale_dim2 = scale_dim2.to(torch.bfloat16)
 
     # ---- Broadcast both to (rows, cols), take per-element min ----
+    # `tight` stays FP32 for the in-kernel arithmetic precision
+    # (the per-element scale broadcast is compute-path, not
+    # storage-path).
     scale_dim1_full = (
-        scale_dim1.unsqueeze(-1)
+        scale_dim1.to(torch.float32).unsqueeze(-1)
         .repeat(1, 1, block)
         .reshape(rows, cols)
     )
     scale_dim2_full = (
-        scale_dim2.unsqueeze(-1)
+        scale_dim2.to(torch.float32).unsqueeze(-1)
         .repeat(1, 1, block)
         .reshape(cols, rows)
         .t()

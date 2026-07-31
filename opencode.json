@@ -36,11 +36,7 @@
       "setcap *": "deny",
       "nvcc *": "ask"
     },
-    "webfetch": {
-      "*": "ask",
-      "raw.githubusercontent.com/*": "allow",
-      "api.github.com/*": "allow"
-    }
+    "webfetch": "allow"
   },
   "compaction": {
     "auto": true

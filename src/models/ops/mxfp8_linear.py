@@ -6,6 +6,9 @@ values + UE8M0 pow2 scales on *both* activation and weight). At the
 KDA prod shape (M=16384, K=N=1536) on sm_120 the b12x MXFP8 GEMM
 hits ~103 TFLOPS — that's at the CUTLASS RowWise ceiling (~97 TF on
 this arch, ~55% of the 188 TF hardware FP8 dense peak measured via
+# NOTE (2026-07-27 audit): the "~97 TF" and "~55% of 188 TF" numbers used
+# the buggy cudaEvent single-event pattern; real numbers ~47 TF / 25%
+# of peak. 188 TF is NVIDIA vendor spec, unaffected. Ratio preserved.
 cuBLASLt nvjet scalar mode; see
 ``docs/fp8_gemm_landscape_2026_07_23.md`` §1). Measurably faster
 than ``torch._scaled_mm`` W8A8 (~95 TFLOPS) at large M; the same

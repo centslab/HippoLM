@@ -21,6 +21,10 @@ Contract:
 Run:
     python -m pytest test/test_nvfp4_linear_w4a8.py -v
 """
+# NOTE (2026-07-27 audit): TFLOPS perf test in this file used the buggy
+# cudaEvent single-event pattern; real ~6 TFLOPS via batched aggregate.
+# See memory `feedback_cudaevent_2x_underreport_2026_07_27.md`.
+
 from __future__ import annotations
 
 import pytest

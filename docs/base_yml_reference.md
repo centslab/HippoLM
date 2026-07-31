@@ -1,3 +1,10 @@
+
+> **⚠️ 2026-07-27 audit**: TF claims in this file may have used the
+> buggy cudaEvent single-event timing pattern (2.07x under-report on
+> sm_120 for ctypes-loaded .so kernels). Real numbers via batched
+> cudaEvent / torch.profiler are roughly half the absolute TF values.
+> See memory `feedback_cudaevent_2x_underreport_2026_07_27.md` and
+> skill `.claude/skills/bench-flops/SKILL.md`.
 > **Rule**: [`dont-target-v100`](../.claude/rules/dont-target-v100.md) — sm_70 已 drop；改 `base.yml` 不要引入 V100 兼容路径。
 
 # `configs/base.yml` parameter reference

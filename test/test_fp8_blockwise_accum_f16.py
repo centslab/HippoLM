@@ -15,6 +15,11 @@ the F32-acc QMMA issue rate on sm_120 (97.9 -> 168 TF @ 4096^3, and
 4. Perf floor: R10 >= 1.3x R7 at 4096^3 (expected ~1.7x; loose bound
    to stay non-flaky on a shared box).
 """
+# NOTE (2026-07-27 audit): TF claims in docstring and tests used the buggy
+# cudaEvent single-event pattern; real ~81 TF (R10) / ~47 TF (R7) via batched
+# aggregate + torch.profiler. The 1.72x R10/R7 ratio is preserved.
+# See memory `feedback_cudaevent_2x_underreport_2026_07_27.md`.
+
 from __future__ import annotations
 
 import ctypes
